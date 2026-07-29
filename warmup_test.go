@@ -94,6 +94,46 @@ func TestWarmupSuppressionExpiresAtReset(t *testing.T) {
 	s.warmupMu.Unlock()
 }
 
+func TestNextWarmupCandidateSkipsSuppressedAccount(t *testing.T) {
+	now := time.Now()
+	s := &schedulerRuntimeState{warmups: map[string]warmupEntry{
+		warmupKey("first", "weekly"): {
+			AuthID:      "first",
+			Window:      "weekly",
+			AttemptedAt: now.Add(-time.Minute),
+			ResetAt:     now.Add(6 * 24 * time.Hour),
+		},
+	}}
+	candidates := []warmupCandidate{
+		{Snapshot: quotaSnapshot{AuthID: "first"}, Window: quotaWindow{Class: "weekly"}},
+		{Snapshot: quotaSnapshot{AuthID: "second"}, Window: quotaWindow{Class: "weekly"}},
+	}
+
+	s.warmupMu.Lock()
+	candidate, key, ok := s.nextWarmupCandidateLocked(candidates, now, 15*time.Minute)
+	s.warmupMu.Unlock()
+	if !ok || candidate.Snapshot.AuthID != "second" || key != warmupKey("second", "weekly") {
+		t.Fatalf("next warmup candidate = %#v, key=%q, ok=%v; want second", candidate, key, ok)
+	}
+}
+
+func TestPruneExpiredWarmupsRemovesOldCycles(t *testing.T) {
+	now := time.Now()
+	s := &schedulerRuntimeState{warmups: map[string]warmupEntry{
+		"expired|weekly": {AuthID: "expired", Window: "weekly", ResetAt: now.Add(-time.Minute)},
+		"active|weekly":  {AuthID: "active", Window: "weekly", ResetAt: now.Add(time.Hour)},
+	}}
+	if !s.pruneExpiredWarmups(now) {
+		t.Fatal("expired warmup should report a state change")
+	}
+	if _, ok := s.warmups["expired|weekly"]; ok {
+		t.Fatal("expired warmup was not removed")
+	}
+	if _, ok := s.warmups["active|weekly"]; !ok {
+		t.Fatal("active warmup must be preserved")
+	}
+}
+
 func TestFindWarmupCandidateSkipsQuarantinedAuth(t *testing.T) {
 	resetBanStoreForTest()
 	now := time.Now()

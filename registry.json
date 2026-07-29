@@ -4,9 +4,9 @@
     {
       "id": "codex-quota-scheduler",
       "name": "Codex Quota Scheduler",
-      "description": "CPA-native serial fill-first Codex quota scheduler with persistent 429 quarantine, half-open recovery, Keeper quota refresh, and active-account-only warmup.",
+      "description": "CPA-native serial fill-first Codex quota scheduler with persistent 429 quarantine, half-open recovery, Keeper quota refresh, and sequential full-quota warmup.",
       "author": "simplez2",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "repository": "https://github.com/simplez2/cpa-codex-quota-scheduler",
       "homepage": "https://github.com/simplez2/cpa-codex-quota-scheduler",
       "license": "MIT",

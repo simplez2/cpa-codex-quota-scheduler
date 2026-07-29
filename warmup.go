@@ -14,8 +14,6 @@ import (
 	"sort"
 	"strings"
 	"time"
-
-	"github.com/simplez2/cpa-codex-quota-scheduler/cpasdk/pluginapi"
 )
 
 // warmupEntry records one low-cost activation attempt. It intentionally stores
@@ -69,8 +67,8 @@ const (
 )
 
 // scheduleWarmup is called after a fresh Keeper snapshot. It deliberately
-// schedules at most one request at a time so a quota refresh cannot create a
-// burst of activation requests across all accounts.
+// schedules at most one request at a time so full accounts are activated
+// sequentially instead of creating a burst across the pool.
 func (s *schedulerRuntimeState) scheduleWarmup(parent context.Context) {
 	s.mu.RLock()
 	cfg := s.cfg
@@ -79,21 +77,29 @@ func (s *schedulerRuntimeState) scheduleWarmup(parent context.Context) {
 		strings.TrimSpace(cfg.CPAManagementKeyFile) == "" || strings.TrimSpace(cfg.WarmupSidecarURL) == "" {
 		return
 	}
+	now := time.Now()
+	if s.pruneExpiredWarmups(now) {
+		s.persistBanState()
+	}
 
 	eligible, err := s.cpaWarmupEligibleAuths(parent, cfg)
 	if err != nil {
 		slog.Warn("codex-quota-scheduler: warmup skipped because CPA auth status is unavailable", "error", err)
 		return
 	}
-	candidate, ok := s.findWarmupCandidate(eligible, time.Now())
-	if !ok {
+	candidates := s.findWarmupCandidates(eligible, time.Now())
+	if len(candidates) == 0 {
 		return
 	}
 
-	now := time.Now()
-	key := warmupKey(candidate.Snapshot.AuthID, candidate.Window.Class)
+	now = time.Now()
 	s.warmupMu.Lock()
-	if s.warmupRunning || s.warmupSuppressedLocked(key, now, cfg.WarmupRetryAfter) {
+	if s.warmupRunning {
+		s.warmupMu.Unlock()
+		return
+	}
+	candidate, key, ok := s.nextWarmupCandidateLocked(candidates, now, cfg.WarmupRetryAfter)
+	if !ok {
 		s.warmupMu.Unlock()
 		return
 	}
@@ -123,14 +129,20 @@ func (s *schedulerRuntimeState) scheduleWarmup(parent context.Context) {
 }
 
 func (s *schedulerRuntimeState) findWarmupCandidate(eligible map[string]bool, now time.Time) (warmupCandidate, bool) {
+	candidates := s.findWarmupCandidates(eligible, now)
+	if len(candidates) == 0 {
+		return warmupCandidate{}, false
+	}
+	return candidates[0], true
+}
+
+func (s *schedulerRuntimeState) findWarmupCandidates(eligible map[string]bool, now time.Time) []warmupCandidate {
 	s.mu.RLock()
 	quotas := make(map[string]quotaSnapshot, len(s.quotas))
 	for key, snapshot := range s.quotas {
 		quotas[key] = snapshot
 	}
 	cfg := s.cfg
-	serialMode := normalizeSchedulerMode(cfg.SchedulerMode) == "serial"
-	serialActive := strings.TrimSpace(s.serialActiveAuthID)
 	s.mu.RUnlock()
 
 	seen := make(map[string]struct{})
@@ -147,9 +159,6 @@ func (s *schedulerRuntimeState) findWarmupCandidate(eligible map[string]bool, no
 		if snapshot.RefreshedAt.IsZero() || now.Before(snapshot.RefreshedAt) || now.Sub(snapshot.RefreshedAt) > cfg.StaleAfter {
 			continue
 		}
-		if serialMode && serialActive != "" && authID != serialActive {
-			continue
-		}
 		if !eligible[authID] && !eligible[strings.TrimSpace(snapshot.AuthIndex)] {
 			continue
 		}
@@ -163,20 +172,7 @@ func (s *schedulerRuntimeState) findWarmupCandidate(eligible map[string]bool, no
 		}
 	}
 	if len(candidates) == 0 {
-		return warmupCandidate{}, false
-	}
-	if serialMode {
-		sort.SliceStable(candidates, func(i, j int) bool {
-			a := inspectSerialCandidate(pluginapi.SchedulerAuthCandidate{ID: candidates[i].Snapshot.AuthID}, candidates[i].Snapshot, true, cfg, now)
-			b := inspectSerialCandidate(pluginapi.SchedulerAuthCandidate{ID: candidates[j].Snapshot.AuthID}, candidates[j].Snapshot, true, cfg, now)
-			return serialCandidateLess(a, b, cfg)
-		})
-		for _, candidate := range candidates {
-			if s.claimSerialWarmupAuth(candidate.Snapshot.AuthID, now) {
-				return candidate, true
-			}
-		}
-		return warmupCandidate{}, false
+		return nil
 	}
 	sort.SliceStable(candidates, func(i, j int) bool {
 		ri, rj := warmupWindowRank(candidates[i].Window.Class), warmupWindowRank(candidates[j].Window.Class)
@@ -190,7 +186,7 @@ func (s *schedulerRuntimeState) findWarmupCandidate(eligible map[string]bool, no
 		}
 		return candidates[i].Snapshot.AuthID < candidates[j].Snapshot.AuthID
 	})
-	return candidates[0], true
+	return candidates
 }
 
 func unstartedWarmupWindow(snapshot quotaSnapshot, now time.Time) (quotaWindow, bool) {
@@ -227,6 +223,33 @@ func warmupWindowRank(class string) int {
 
 func warmupKey(authID, window string) string {
 	return strings.TrimSpace(authID) + "|" + strings.TrimSpace(window)
+}
+
+// nextWarmupCandidateLocked skips accounts already activated or recently
+// attempted, allowing later full accounts to make progress on the next refresh.
+// The caller must hold warmupMu.
+func (s *schedulerRuntimeState) nextWarmupCandidateLocked(candidates []warmupCandidate, now time.Time, retryAfter time.Duration) (warmupCandidate, string, bool) {
+	for _, candidate := range candidates {
+		key := warmupKey(candidate.Snapshot.AuthID, candidate.Window.Class)
+		if s.warmupSuppressedLocked(key, now, retryAfter) {
+			continue
+		}
+		return candidate, key, true
+	}
+	return warmupCandidate{}, "", false
+}
+
+func (s *schedulerRuntimeState) pruneExpiredWarmups(now time.Time) bool {
+	s.warmupMu.Lock()
+	defer s.warmupMu.Unlock()
+	changed := false
+	for key, entry := range s.warmups {
+		if !entry.ResetAt.IsZero() && !now.Before(entry.ResetAt) {
+			delete(s.warmups, key)
+			changed = true
+		}
+	}
+	return changed
 }
 
 func (s *schedulerRuntimeState) warmupSuppressedLocked(key string, now time.Time, retryAfter time.Duration) bool {

@@ -248,34 +248,3 @@ func (s *schedulerRuntimeState) markSerialUnavailable(authID, reason string, now
 	s.serialLastSwitchReason = strings.TrimSpace(reason)
 	return true
 }
-
-// claimSerialWarmupAuth makes warmup obey the same single-active-account rule
-// as real traffic. It never replaces an already selected active auth.
-func (s *schedulerRuntimeState) claimSerialWarmupAuth(authID string, now time.Time) bool {
-	authID = strings.TrimSpace(authID)
-	if authID == "" {
-		return false
-	}
-	s.mu.Lock()
-	if normalizeSchedulerMode(s.cfg.SchedulerMode) != "serial" {
-		s.mu.Unlock()
-		return true
-	}
-	current := strings.TrimSpace(s.serialActiveAuthID)
-	changed := false
-	if current == "" {
-		s.serialActiveAuthID = authID
-		s.serialSelectedAt = now
-		s.serialLastSwitchAt = now
-		if strings.TrimSpace(s.serialLastSwitchReason) == "" {
-			s.serialLastSwitchReason = "warmup_initial_selection"
-		}
-		current = authID
-		changed = true
-	}
-	s.mu.Unlock()
-	if changed {
-		s.persistBanState()
-	}
-	return current == authID
-}

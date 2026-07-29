@@ -225,7 +225,7 @@ func TestSerialStatePersistenceIncludesActiveAuth(t *testing.T) {
 	}
 }
 
-func TestSerialWarmupNeverStartsBackupAccount(t *testing.T) {
+func TestSerialWarmupActivatesFullBackupWithoutReplacingActiveTrafficAuth(t *testing.T) {
 	resetBanStoreForTest()
 	now := time.Now()
 	cfg := defaultPluginConfig()
@@ -244,9 +244,13 @@ func TestSerialWarmupNeverStartsBackupAccount(t *testing.T) {
 			},
 		},
 	}
-	if candidate, ok := state.findWarmupCandidate(map[string]bool{
+	candidate, ok := state.findWarmupCandidate(map[string]bool{
 		"primary": true, "idx-primary": true, "backup": true, "idx-backup": true,
-	}, now); ok {
-		t.Fatalf("backup account was warmed while primary remained active: %#v", candidate)
+	}, now)
+	if !ok || candidate.Snapshot.AuthID != "backup" {
+		t.Fatalf("warmup candidate = %#v, ok=%v; want full backup", candidate, ok)
+	}
+	if state.serialActiveAuthID != "primary" {
+		t.Fatalf("serial active auth changed to %q during warmup selection", state.serialActiveAuthID)
 	}
 }
