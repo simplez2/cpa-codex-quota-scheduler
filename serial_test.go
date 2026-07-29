@@ -152,6 +152,192 @@ func TestSerialSchedulerConcurrentPicksClaimOnlyOneAuth(t *testing.T) {
 	}
 }
 
+func TestSerialSchedulerRetrySubsetUsesStableProvisionalWithoutSwitch(t *testing.T) {
+	resetBanStoreForTest()
+	now := time.Now()
+	state := newSerialTestState(now)
+	if got := state.serialPick(serialTestRequest(), now); got.AuthID != "primary" {
+		t.Fatalf("initial pick = %#v", got)
+	}
+	retry := serialTestRequest()
+	retry.Candidates = retry.Candidates[:1]
+
+	first := state.serialPick(retry, now.Add(time.Second))
+	second := state.serialPick(retry, now.Add(30*time.Second))
+	if !first.Handled || first.AuthID != "backup" || !second.Handled || second.AuthID != "backup" {
+		t.Fatalf("retry fallback picks = %#v then %#v", first, second)
+	}
+	if state.serialActiveAuthID != "primary" || state.serialSwitches != 0 {
+		t.Fatalf("retry subset changed committed auth=%q switches=%d", state.serialActiveAuthID, state.serialSwitches)
+	}
+	if state.serialFallbackAuthID != "backup" || state.serialFallbacks != 2 {
+		t.Fatalf("provisional auth=%q fallbacks=%d", state.serialFallbackAuthID, state.serialFallbacks)
+	}
+}
+
+func TestSerialSchedulerActiveReappearsClearsProvisional(t *testing.T) {
+	resetBanStoreForTest()
+	now := time.Now()
+	state := newSerialTestState(now)
+	req := serialTestRequest()
+	if got := state.serialPick(req, now); got.AuthID != "primary" {
+		t.Fatalf("initial pick = %#v", got)
+	}
+	retry := req
+	retry.Candidates = retry.Candidates[:1]
+	if got := state.serialPick(retry, now.Add(time.Second)); got.AuthID != "backup" {
+		t.Fatalf("provisional pick = %#v", got)
+	}
+	if got := state.serialPick(req, now.Add(30*time.Second)); got.AuthID != "primary" {
+		t.Fatalf("reappeared active pick = %#v", got)
+	}
+	if state.serialMissingAuthID != "" || state.serialFallbackAuthID != "" || !state.serialMissingSince.IsZero() || state.serialMissingCount != 0 {
+		t.Fatalf("missing state not cleared: auth=%q provisional=%q since=%v count=%d", state.serialMissingAuthID, state.serialFallbackAuthID, state.serialMissingSince, state.serialMissingCount)
+	}
+	if state.serialSwitches != 0 {
+		t.Fatalf("reappearance counted as %d switches", state.serialSwitches)
+	}
+}
+
+func TestSerialSchedulerCommitsConfirmedMissingAfterGrace(t *testing.T) {
+	resetBanStoreForTest()
+	now := time.Now()
+	state := newSerialTestState(now)
+	if got := state.serialPick(serialTestRequest(), now); got.AuthID != "primary" {
+		t.Fatalf("initial pick = %#v", got)
+	}
+	retry := serialTestRequest()
+	retry.Candidates = retry.Candidates[:1]
+	if got := state.serialPick(retry, now.Add(time.Second)); got.AuthID != "backup" {
+		t.Fatalf("first provisional pick = %#v", got)
+	}
+	if got := state.serialPick(retry, now.Add(30*time.Second)); got.AuthID != "backup" {
+		t.Fatalf("second provisional pick = %#v", got)
+	}
+	confirmedAt := now.Add(time.Second + serialCandidateMissingGrace)
+	if got := state.serialPick(retry, confirmedAt); !got.Handled || got.AuthID != "backup" {
+		t.Fatalf("confirmed pick = %#v", got)
+	}
+	if state.serialActiveAuthID != "backup" || state.serialSwitches != 1 || state.serialLastSwitchReason != "candidate_unavailable_confirmed" {
+		t.Fatalf("confirmed state auth=%q switches=%d reason=%q", state.serialActiveAuthID, state.serialSwitches, state.serialLastSwitchReason)
+	}
+	if state.serialFallbacks != 2 {
+		t.Fatalf("provisional fallbacks=%d; want 2", state.serialFallbacks)
+	}
+}
+
+func TestSerialSchedulerPinnedRequestDoesNotChangeCommittedAuth(t *testing.T) {
+	resetBanStoreForTest()
+	now := time.Now()
+	state := newSerialTestState(now)
+	if got := state.serialPick(serialTestRequest(), now); got.AuthID != "primary" {
+		t.Fatalf("initial pick = %#v", got)
+	}
+	pinned := serialTestRequest()
+	pinned.Candidates = pinned.Candidates[:1]
+	pinned.Options.Metadata = map[string]any{"pinned_auth_id": "backup"}
+	got := state.serialPick(pinned, now.Add(time.Second))
+	if !got.Handled || got.AuthID != "backup" {
+		t.Fatalf("pinned pick = %#v", got)
+	}
+	if state.serialActiveAuthID != "primary" || state.serialSwitches != 0 || state.serialFallbacks != 0 {
+		t.Fatalf("pinned request polluted serial state: auth=%q switches=%d provisional=%d", state.serialActiveAuthID, state.serialSwitches, state.serialFallbacks)
+	}
+}
+
+func TestSerialSchedulerConcurrentConfirmedMissingSwitchesOnce(t *testing.T) {
+	resetBanStoreForTest()
+	now := time.Now()
+	state := newSerialTestState(now)
+	if got := state.serialPick(serialTestRequest(), now); got.AuthID != "primary" {
+		t.Fatalf("initial pick = %#v", got)
+	}
+	retry := serialTestRequest()
+	retry.Candidates = retry.Candidates[:1]
+	state.serialPick(retry, now.Add(time.Second))
+	state.serialPick(retry, now.Add(2*time.Second))
+
+	const workers = 64
+	start := make(chan struct{})
+	results := make(chan pluginapi.SchedulerPickResponse, workers)
+	var wg sync.WaitGroup
+	confirmedAt := now.Add(time.Second + serialCandidateMissingGrace)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			results <- state.serialPick(retry, confirmedAt)
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	for got := range results {
+		if !got.Handled || got.AuthID != "backup" {
+			t.Fatalf("concurrent confirmed pick = %#v", got)
+		}
+	}
+	if state.serialActiveAuthID != "backup" || state.serialSwitches != 1 {
+		t.Fatalf("concurrent confirmation auth=%q switches=%d", state.serialActiveAuthID, state.serialSwitches)
+	}
+}
+
+func TestSerialSchedulerHalfOpenCollisionDoesNotSwitchCommittedAuth(t *testing.T) {
+	resetBanStoreForTest()
+	now := time.Now()
+	state := newSerialTestState(now)
+	state.serialActiveAuthID = "primary"
+	state.serialSelectedAt = now
+	banStore.set("primary", banEntry{
+		ResetAt: now.Add(-time.Second), Window: "probation", Kind: banKindProbation, Phase: banPhaseCooldown,
+	})
+	req := serialTestRequest()
+
+	const workers = 32
+	start := make(chan struct{})
+	results := make(chan pluginapi.SchedulerPickResponse, workers)
+	errs := make(chan error, workers)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			got, err := state.schedulerPick(req)
+			results <- got
+			errs <- err
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	primaryPicks := 0
+	for got := range results {
+		if !got.Handled || (got.AuthID != "primary" && got.AuthID != "backup") {
+			t.Fatalf("half-open collision pick = %#v", got)
+		}
+		if got.AuthID == "primary" {
+			primaryPicks++
+		}
+	}
+	if primaryPicks != 1 {
+		t.Fatalf("primary half-open probes=%d; want exactly 1", primaryPicks)
+	}
+	if state.serialActiveAuthID != "primary" || state.serialSwitches != 0 {
+		t.Fatalf("half-open collision changed committed auth=%q switches=%d", state.serialActiveAuthID, state.serialSwitches)
+	}
+	if stats := banStore.stats(); stats.ProbeStarts != 1 {
+		t.Fatalf("probe starts=%d; want 1", stats.ProbeStarts)
+	}
+}
+
 func TestSerialSchedulerKeepsUnknownQuotaOnOneDeterministicAuth(t *testing.T) {
 	resetBanStoreForTest()
 	cfg := defaultPluginConfig()
@@ -208,6 +394,7 @@ func TestSerialStatePersistenceIncludesActiveAuth(t *testing.T) {
 		serialActiveAuthID:     "primary",
 		serialSelectedAt:       now,
 		serialSwitches:         3,
+		serialFallbacks:        7,
 		serialLastSwitchAt:     now,
 		serialLastSwitchReason: "serial_threshold",
 	}
@@ -220,7 +407,7 @@ func TestSerialStatePersistenceIncludesActiveAuth(t *testing.T) {
 	if err := json.Unmarshal(raw, &persisted); err != nil {
 		t.Fatal(err)
 	}
-	if persisted.Version != 4 || persisted.SerialActiveAuthID != "primary" || persisted.SerialSwitches != 3 {
+	if persisted.Version != 4 || persisted.SerialActiveAuthID != "primary" || persisted.SerialSwitches != 3 || persisted.SerialFallbacks != 7 {
 		t.Fatalf("serial persistence = %#v", persisted)
 	}
 }

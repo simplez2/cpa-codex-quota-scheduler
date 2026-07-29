@@ -2,19 +2,21 @@
 
 面向 CPA（CLIProxyAPI）的 Codex 串行配额调度与 429 自动隔离插件。
 
-当前版本：`v0.1.1`。
+当前版本：`v0.1.2`。
 
 ## 解决的问题
 
 旧的按会话粘性或动态评分调度，会让不同会话同时使用多个 Codex 账号。这个项目默认改为全局串行 fill-first：
 
 1. 全部 Codex 请求固定使用同一个“当前主账号”；
-2. 只在主账号达到配额阈值、收到 429、被 CPA 移出候选池或明确不可用时切换；
+2. 只在主账号达到配额阈值、收到 429、进入插件隔离或持续不可用时正式切换；
 3. 备用账号保持休眠，不会因为另一个 session 或更高评分提前参与流量；
 4. 429 进入持久化 cooldown / probation / half-open 状态，恢复时全局只放行一个探测请求；
 5. 预热与正常流量解耦：100% 可用且尚未启动窗口的账号会一次一个顺序激活，正常请求仍只使用当前主账号。
 
 默认切换阈值是任一活动窗口达到 `98% used`。这是为了在硬 429 前留下很小的并发余量；若你确实希望完全用尽，可把 `serial_switch_percent` 设为 `100`。
+
+CPA 会在上游 `408/5xx` 后把账号临时移出候选池约 60 秒。`v0.1.2` 将这种情况作为 request-local provisional fallback：固定使用一个临时备用账号，但保留原主账号且不增加正式切换次数；主账号恢复后自动回归。只有候选持续缺席至少 90 秒并经过 3 次确认，才以 `candidate_unavailable_confirmed` 正式切换。pinned 预热和半开探测竞争也不会污染全局主账号。
 
 ## 账号选择顺序
 
@@ -115,7 +117,7 @@ Windows PowerShell：
 
 - 429 quarantine / probation / half-open 状态；
 - 当前主账号及选择时间；
-- 串行切换计数和最近切换原因；
+- 正式串行切换计数、临时故障转移计数和最近切换原因；
 - 已执行的预热记录。
 
 它不包含 token、PAT、cookie、Keeper 密码或 Management key。文件以 `0600` 权限原子写入。
@@ -133,7 +135,7 @@ POST /v0/management/plugins/codex-quota-scheduler/unban
 POST /v0/management/plugins/codex-quota-scheduler/unban-all
 ```
 
-`/quota` 会显示当前主账号、切换阈值、最近切换原因、Keeper 快照、预热和隔离状态。
+`/quota` 会显示当前主账号、切换阈值、正式切换、临时故障转移、候选缺席确认、Keeper 快照、预热和隔离状态。
 
 ## 兼容模式
 

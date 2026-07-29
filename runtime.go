@@ -97,8 +97,13 @@ type schedulerRuntimeState struct {
 	serialActiveAuthID     string
 	serialSelectedAt       time.Time
 	serialSwitches         uint64
+	serialFallbacks        uint64
 	serialLastSwitchAt     time.Time
 	serialLastSwitchReason string
+	serialMissingAuthID    string
+	serialFallbackAuthID   string
+	serialMissingSince     time.Time
+	serialMissingCount     int
 }
 
 var schedulerRuntime schedulerRuntimeState
@@ -128,8 +133,13 @@ func configureSchedulerRuntime(raw []byte) {
 	schedulerRuntime.serialActiveAuthID = ""
 	schedulerRuntime.serialSelectedAt = time.Time{}
 	schedulerRuntime.serialSwitches = 0
+	schedulerRuntime.serialFallbacks = 0
 	schedulerRuntime.serialLastSwitchAt = time.Time{}
 	schedulerRuntime.serialLastSwitchReason = ""
+	schedulerRuntime.serialMissingAuthID = ""
+	schedulerRuntime.serialFallbackAuthID = ""
+	schedulerRuntime.serialMissingSince = time.Time{}
+	schedulerRuntime.serialMissingCount = 0
 	if schedulerRuntime.pricing == nil {
 		schedulerRuntime.pricing = make(map[string]modelPricing)
 	}
@@ -1213,6 +1223,7 @@ type persistedBanState struct {
 	SerialActiveAuthID     string                 `json:"serial_active_auth_id,omitempty"`
 	SerialSelectedAt       time.Time              `json:"serial_selected_at,omitempty"`
 	SerialSwitches         uint64                 `json:"serial_switches,omitempty"`
+	SerialFallbacks        uint64                 `json:"serial_provisional_fallbacks,omitempty"`
 	SerialLastSwitchAt     time.Time              `json:"serial_last_switch_at,omitempty"`
 	SerialLastSwitchReason string                 `json:"serial_last_switch_reason,omitempty"`
 	SavedAt                time.Time              `json:"saved_at"`
@@ -1256,6 +1267,7 @@ func loadBanState(path string) {
 	schedulerRuntime.serialActiveAuthID = strings.TrimSpace(state.SerialActiveAuthID)
 	schedulerRuntime.serialSelectedAt = state.SerialSelectedAt
 	schedulerRuntime.serialSwitches = state.SerialSwitches
+	schedulerRuntime.serialFallbacks = state.SerialFallbacks
 	schedulerRuntime.serialLastSwitchAt = state.SerialLastSwitchAt
 	schedulerRuntime.serialLastSwitchReason = strings.TrimSpace(state.SerialLastSwitchReason)
 	schedulerRuntime.mu.Unlock()
@@ -1273,6 +1285,7 @@ func (s *schedulerRuntimeState) persistBanState() {
 	serialActiveAuthID := strings.TrimSpace(s.serialActiveAuthID)
 	serialSelectedAt := s.serialSelectedAt
 	serialSwitches := s.serialSwitches
+	serialFallbacks := s.serialFallbacks
 	serialLastSwitchAt := s.serialLastSwitchAt
 	serialLastSwitchReason := strings.TrimSpace(s.serialLastSwitchReason)
 	s.mu.RUnlock()
@@ -1292,6 +1305,7 @@ func (s *schedulerRuntimeState) persistBanState() {
 		SerialActiveAuthID:     serialActiveAuthID,
 		SerialSelectedAt:       serialSelectedAt,
 		SerialSwitches:         serialSwitches,
+		SerialFallbacks:        serialFallbacks,
 		SerialLastSwitchAt:     serialLastSwitchAt,
 		SerialLastSwitchReason: serialLastSwitchReason,
 		SavedAt:                time.Now(),
@@ -1336,6 +1350,10 @@ type runtimeStatus struct {
 	SerialActiveAuthID  string                   `json:"serial_active_auth_id,omitempty"`
 	SerialSelectedAt    string                   `json:"serial_selected_at,omitempty"`
 	SerialSwitches      uint64                   `json:"serial_switches"`
+	SerialFallbacks     uint64                   `json:"serial_provisional_fallbacks"`
+	SerialFallbackAuth  string                   `json:"serial_provisional_auth_id,omitempty"`
+	SerialMissingSince  string                   `json:"serial_candidate_missing_since,omitempty"`
+	SerialMissingCount  int                      `json:"serial_candidate_missing_confirmations,omitempty"`
 	SerialLastSwitchAt  string                   `json:"serial_last_switch_at,omitempty"`
 	SerialSwitchReason  string                   `json:"serial_last_switch_reason,omitempty"`
 	ConfigGeneration    uint64                   `json:"config_generation"`
@@ -1513,6 +1531,10 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 	serialActiveAuthID := s.serialActiveAuthID
 	serialSelectedAt := s.serialSelectedAt
 	serialSwitches := s.serialSwitches
+	serialFallbacks := s.serialFallbacks
+	serialFallbackAuthID := s.serialFallbackAuthID
+	serialMissingSince := s.serialMissingSince
+	serialMissingCount := s.serialMissingCount
 	serialLastSwitchAt := s.serialLastSwitchAt
 	serialLastSwitchReason := s.serialLastSwitchReason
 	s.mu.RUnlock()
@@ -1715,6 +1737,9 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 		SerialSwitchPercent: cfg.SerialSwitchPercent,
 		SerialActiveAuthID:  serialActiveAuthID,
 		SerialSwitches:      serialSwitches,
+		SerialFallbacks:     serialFallbacks,
+		SerialFallbackAuth:  serialFallbackAuthID,
+		SerialMissingCount:  serialMissingCount,
 		SerialSwitchReason:  serialLastSwitchReason,
 		ConfigGeneration:    configGeneration,
 		KeeperConfigured:    strings.TrimSpace(cfg.KeeperURL) != "",
@@ -1734,6 +1759,9 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 	}
 	if !serialSelectedAt.IsZero() {
 		out.SerialSelectedAt = serialSelectedAt.Format(time.RFC3339)
+	}
+	if !serialMissingSince.IsZero() {
+		out.SerialMissingSince = serialMissingSince.Format(time.RFC3339)
 	}
 	if !serialLastSwitchAt.IsZero() {
 		out.SerialLastSwitchAt = serialLastSwitchAt.Format(time.RFC3339)
