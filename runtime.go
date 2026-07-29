@@ -1,0 +1,1794 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"math"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/simplez2/cpa-codex-quota-scheduler/cpasdk/pluginapi"
+)
+
+type lifecycleRequest struct {
+	ConfigYAML    []byte `json:"config_yaml"`
+	SchemaVersion uint32 `json:"schema_version"`
+}
+
+// quotaSource records where the latest values for a normalized window came
+// from. Keeper is authoritative; response headers are a low-latency overlay.
+type quotaSource string
+
+const (
+	quotaSourceUnknown quotaSource = ""
+	quotaSourceKeeper  quotaSource = "keeper"
+	quotaSourceHeader  quotaSource = "header"
+	quotaSourceMixed   quotaSource = "mixed"
+)
+
+// quotaWindow is a normalized view of one Keeper quota row.  Keeping the
+// normalized form in the plugin means the scheduler does not depend on one
+// particular Keeper/provider JSON spelling.
+type quotaWindow struct {
+	Class                   string
+	WindowSeconds           int64
+	UsedPercent             float64
+	Allowed                 bool
+	LimitReached            bool
+	ResetAt                 time.Time
+	Source                  quotaSource
+	ObservedAt              time.Time
+	WindowUsageCredits      float64
+	WindowUsageCreditsKnown bool
+}
+
+type quotaSnapshot struct {
+	AuthID           string
+	AuthIndex        string
+	Windows          []quotaWindow
+	ResetCredits     int
+	RefreshedAt      time.Time
+	HeaderObservedAt time.Time
+}
+
+type schedulerRuntimeState struct {
+	mu        sync.RWMutex
+	persistMu sync.Mutex
+
+	cfg         pluginConfig
+	quotas      map[string]quotaSnapshot // indexed by AuthID and AuthIndex aliases
+	identities  map[string]string        // Keeper auth_index -> CPA auth file/AuthID
+	lastRefresh time.Time
+	lastError   string
+	refreshes   int
+
+	cancel        context.CancelFunc
+	wg            sync.WaitGroup
+	warmupMu      sync.Mutex
+	warmupRunning bool
+	warmups       map[string]warmupEntry
+
+	sessionToken  string
+	sessionExpiry time.Time
+	pickCounter   uint64
+
+	pricing             map[string]modelPricing
+	costSamples         map[string][]float64
+	globalCostSamples   []float64
+	pacingAccounts      map[string]*accountPacingState
+	stickyBindings      map[string]stickyBinding
+	decisionHistory     []schedulerDecisionAudit
+	shadowDisagreements uint64
+	sessionSwitches     uint64
+	lastShadowLog       time.Time
+	configGeneration    uint64
+
+	serialActiveAuthID     string
+	serialSelectedAt       time.Time
+	serialSwitches         uint64
+	serialLastSwitchAt     time.Time
+	serialLastSwitchReason string
+}
+
+var schedulerRuntime schedulerRuntimeState
+
+func configureSchedulerRuntime(raw []byte) {
+	cfg, err := parsePluginConfig(raw)
+	if err != nil {
+		// A malformed optional plugin config must never prevent CPA from
+		// starting or make a request return 502.  Keep the plugin loaded in a
+		// safe native-fallback mode and make the error visible in logs/status.
+		slog.Warn("codex-quota-scheduler: invalid plugin config; using safe defaults", "error", err)
+		cfg = defaultPluginConfig()
+		cfg.Enabled = false
+	}
+
+	schedulerRuntime.stop()
+	schedulerRuntime.mu.Lock()
+	schedulerRuntime.cfg = cfg
+	schedulerRuntime.quotas = make(map[string]quotaSnapshot)
+	schedulerRuntime.identities = make(map[string]string)
+	schedulerRuntime.lastRefresh = time.Time{}
+	schedulerRuntime.lastError = ""
+	schedulerRuntime.refreshes = 0
+	schedulerRuntime.warmups = make(map[string]warmupEntry)
+	schedulerRuntime.sessionToken = ""
+	schedulerRuntime.sessionExpiry = time.Time{}
+	schedulerRuntime.serialActiveAuthID = ""
+	schedulerRuntime.serialSelectedAt = time.Time{}
+	schedulerRuntime.serialSwitches = 0
+	schedulerRuntime.serialLastSwitchAt = time.Time{}
+	schedulerRuntime.serialLastSwitchReason = ""
+	if schedulerRuntime.pricing == nil {
+		schedulerRuntime.pricing = make(map[string]modelPricing)
+	}
+	if schedulerRuntime.costSamples == nil {
+		schedulerRuntime.costSamples = make(map[string][]float64)
+	}
+	if schedulerRuntime.pacingAccounts == nil {
+		schedulerRuntime.pacingAccounts = make(map[string]*accountPacingState)
+	}
+	if schedulerRuntime.stickyBindings == nil {
+		schedulerRuntime.stickyBindings = make(map[string]stickyBinding)
+	}
+	schedulerRuntime.configGeneration++
+	schedulerRuntime.mu.Unlock()
+
+	loadBanState(cfg.StatePath)
+	if !cfg.Enabled || strings.TrimSpace(cfg.KeeperURL) == "" {
+		return
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	schedulerRuntime.mu.Lock()
+	schedulerRuntime.cancel = cancel
+	schedulerRuntime.wg.Add(1)
+	schedulerRuntime.mu.Unlock()
+	go schedulerRuntime.refreshLoop(ctx)
+}
+
+func (s *schedulerRuntimeState) stop() {
+	s.mu.Lock()
+	cancel := s.cancel
+	s.cancel = nil
+	s.sessionToken = ""
+	s.sessionExpiry = time.Time{}
+	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
+		s.wg.Wait()
+	}
+	// Persist bans before CPA unloads the shared object.  The file contains
+	// only auth IDs and reset timestamps, never PATs, cookies, or passwords.
+	s.persistBanState()
+}
+
+func (s *schedulerRuntimeState) refreshLoop(ctx context.Context) {
+	defer s.wg.Done()
+	// Cold-start immediately, then refresh on the configured cadence.  A
+	// failed Keeper call is intentionally non-fatal; schedulerPick simply
+	// returns Handled=false until a fresh snapshot exists.
+	s.refreshOnce(ctx)
+	s.mu.RLock()
+	interval := s.cfg.RefreshInterval
+	s.mu.RUnlock()
+	if interval < time.Second {
+		interval = 30 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.refreshOnce(ctx)
+		}
+	}
+}
+
+func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
+	s.mu.RLock()
+	cfg := s.cfg
+	s.mu.RUnlock()
+	if !cfg.Enabled || strings.TrimSpace(cfg.KeeperURL) == "" {
+		return
+	}
+	passwordRaw, err := os.ReadFile(cfg.KeeperPasswordFile)
+	if err != nil {
+		s.recordRefreshError(fmt.Errorf("read Keeper password file: %w", err))
+		return
+	}
+	password := strings.TrimSpace(string(passwordRaw))
+	if password == "" {
+		s.recordRefreshError(errors.New("Keeper password file is empty"))
+		return
+	}
+
+	token, err := s.keeperSession(ctx, cfg, password, false)
+	if err != nil {
+		s.recordRefreshError(err)
+		return
+	}
+	identityBody, status, err := keeperJSON(ctx, cfg.KeeperURL, token, http.MethodGet, "/usage/identities", nil)
+	if status == http.StatusUnauthorized || status == http.StatusForbidden {
+		// Session TTLs vary between Keeper versions.  Retry once with a fresh
+		// login instead of waiting for the next 30-second tick.
+		token, err = s.keeperSession(ctx, cfg, password, true)
+		if err == nil {
+			identityBody, status, err = keeperJSON(ctx, cfg.KeeperURL, token, http.MethodGet, "/usage/identities", nil)
+		}
+	}
+	if err != nil || status < 200 || status >= 300 {
+		if err == nil {
+			err = fmt.Errorf("Keeper identities returned HTTP %d", status)
+		}
+		s.recordRefreshError(err)
+		return
+	}
+
+	var identitiesResp struct {
+		Identities []keeperIdentity `json:"identities"`
+	}
+	if err := json.Unmarshal(identityBody, &identitiesResp); err != nil {
+		s.recordRefreshError(fmt.Errorf("decode Keeper identities: %w", err))
+		return
+	}
+	indexToFile := make(map[string]string)
+	indexes := make([]string, 0, len(identitiesResp.Identities))
+	seen := make(map[string]struct{})
+	for _, identity := range identitiesResp.Identities {
+		if !strings.EqualFold(strings.TrimSpace(identity.Provider), providerCodex) &&
+			!strings.EqualFold(strings.TrimSpace(identity.Type), providerCodex) {
+			continue
+		}
+		index := strings.TrimSpace(identity.Identity)
+		fileName := strings.TrimSpace(identity.FileName)
+		if index == "" || fileName == "" || identity.IsDeleted {
+			continue
+		}
+		indexToFile[index] = fileName
+		if _, ok := seen[index]; !ok {
+			seen[index] = struct{}{}
+			indexes = append(indexes, index)
+		}
+	}
+	if len(indexes) == 0 {
+		s.recordRefreshError(errors.New("Keeper returned no active Codex identities"))
+		return
+	}
+
+	body, _ := json.Marshal(map[string]any{"auth_indexes": indexes})
+	cacheBody, status, err := keeperJSON(ctx, cfg.KeeperURL, token, http.MethodPost, "/quota/cache", body)
+	if status == http.StatusUnauthorized || status == http.StatusForbidden {
+		token, err = s.keeperSession(ctx, cfg, password, true)
+		if err == nil {
+			cacheBody, status, err = keeperJSON(ctx, cfg.KeeperURL, token, http.MethodPost, "/quota/cache", body)
+		}
+	}
+	if err != nil || status < 200 || status >= 300 {
+		if err == nil {
+			err = fmt.Errorf("Keeper quota cache returned HTTP %d", status)
+		}
+		s.recordRefreshError(err)
+		return
+	}
+	var cacheResp keeperCacheResponse
+	if err := json.Unmarshal(cacheBody, &cacheResp); err != nil {
+		s.recordRefreshError(fmt.Errorf("decode Keeper quota cache: %w", err))
+		return
+	}
+	if len(cacheResp.Items) == 0 {
+		s.recordRefreshError(errors.New("Keeper quota cache returned no completed items"))
+		return
+	}
+
+	now := time.Now()
+	quotas := make(map[string]quotaSnapshot, len(cacheResp.Items)*2)
+	for _, item := range cacheResp.Items {
+		if !strings.EqualFold(strings.TrimSpace(item.Status), "completed") || item.Quota == nil {
+			continue
+		}
+		index := strings.TrimSpace(item.AuthIndex)
+		fileName := strings.TrimSpace(item.FileName)
+		if fileName == "" {
+			fileName = indexToFile[index]
+		}
+		if index == "" && fileName == "" {
+			continue
+		}
+		refreshedAt := parseKeeperTime(item.RefreshedAt)
+		if refreshedAt.IsZero() {
+			refreshedAt = now
+		}
+		snapshot := normalizeQuotaSnapshot(index, fileName, *item.Quota, refreshedAt, now)
+		if len(snapshot.Windows) == 0 {
+			continue
+		}
+		if fileName != "" {
+			quotas[fileName] = snapshot
+		}
+		if index != "" {
+			quotas[index] = snapshot
+		}
+	}
+	if len(quotas) == 0 {
+		s.recordRefreshError(errors.New("Keeper quota cache contained no usable Codex windows"))
+		return
+	}
+
+	pricing, pricingOK := fetchKeeperPricing(ctx, cfg, token)
+
+	s.mu.Lock()
+	quotas = s.mergePartialQuotaSnapshotsLocked(quotas, now)
+	s.updateCalibrationsLocked(quotas, now)
+	s.quotas = quotas
+	s.identities = indexToFile
+	if pricingOK {
+		s.pricing = pricing
+	}
+	s.lastRefresh = now
+	s.lastError = ""
+	s.refreshes++
+	s.mu.Unlock()
+	s.scheduleWarmup(ctx)
+}
+
+func fetchKeeperPricing(ctx context.Context, cfg pluginConfig, token string) (map[string]modelPricing, bool) {
+	body, status, err := keeperJSON(ctx, cfg.KeeperURL, token, http.MethodGet, "/pricing", nil)
+	if err != nil || status < 200 || status >= 300 {
+		return nil, false
+	}
+	var response struct {
+		Pricing []modelPricing `json:"pricing"`
+	}
+	if err := json.Unmarshal(body, &response); err != nil {
+		return nil, false
+	}
+	out := make(map[string]modelPricing, len(response.Pricing))
+	for _, pricing := range response.Pricing {
+		model := normalizeModelName(pricing.Model)
+		if model == "" {
+			continue
+		}
+		if pricing.PriceMultiplier < 0 {
+			pricing.PriceMultiplier = 1
+		}
+		out[model] = pricing
+	}
+	if len(out) == 0 {
+		return nil, false
+	}
+	return out, true
+}
+
+func (s *schedulerRuntimeState) recordRefreshError(err error) {
+	if err == nil {
+		return
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		// Reconfigure/shutdown cancels an in-flight Keeper request by design;
+		// it is not an outage and should not fill the CPA error log.
+		return
+	}
+	s.mu.Lock()
+	s.lastError = err.Error()
+	s.mu.Unlock()
+	// Do not include response bodies, URLs with credentials, or secret paths in
+	// the log.  The error is intentionally short and operationally actionable.
+	slog.Warn("codex-quota-scheduler: Keeper quota refresh unavailable", "error", err)
+}
+
+type keeperIdentity struct {
+	Identity  string `json:"identity"`
+	FileName  string `json:"file_name"`
+	Provider  string `json:"provider"`
+	Type      string `json:"type"`
+	IsDeleted bool   `json:"is_deleted"`
+}
+
+type keeperCacheResponse struct {
+	Items []keeperCacheItem `json:"items"`
+}
+
+type keeperCacheItem struct {
+	AuthIndex   string               `json:"auth_index"`
+	FileName    string               `json:"file_name"`
+	Status      string               `json:"status"`
+	Quota       *keeperCheckResponse `json:"quota"`
+	RefreshedAt json.RawMessage      `json:"refreshed_at"`
+}
+
+type keeperCheckResponse struct {
+	Quota                               []keeperQuotaRow `json:"quota"`
+	RateLimitResetCreditsAvailableCount *int             `json:"rateLimitResetCreditsAvailableCount"`
+}
+
+type keeperQuotaRow struct {
+	Key               string             `json:"key"`
+	Label             string             `json:"label"`
+	UsedPercent       *float64           `json:"usedPercent"`
+	Allowed           *bool              `json:"allowed"`
+	LimitReached      *bool              `json:"limitReached"`
+	Window            *keeperQuotaWindow `json:"window"`
+	ResetAt           json.RawMessage    `json:"resetAt"`
+	ResetAfterSeconds *int64             `json:"resetAfterSeconds"`
+	WindowUsageCost   *float64           `json:"window_usage_cost"`
+}
+
+type keeperQuotaWindow struct {
+	Seconds *int64 `json:"seconds"`
+}
+
+func normalizeQuotaSnapshot(index, fileName string, response keeperCheckResponse, refreshedAt, now time.Time) quotaSnapshot {
+	out := quotaSnapshot{AuthID: fileName, AuthIndex: index, RefreshedAt: refreshedAt}
+	if response.RateLimitResetCreditsAvailableCount != nil && *response.RateLimitResetCreditsAvailableCount > 0 {
+		out.ResetCredits = *response.RateLimitResetCreditsAvailableCount
+	}
+	for _, row := range response.Quota {
+		class := normalizeWindowClass(row.Label)
+		seconds := int64(0)
+		if row.Window != nil && row.Window.Seconds != nil {
+			seconds = *row.Window.Seconds
+		}
+		if class == "" {
+			class = windowClassFromSeconds(seconds)
+		}
+		if class == "" {
+			// A future Keeper window type should not make the plugin unusable;
+			// retain it as an unknown/lowest-priority window.
+			class = "unknown"
+		}
+		used := 0.0
+		if row.UsedPercent != nil {
+			used = clampPercent(*row.UsedPercent)
+		}
+		allowed := true
+		if row.Allowed != nil {
+			allowed = *row.Allowed
+		}
+		limitReached := false
+		if row.LimitReached != nil {
+			limitReached = *row.LimitReached
+		}
+		resetAt := parseKeeperTime(row.ResetAt)
+		if resetAt.IsZero() && row.ResetAfterSeconds != nil && *row.ResetAfterSeconds > 0 {
+			resetAt = now.Add(time.Duration(*row.ResetAfterSeconds) * time.Second)
+		}
+		window := quotaWindow{
+			Class:         class,
+			WindowSeconds: seconds,
+			UsedPercent:   used,
+			Allowed:       allowed,
+			LimitReached:  limitReached || used >= usedPercentThreshold,
+			ResetAt:       resetAt,
+			Source:        quotaSourceKeeper,
+			ObservedAt:    refreshedAt,
+		}
+		if row.WindowUsageCost != nil && *row.WindowUsageCost >= 0 {
+			window.WindowUsageCredits = *row.WindowUsageCost
+			window.WindowUsageCreditsKnown = true
+		}
+		out.Windows = append(out.Windows, window)
+	}
+	return out
+}
+
+func (s *schedulerRuntimeState) mergePartialQuotaSnapshotsLocked(current map[string]quotaSnapshot, now time.Time) map[string]quotaSnapshot {
+	if len(current) == 0 || len(s.quotas) == 0 {
+		return current
+	}
+	out := make(map[string]quotaSnapshot, len(current))
+	for key, snapshot := range current {
+		previous, ok := s.quotas[key]
+		if !ok && strings.TrimSpace(snapshot.AuthID) != "" {
+			previous, ok = s.quotas[strings.TrimSpace(snapshot.AuthID)]
+		}
+		if !ok && strings.TrimSpace(snapshot.AuthIndex) != "" {
+			previous, ok = s.quotas[strings.TrimSpace(snapshot.AuthIndex)]
+		}
+		if ok {
+			snapshot = mergePartialQuotaSnapshot(previous, snapshot, now, s.cfg.StaleAfter)
+		}
+		out[key] = snapshot
+	}
+	return out
+}
+
+func mergePartialQuotaSnapshot(previous, current quotaSnapshot, now time.Time, staleAfter time.Duration) quotaSnapshot {
+	if previous.RefreshedAt.IsZero() || now.Before(previous.RefreshedAt) || now.Sub(previous.RefreshedAt) > staleAfter {
+		return current
+	}
+	present := make(map[string]struct{}, len(current.Windows))
+	for _, window := range current.Windows {
+		present[window.Class] = struct{}{}
+	}
+	for _, window := range previous.Windows {
+		if _, ok := present[window.Class]; ok {
+			continue
+		}
+		if !window.ResetAt.IsZero() && !now.Before(window.ResetAt) {
+			continue
+		}
+		if window.ObservedAt.IsZero() {
+			window.ObservedAt = previous.RefreshedAt
+		}
+		current.Windows = append(current.Windows, window)
+		present[window.Class] = struct{}{}
+	}
+	return current
+}
+
+func windowClassFromSeconds(seconds int64) string {
+	switch {
+	case seconds > 0 && seconds <= 6*60*60:
+		return "5h"
+	case seconds > 6*60*60 && seconds <= 8*24*60*60:
+		return "weekly"
+	case seconds > 8*24*60*60 && seconds <= 35*24*60*60:
+		return "monthly"
+	default:
+		return ""
+	}
+}
+
+func clampPercent(v float64) float64 {
+	if v < 0 {
+		return 0
+	}
+	if v > 100 {
+		return 100
+	}
+	return v
+}
+
+func parseKeeperTime(raw json.RawMessage) time.Time {
+	if len(raw) == 0 || string(raw) == "null" {
+		return time.Time{}
+	}
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		text = strings.TrimSpace(text)
+		if text == "" {
+			return time.Time{}
+		}
+		if t, err := time.Parse(time.RFC3339Nano, text); err == nil {
+			return t
+		}
+		if n, err := strconv.ParseInt(text, 10, 64); err == nil && n > 0 {
+			return time.Unix(n, 0)
+		}
+		return time.Time{}
+	}
+	var number float64
+	if json.Unmarshal(raw, &number) == nil && number > 0 {
+		return time.Unix(int64(number), 0)
+	}
+	return time.Time{}
+}
+
+func (s *schedulerRuntimeState) keeperSession(ctx context.Context, cfg pluginConfig, password string, force bool) (string, error) {
+	now := time.Now()
+	s.mu.RLock()
+	if !force && s.sessionToken != "" && now.Before(s.sessionExpiry) {
+		token := s.sessionToken
+		s.mu.RUnlock()
+		return token, nil
+	}
+	s.mu.RUnlock()
+
+	payload, _ := json.Marshal(map[string]string{"password": password})
+	body, status, err := keeperJSON(ctx, cfg.KeeperURL, "", http.MethodPost, "/auth/login", payload)
+	if err != nil {
+		return "", err
+	}
+	if status < 200 || status >= 300 {
+		return "", fmt.Errorf("Keeper login returned HTTP %d", status)
+	}
+	var response struct {
+		SessionToken string `json:"session_token"`
+		Token        string `json:"token"`
+	}
+	if err := json.Unmarshal(body, &response); err != nil {
+		return "", fmt.Errorf("decode Keeper login response: %w", err)
+	}
+	token := strings.TrimSpace(response.SessionToken)
+	if token == "" {
+		token = strings.TrimSpace(response.Token)
+	}
+	if token == "" {
+		return "", errors.New("Keeper login returned no session token")
+	}
+	s.mu.Lock()
+	s.sessionToken = token
+	// Keeper's configured session TTL is currently one week.  Refreshing the
+	// cached token every six hours keeps behavior safe across deployments with a
+	// shorter TTL and avoids logging in on every quota tick.
+	s.sessionExpiry = now.Add(6 * time.Hour)
+	s.mu.Unlock()
+	return token, nil
+}
+
+func keeperJSON(ctx context.Context, baseURL, token, method, path string, body []byte) ([]byte, int, error) {
+	endpoint, err := keeperEndpoint(baseURL, path)
+	if err != nil {
+		return nil, 0, err
+	}
+	var reader io.Reader
+	if len(body) > 0 {
+		reader = strings.NewReader(string(body))
+	}
+	req, err := http.NewRequestWithContext(ctx, method, endpoint, reader)
+	if err != nil {
+		return nil, 0, err
+	}
+	req.Header.Set("X-CPA-Usage-Keeper-Request", "fetch")
+	req.Header.Set("X-CPA-Usage-Keeper-Embed", "cpamc")
+	if token != "" {
+		req.Header.Set("X-CPA-Usage-Keeper-Embed-Session", token)
+	}
+	if len(body) > 0 {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, 0, fmt.Errorf("Keeper request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	data, readErr := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if readErr != nil {
+		return nil, resp.StatusCode, fmt.Errorf("read Keeper response: %w", readErr)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return data, resp.StatusCode, fmt.Errorf("Keeper returned HTTP %d", resp.StatusCode)
+	}
+	return data, resp.StatusCode, nil
+}
+
+func keeperEndpoint(baseURL, path string) (string, error) {
+	baseURL = strings.TrimSpace(baseURL)
+	if baseURL == "" {
+		return "", errors.New("Keeper URL is empty")
+	}
+	u, err := url.Parse(baseURL)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return "", fmt.Errorf("invalid Keeper URL")
+	}
+	basePath := strings.TrimRight(u.Path, "/")
+	if !strings.HasSuffix(basePath, "/api/v1") {
+		basePath += "/api/v1"
+	}
+	u.Path = strings.TrimRight(basePath, "/") + "/" + strings.TrimLeft(path, "/")
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.String(), nil
+}
+
+// quotaWindowPatch carries only fields that were actually present and valid in
+// one upstream response. Pointers are intentional: a missing field must never
+// overwrite Keeper data with a zero value.
+type quotaWindowPatch struct {
+	Class         string
+	WindowSeconds *int64
+	UsedPercent   *float64
+	ResetAt       *time.Time
+}
+
+func (p quotaWindowPatch) hasQuotaSignal() bool {
+	return p.UsedPercent != nil || p.ResetAt != nil
+}
+
+// observeUsage is called on every Codex completion, not just 429s.  Response
+// headers are merged into an existing Keeper snapshot field by field.  A
+// header-only observation never advances RefreshedAt, which remains the
+// authoritative Keeper freshness boundary.
+func (s *schedulerRuntimeState) observeUsage(record pluginapi.UsageRecord) {
+	if !strings.EqualFold(strings.TrimSpace(record.Provider), providerCodex) {
+		return
+	}
+	s.observeUsageCost(record)
+	if len(record.ResponseHeaders) == 0 {
+		return
+	}
+	now := time.Now()
+	patches := quotaWindowPatchesFromHeaders(record.ResponseHeaders, now)
+	if len(patches) == 0 {
+		return
+	}
+	authID := strings.TrimSpace(record.AuthID)
+	authIndex := strings.TrimSpace(record.AuthIndex)
+	if authID == "" && authIndex == "" {
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if authID == "" && authIndex != "" {
+		authID = s.identities[authIndex]
+	}
+	old, ok := s.quotas[authID]
+	if !ok && authIndex != "" {
+		old, ok = s.quotas[authIndex]
+	}
+	if !ok {
+		// Headers expose only a subset of all possible windows.  Creating a
+		// schedulable snapshot from them alone could hide a monthly limit.
+		return
+	}
+	merged, changed, quotaSignal := mergeQuotaWindows(old.Windows, patches, now)
+	if !changed && !quotaSignal {
+		return
+	}
+	if old.AuthID == "" {
+		old.AuthID = authID
+	}
+	if old.AuthIndex == "" {
+		old.AuthIndex = authIndex
+	}
+	old.Windows = merged
+	if quotaSignal {
+		old.HeaderObservedAt = now
+	}
+	// Keeper's cache is the authoritative source for reset-credit counts.  The
+	// response header only exposes a boolean, so never overwrite a cached count.
+	if authID != "" {
+		s.quotas[authID] = old
+	}
+	if authIndex != "" {
+		s.quotas[authIndex] = old
+	}
+}
+
+func quotaWindowPatchesFromHeaders(headers http.Header, now time.Time) []quotaWindowPatch {
+	var out []quotaWindowPatch
+	for _, item := range []struct {
+		prefix string
+		class  string
+	}{{"x-codex-primary-", "5h"}, {"x-codex-secondary-", "weekly"}} {
+		patch := quotaWindowPatch{Class: item.class}
+		if raw := strings.TrimSpace(headers.Get(item.prefix + "window-minutes")); raw != "" {
+			if minutes, err := strconv.ParseInt(raw, 10, 64); err == nil && minutes > 0 {
+				seconds := minutes * 60
+				patch.WindowSeconds = &seconds
+				if derived := windowClassFromSeconds(seconds); derived != "" {
+					patch.Class = derived
+				}
+			}
+		}
+		if raw := strings.TrimSpace(headers.Get(item.prefix + "used-percent")); raw != "" {
+			if used, err := strconv.ParseFloat(raw, 64); err == nil {
+				used = clampPercent(used)
+				patch.UsedPercent = &used
+			}
+		}
+		if reset, ok := parseHeaderTimeValue(headers.Get(item.prefix + "reset-at")); ok {
+			patch.ResetAt = &reset
+		} else if raw := strings.TrimSpace(headers.Get(item.prefix + "reset-after-seconds")); raw != "" {
+			if after, err := strconv.ParseInt(raw, 10, 64); err == nil && after > 0 {
+				reset = now.Add(time.Duration(after) * time.Second)
+				patch.ResetAt = &reset
+			}
+		}
+		if patch.WindowSeconds != nil || patch.hasQuotaSignal() {
+			out = append(out, patch)
+		}
+	}
+	return out
+}
+
+func mergeQuotaWindows(existing []quotaWindow, patches []quotaWindowPatch, observedAt time.Time) ([]quotaWindow, bool, bool) {
+	out := append([]quotaWindow(nil), existing...)
+	changed := false
+	quotaSignal := false
+	for _, patch := range patches {
+		quotaSignal = quotaSignal || patch.hasQuotaSignal()
+		index := -1
+		for i := range out {
+			if out[i].Class == patch.Class {
+				index = i
+				break
+			}
+		}
+		if index < 0 {
+			// Window duration by itself is metadata, not an eligibility signal.
+			if !patch.hasQuotaSignal() {
+				continue
+			}
+			window := quotaWindow{Class: patch.Class, Allowed: true, Source: quotaSourceHeader, ObservedAt: observedAt}
+			if patch.WindowSeconds != nil {
+				window.WindowSeconds = *patch.WindowSeconds
+			}
+			if patch.UsedPercent != nil {
+				window.UsedPercent = *patch.UsedPercent
+				window.LimitReached = window.UsedPercent >= usedPercentThreshold
+			}
+			if patch.ResetAt != nil {
+				window.ResetAt = *patch.ResetAt
+			}
+			out = append(out, window)
+			changed = true
+			continue
+		}
+		window := out[index]
+		windowChanged := false
+		if patch.WindowSeconds != nil && window.WindowSeconds != *patch.WindowSeconds {
+			window.WindowSeconds = *patch.WindowSeconds
+			windowChanged = true
+		}
+		if patch.UsedPercent != nil {
+			limitReached := *patch.UsedPercent >= usedPercentThreshold
+			if window.UsedPercent != *patch.UsedPercent || window.LimitReached != limitReached {
+				window.UsedPercent = *patch.UsedPercent
+				window.LimitReached = limitReached
+				windowChanged = true
+			}
+		}
+		if patch.ResetAt != nil && !window.ResetAt.Equal(*patch.ResetAt) {
+			window.ResetAt = *patch.ResetAt
+			windowChanged = true
+		}
+		if patch.hasQuotaSignal() && (window.ObservedAt.IsZero() || observedAt.After(window.ObservedAt)) {
+			window.ObservedAt = observedAt
+			windowChanged = true
+		}
+		if windowChanged {
+			window.Source = mergeQuotaSource(window.Source, quotaSourceHeader)
+			changed = true
+		}
+		out[index] = window
+	}
+	return out, changed, quotaSignal
+}
+
+func mergeQuotaSource(current, incoming quotaSource) quotaSource {
+	if current == quotaSourceUnknown {
+		return incoming
+	}
+	if incoming == quotaSourceUnknown || current == incoming {
+		return current
+	}
+	return quotaSourceMixed
+}
+
+func quotaWindowsFromHeaders(headers http.Header, now time.Time) []quotaWindow {
+	windows, _, _ := mergeQuotaWindows(nil, quotaWindowPatchesFromHeaders(headers, now), now)
+	return windows
+}
+
+func parseHeaderTimeValue(raw string) (time.Time, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return time.Time{}, false
+	}
+	if n, err := strconv.ParseInt(raw, 10, 64); err == nil && n > 0 {
+		return time.Unix(n, 0), true
+	}
+	if value, err := time.Parse(time.RFC3339Nano, raw); err == nil {
+		return value, true
+	}
+	return time.Time{}, false
+}
+
+type schedulerChoice struct {
+	candidate pluginapi.SchedulerAuthCandidate
+	snapshot  quotaSnapshot
+	window    quotaWindow
+	rank      int
+	near      bool
+	unknown   bool
+}
+
+func codexOnlySchedulerRequest(req pluginapi.SchedulerPickRequest) bool {
+	if strings.TrimSpace(req.Provider) != "" && !strings.EqualFold(strings.TrimSpace(req.Provider), providerCodex) {
+		return false
+	}
+	for _, provider := range req.Providers {
+		if !strings.EqualFold(strings.TrimSpace(provider), providerCodex) {
+			return false
+		}
+	}
+	for _, candidate := range req.Candidates {
+		if !strings.EqualFold(strings.TrimSpace(candidate.Provider), providerCodex) {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *schedulerRuntimeState) schedulerPick(req pluginapi.SchedulerPickRequest) (pluginapi.SchedulerPickResponse, error) {
+	if len(req.Candidates) == 0 || !codexOnlySchedulerRequest(req) {
+		// Codex-only isolation is a hard boundary. Mixed and third-party routes
+		// always fall through to CPA without a plugin decision.
+		return pluginapi.SchedulerPickResponse{Handled: false}, nil
+	}
+	s.mu.RLock()
+	mode := normalizeSchedulerMode(s.cfg.SchedulerMode)
+	probeLease := s.cfg.HalfOpenProbeTimeout
+	s.mu.RUnlock()
+	if probeLease <= 0 {
+		probeLease = 15 * time.Minute
+	}
+
+	remaining := append([]pluginapi.SchedulerAuthCandidate(nil), req.Candidates...)
+	var lastLegacy pluginapi.SchedulerPickResponse
+	var lastDynamic pluginapi.SchedulerPickResponse
+	var lastCandidates []pacingCandidate
+	for len(remaining) > 0 {
+		now := time.Now()
+		attempt := req
+		attempt.Candidates = remaining
+		legacy := pluginapi.SchedulerPickResponse{Handled: false}
+		dynamic := pluginapi.SchedulerPickResponse{Handled: false}
+		returned := pluginapi.SchedulerPickResponse{Handled: false}
+		var candidates []pacingCandidate
+		if mode == "serial" {
+			returned = s.serialPick(attempt, now)
+		} else {
+			var err error
+			legacy, err = s.legacySchedulerPick(attempt, now)
+			if err != nil {
+				return pluginapi.SchedulerPickResponse{}, err
+			}
+			if mode != "legacy" {
+				dynamic, candidates = s.pacingPick(attempt, now)
+			}
+			returned = legacy
+			if mode == "enforce" && dynamic.Handled {
+				returned = dynamic
+			}
+		}
+		lastLegacy, lastDynamic, lastCandidates = legacy, dynamic, candidates
+		if !returned.Handled {
+			s.recordDecisionAudit(attempt, mode, legacy, dynamic, returned, candidates, now)
+			return returned, nil
+		}
+
+		allowed, probeStarted := banStore.tryStartProbe(returned.AuthID, now, probeLease)
+		if !allowed {
+			// Another concurrent pick won the half-open lease after this decision
+			// was ranked. Retry with that credential removed instead of issuing a
+			// second probe.
+			remaining = schedulerCandidatesWithout(remaining, returned.AuthID)
+			continue
+		}
+		if probeStarted {
+			s.persistAfterBanChange()
+			slog.Info("codex-quota-scheduler: half-open probe admitted", "auth_id", returned.AuthID, "lease_until", now.Add(probeLease).Format(time.RFC3339))
+		}
+		s.recordDecisionAudit(attempt, mode, legacy, dynamic, returned, candidates, now)
+		if returned.Handled {
+			for _, candidate := range candidates {
+				if candidate.Candidate.ID == returned.AuthID {
+					s.recordPredictedDebit(returned.AuthID, candidate.PredictedCredits)
+					break
+				}
+			}
+		}
+		return returned, nil
+	}
+
+	// Every candidate became unavailable while concurrent picks were racing for
+	// a half-open lease. Keep the plugin non-fatal and let CPA apply its normal
+	// no-auth/retry behavior; the audit still records the collision.
+	now := time.Now()
+	returned := pluginapi.SchedulerPickResponse{Handled: false}
+	s.recordDecisionAudit(req, mode, lastLegacy, lastDynamic, returned, lastCandidates, now)
+	return returned, nil
+}
+
+func schedulerCandidatesWithout(candidates []pluginapi.SchedulerAuthCandidate, authID string) []pluginapi.SchedulerAuthCandidate {
+	authID = strings.TrimSpace(authID)
+	out := make([]pluginapi.SchedulerAuthCandidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		if strings.TrimSpace(candidate.ID) == authID {
+			continue
+		}
+		out = append(out, candidate)
+	}
+	return out
+}
+
+func (s *schedulerRuntimeState) legacySchedulerPick(req pluginapi.SchedulerPickRequest, now time.Time) (pluginapi.SchedulerPickResponse, error) {
+	if len(req.Candidates) == 0 {
+		return pluginapi.SchedulerPickResponse{Handled: false}, nil
+	}
+	known := make([]schedulerChoice, 0, len(req.Candidates))
+	unknown := make([]pluginapi.SchedulerAuthCandidate, 0)
+	for _, candidate := range req.Candidates {
+		if !banStore.schedulable(candidate.ID, now) {
+			continue
+		}
+		snapshot, found := s.lookupQuota(candidate.ID)
+		if !found || !s.snapshotFresh(snapshot, now) {
+			unknown = append(unknown, candidate)
+			continue
+		}
+		evaluation := s.evaluateQuotaSnapshot(snapshot, now)
+		if !evaluation.Known {
+			unknown = append(unknown, candidate)
+			continue
+		}
+		if !evaluation.Eligible {
+			// One exhausted active window excludes the whole credential.
+			continue
+		}
+		window := evaluation.Bottleneck
+		known = append(known, schedulerChoice{
+			candidate: candidate,
+			snapshot:  snapshot,
+			window:    window,
+			rank:      s.windowRank(window.Class),
+			near:      window.UsedPercent >= s.softLimit(),
+		})
+	}
+	if len(known) == 0 {
+		if len(unknown) == 0 {
+			return pluginapi.SchedulerPickResponse{Handled: false}, nil
+		}
+		// Do not manufacture a quota decision when no fresh Keeper data exists.
+		// Preserve CPA's native fill-first/session-affinity behavior.
+		if len(unknown) == len(req.Candidates) {
+			return pluginapi.SchedulerPickResponse{Handled: false}, nil
+		}
+		// Some accounts were known but exhausted.  An unknown account is safer
+		// than sending traffic to a credential we know is full.
+		chosen := unknown[s.nextPick(len(unknown))]
+		return pluginapi.SchedulerPickResponse{AuthID: chosen.ID, Handled: true}, nil
+	}
+
+	sort.SliceStable(known, func(i, j int) bool {
+		return s.choiceLess(known[i], known[j])
+	})
+	// Rotate exact-score ties so two healthy accounts do not collapse onto one
+	// credential while preserving the explicit window/credit ordering.
+	best := known[0]
+	tieCount := 1
+	for tieCount < len(known) && s.choiceEquivalent(best, known[tieCount]) {
+		tieCount++
+	}
+	if tieCount > 1 {
+		best = known[s.nextPick(tieCount)]
+	}
+	return pluginapi.SchedulerPickResponse{AuthID: best.candidate.ID, Handled: true}, nil
+}
+
+func (s *schedulerRuntimeState) authIDForIndex(authIndex string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return strings.TrimSpace(s.identities[strings.TrimSpace(authIndex)])
+}
+
+func (s *schedulerRuntimeState) lookupQuota(authID string) (quotaSnapshot, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	snapshot, ok := s.quotas[strings.TrimSpace(authID)]
+	return snapshot, ok
+}
+
+func quotaSnapshotFresh(snapshot quotaSnapshot, now time.Time, staleAfter time.Duration) bool {
+	age := now.Sub(snapshot.RefreshedAt)
+	if snapshot.RefreshedAt.IsZero() || age < 0 || age > staleAfter {
+		return false
+	}
+	for _, window := range snapshot.Windows {
+		if !window.ResetAt.IsZero() && !now.Before(window.ResetAt) {
+			continue
+		}
+		observedAt := window.ObservedAt
+		if observedAt.IsZero() {
+			observedAt = snapshot.RefreshedAt
+		}
+		windowAge := now.Sub(observedAt)
+		if observedAt.IsZero() || windowAge < 0 || windowAge > staleAfter {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *schedulerRuntimeState) snapshotFresh(snapshot quotaSnapshot, now time.Time) bool {
+	s.mu.RLock()
+	staleAfter := s.cfg.StaleAfter
+	s.mu.RUnlock()
+	return quotaSnapshotFresh(snapshot, now, staleAfter)
+}
+
+func (s *schedulerRuntimeState) softLimit() float64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.cfg.SoftLimitPercent <= 0 {
+		return 98
+	}
+	return s.cfg.SoftLimitPercent
+}
+
+func (s *schedulerRuntimeState) windowRank(class string) int {
+	s.mu.RLock()
+	order := append([]string(nil), s.cfg.WindowOrder...)
+	s.mu.RUnlock()
+	for i, item := range order {
+		if item == class {
+			return i
+		}
+	}
+	return len(order) + 10
+}
+
+type quotaEvaluation struct {
+	Known         bool
+	Eligible      bool
+	Bottleneck    quotaWindow
+	ActiveWindows int
+	Reason        string
+}
+
+func (s *schedulerRuntimeState) evaluateQuotaSnapshot(snapshot quotaSnapshot, now time.Time) quotaEvaluation {
+	s.mu.RLock()
+	order := append([]string(nil), s.cfg.WindowOrder...)
+	s.mu.RUnlock()
+	return quotaEvaluationWithOrder(snapshot, now, order)
+}
+
+func (s *schedulerRuntimeState) windowMoreRestrictive(a, b quotaWindow) bool {
+	s.mu.RLock()
+	order := append([]string(nil), s.cfg.WindowOrder...)
+	s.mu.RUnlock()
+	return windowMoreRestrictiveWithOrder(a, b, order)
+}
+
+func (s *schedulerRuntimeState) bestWindow(snapshot quotaSnapshot, now time.Time) (quotaWindow, bool) {
+	evaluation := s.evaluateQuotaSnapshot(snapshot, now)
+	return evaluation.Bottleneck, evaluation.Known && evaluation.Eligible
+}
+
+func (s *schedulerRuntimeState) choiceLess(a, b schedulerChoice) bool {
+	if a.rank != b.rank {
+		return a.rank < b.rank
+	}
+	s.mu.RLock()
+	preferCredits := s.cfg.PreferResetCredits
+	s.mu.RUnlock()
+	if preferCredits && a.near && b.near && a.snapshot.ResetCredits != b.snapshot.ResetCredits {
+		return a.snapshot.ResetCredits > b.snapshot.ResetCredits
+	}
+	if a.near != b.near {
+		return !a.near
+	}
+	if a.window.UsedPercent != b.window.UsedPercent {
+		return a.window.UsedPercent < b.window.UsedPercent
+	}
+	if !a.window.ResetAt.Equal(b.window.ResetAt) {
+		if a.window.ResetAt.IsZero() {
+			return false
+		}
+		if b.window.ResetAt.IsZero() {
+			return true
+		}
+		return a.window.ResetAt.Before(b.window.ResetAt)
+	}
+	if a.candidate.Priority != b.candidate.Priority {
+		return a.candidate.Priority > b.candidate.Priority
+	}
+	return a.candidate.ID < b.candidate.ID
+}
+
+func (s *schedulerRuntimeState) choiceEquivalent(a, b schedulerChoice) bool {
+	s.mu.RLock()
+	preferCredits := s.cfg.PreferResetCredits
+	s.mu.RUnlock()
+	creditsEquivalent := !preferCredits || !(a.near && b.near) || a.snapshot.ResetCredits == b.snapshot.ResetCredits
+	return a.rank == b.rank && a.near == b.near &&
+		creditsEquivalent &&
+		a.window.UsedPercent == b.window.UsedPercent &&
+		a.candidate.Priority == b.candidate.Priority
+}
+
+func (s *schedulerRuntimeState) nextPick(n int) int {
+	if n <= 1 {
+		return 0
+	}
+	s.mu.Lock()
+	value := s.pickCounter
+	s.pickCounter++
+	s.mu.Unlock()
+	return int(value % uint64(n))
+}
+
+type persistedBanState struct {
+	Version                int                    `json:"version"`
+	Bans                   map[string]banEntry    `json:"bans"`
+	Warmups                map[string]warmupEntry `json:"warmups,omitempty"`
+	SerialActiveAuthID     string                 `json:"serial_active_auth_id,omitempty"`
+	SerialSelectedAt       time.Time              `json:"serial_selected_at,omitempty"`
+	SerialSwitches         uint64                 `json:"serial_switches,omitempty"`
+	SerialLastSwitchAt     time.Time              `json:"serial_last_switch_at,omitempty"`
+	SerialLastSwitchReason string                 `json:"serial_last_switch_reason,omitempty"`
+	SavedAt                time.Time              `json:"saved_at"`
+}
+
+func loadBanState(path string) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			slog.Warn("codex-quota-scheduler: could not read persisted ban state", "error", err)
+		}
+		return
+	}
+	var state persistedBanState
+	if err := json.Unmarshal(raw, &state); err != nil {
+		slog.Warn("codex-quota-scheduler: ignoring invalid persisted ban state", "error", err)
+		return
+	}
+	for authID, entry := range state.Bans {
+		if strings.TrimSpace(authID) == "" || entry.ResetAt.IsZero() {
+			continue
+		}
+		banStore.set(authID, entry)
+	}
+	schedulerRuntime.warmupMu.Lock()
+	if schedulerRuntime.warmups == nil {
+		schedulerRuntime.warmups = make(map[string]warmupEntry)
+	}
+	for key, entry := range state.Warmups {
+		if strings.TrimSpace(key) == "" || strings.TrimSpace(entry.AuthID) == "" || entry.AttemptedAt.IsZero() {
+			continue
+		}
+		schedulerRuntime.warmups[key] = entry
+	}
+	schedulerRuntime.warmupMu.Unlock()
+	schedulerRuntime.mu.Lock()
+	schedulerRuntime.serialActiveAuthID = strings.TrimSpace(state.SerialActiveAuthID)
+	schedulerRuntime.serialSelectedAt = state.SerialSelectedAt
+	schedulerRuntime.serialSwitches = state.SerialSwitches
+	schedulerRuntime.serialLastSwitchAt = state.SerialLastSwitchAt
+	schedulerRuntime.serialLastSwitchReason = strings.TrimSpace(state.SerialLastSwitchReason)
+	schedulerRuntime.mu.Unlock()
+}
+
+func (s *schedulerRuntimeState) persistBanState() {
+	// Serialize snapshot-and-rename, not only the rename. Otherwise an older
+	// concurrent snapshot could land after a newer one and lose quarantine
+	// state on the next process restart.
+	s.persistMu.Lock()
+	defer s.persistMu.Unlock()
+
+	s.mu.RLock()
+	path := strings.TrimSpace(s.cfg.StatePath)
+	serialActiveAuthID := strings.TrimSpace(s.serialActiveAuthID)
+	serialSelectedAt := s.serialSelectedAt
+	serialSwitches := s.serialSwitches
+	serialLastSwitchAt := s.serialLastSwitchAt
+	serialLastSwitchReason := strings.TrimSpace(s.serialLastSwitchReason)
+	s.mu.RUnlock()
+	if path == "" {
+		return
+	}
+	s.warmupMu.Lock()
+	warmups := make(map[string]warmupEntry, len(s.warmups))
+	for key, entry := range s.warmups {
+		warmups[key] = entry
+	}
+	s.warmupMu.Unlock()
+	state := persistedBanState{
+		Version:                4,
+		Bans:                   banStore.snapshot(),
+		Warmups:                warmups,
+		SerialActiveAuthID:     serialActiveAuthID,
+		SerialSelectedAt:       serialSelectedAt,
+		SerialSwitches:         serialSwitches,
+		SerialLastSwitchAt:     serialLastSwitchAt,
+		SerialLastSwitchReason: serialLastSwitchReason,
+		SavedAt:                time.Now(),
+	}
+	raw, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return
+	}
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		slog.Warn("codex-quota-scheduler: could not create ban state directory", "error", err)
+		return
+	}
+	tmp, err := os.CreateTemp(dir, ".state-*.tmp")
+	if err != nil {
+		slog.Warn("codex-quota-scheduler: could not create ban state temp file", "error", err)
+		return
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	_ = tmp.Chmod(0600)
+	if _, err := tmp.Write(raw); err != nil {
+		_ = tmp.Close()
+		return
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		return
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		slog.Warn("codex-quota-scheduler: could not persist ban state", "error", err)
+	}
+}
+
+type runtimeStatus struct {
+	Enabled             bool                     `json:"enabled"`
+	SchedulerMode       string                   `json:"scheduler_mode"`
+	SerialSwitchPercent float64                  `json:"serial_switch_percent"`
+	SerialActiveAuthID  string                   `json:"serial_active_auth_id,omitempty"`
+	SerialSelectedAt    string                   `json:"serial_selected_at,omitempty"`
+	SerialSwitches      uint64                   `json:"serial_switches"`
+	SerialLastSwitchAt  string                   `json:"serial_last_switch_at,omitempty"`
+	SerialSwitchReason  string                   `json:"serial_last_switch_reason,omitempty"`
+	ConfigGeneration    uint64                   `json:"config_generation"`
+	KeeperConfigured    bool                     `json:"keeper_configured"`
+	WarmupEnabled       bool                     `json:"warmup_enabled"`
+	Refreshes           int                      `json:"refreshes"`
+	LastRefresh         string                   `json:"last_refresh,omitempty"`
+	LastError           string                   `json:"last_error,omitempty"`
+	FreshSnapshots      int                      `json:"fresh_snapshots"`
+	WindowOrder         []string                 `json:"window_order"`
+	PricingModels       int                      `json:"pricing_models"`
+	CostProfiles        []runtimeCostProfile     `json:"cost_profiles"`
+	Pacing              []runtimePacingStatus    `json:"pacing,omitempty"`
+	StickyBindings      int                      `json:"sticky_bindings"`
+	SessionSwitches     uint64                   `json:"session_switches"`
+	ShadowDisagreements uint64                   `json:"shadow_disagreements"`
+	Quarantine          runtimeQuarantineStatus  `json:"quarantine"`
+	RecentDecisions     []schedulerDecisionAudit `json:"recent_decisions,omitempty"`
+	Snapshots           []runtimeQuotaStatus     `json:"snapshots,omitempty"`
+	Warmups             []runtimeWarmupStatus    `json:"warmups,omitempty"`
+}
+
+type runtimeQuotaStatus struct {
+	AuthID           string                     `json:"auth_id"`
+	AuthIndex        string                     `json:"auth_index,omitempty"`
+	Window           string                     `json:"window"`
+	UsedPercent      float64                    `json:"used_percent"`
+	ResetCredits     int                        `json:"reset_credits"`
+	ResetAt          string                     `json:"reset_at,omitempty"`
+	Fresh            bool                       `json:"fresh"`
+	Eligible         bool                       `json:"eligible"`
+	ActiveWindows    int                        `json:"active_windows"`
+	Reason           string                     `json:"reason,omitempty"`
+	Source           string                     `json:"source,omitempty"`
+	HeaderObservedAt string                     `json:"header_observed_at,omitempty"`
+	Windows          []runtimeQuotaWindowStatus `json:"windows,omitempty"`
+}
+
+type runtimeQuotaWindowStatus struct {
+	Window                  string  `json:"window"`
+	WindowSeconds           int64   `json:"window_seconds,omitempty"`
+	UsedPercent             float64 `json:"used_percent"`
+	RemainingPercent        float64 `json:"remaining_percent"`
+	Allowed                 bool    `json:"allowed"`
+	LimitReached            bool    `json:"limit_reached"`
+	Active                  bool    `json:"active"`
+	ResetAt                 string  `json:"reset_at,omitempty"`
+	Source                  string  `json:"source,omitempty"`
+	ObservedAt              string  `json:"observed_at,omitempty"`
+	WindowUsageCredits      float64 `json:"window_usage_credits,omitempty"`
+	WindowUsageCreditsKnown bool    `json:"window_usage_credits_known"`
+}
+
+type runtimeWarmupStatus struct {
+	AuthID      string `json:"auth_id"`
+	Window      string `json:"window"`
+	AttemptedAt string `json:"attempted_at,omitempty"`
+	ActivatedAt string `json:"activated_at,omitempty"`
+	ResetAt     string `json:"reset_at,omitempty"`
+	Status      int    `json:"status,omitempty"`
+	Error       string `json:"error,omitempty"`
+}
+
+type runtimeCostProfile struct {
+	Model   string  `json:"model"`
+	Effort  string  `json:"effort"`
+	Source  string  `json:"source"`
+	Samples int     `json:"samples"`
+	P75     float64 `json:"p75_credits"`
+	P90     float64 `json:"p90_credits"`
+	P95     float64 `json:"p95_credits"`
+}
+
+type runtimePacingStatus struct {
+	AuthID                   string                      `json:"auth_id"`
+	DeficitCredits           float64                     `json:"deficit_credits"`
+	DeficitPercent           float64                     `json:"deficit_percent"`
+	AccountDebtPercent       float64                     `json:"account_debt_percent"`
+	ReferenceCapacityCredits float64                     `json:"reference_capacity_credits"`
+	PendingPredictedRequests int                         `json:"pending_predicted_requests"`
+	LastAccruedAt            string                      `json:"last_accrued_at,omitempty"`
+	Windows                  []runtimePacingWindowStatus `json:"windows,omitempty"`
+}
+
+type runtimePacingWindowStatus struct {
+	Window                 string  `json:"window"`
+	RemainingPercent       float64 `json:"remaining_percent"`
+	ReservePercent         float64 `json:"reserve_percent"`
+	PacingDebtPercent      float64 `json:"pacing_debt_percent"`
+	CapacityCredits        float64 `json:"capacity_credits,omitempty"`
+	CapacitySamples        int     `json:"capacity_samples"`
+	CapacityUpdatedAt      string  `json:"capacity_updated_at,omitempty"`
+	TargetCreditsPerSecond float64 `json:"target_credits_per_second"`
+}
+
+type runtimeQuarantineStatus struct {
+	Total          int    `json:"total"`
+	Cooldown       int    `json:"cooldown"`
+	ProbeReady     int    `json:"probe_ready"`
+	HalfOpen       int    `json:"half_open"`
+	Probation      int    `json:"probation"`
+	Total429s      uint64 `json:"total_429s"`
+	Probation429s  uint64 `json:"probation_429s"`
+	ProbeStarts    uint64 `json:"probe_starts"`
+	ProbeSuccesses uint64 `json:"probe_successes"`
+	ProbeFailures  uint64 `json:"probe_failures"`
+}
+
+type pacingStateSnapshot struct {
+	DeficitCredits   float64
+	LastAccruedAt    time.Time
+	Capacities       map[string]capacityEstimate
+	PendingPredicted int
+}
+
+func runtimeCostProfileFor(model, effort string, samples []float64) runtimeCostProfile {
+	profile := runtimeCostProfile{Model: model, Effort: effort, Source: "bootstrap", Samples: len(samples)}
+	if len(samples) > 0 {
+		profile.Source = "observed"
+		profile.P75 = sampleQuantile(samples, 0.75)
+		profile.P90 = sampleQuantile(samples, 0.90)
+		profile.P95 = sampleQuantile(samples, 0.95)
+		return profile
+	}
+	profile.P75 = bootstrapCost(0.75)
+	profile.P90 = bootstrapCost(0.90)
+	profile.P95 = bootstrapCost(0.95)
+	return profile
+}
+
+func (s *schedulerRuntimeState) status() runtimeStatus {
+	s.mu.RLock()
+	cfg := s.cfg
+	quotas := make(map[string]quotaSnapshot, len(s.quotas))
+	for key, snapshot := range s.quotas {
+		quotas[key] = snapshot
+	}
+	costSamples := make(map[string][]float64, len(s.costSamples))
+	for key, samples := range s.costSamples {
+		costSamples[key] = append([]float64(nil), samples...)
+	}
+	globalCostSamples := append([]float64(nil), s.globalCostSamples...)
+	pacingStates := make(map[string]pacingStateSnapshot, len(s.pacingAccounts))
+	for authID, state := range s.pacingAccounts {
+		if state == nil {
+			continue
+		}
+		capacities := make(map[string]capacityEstimate, len(state.Capacities))
+		for class, estimate := range state.Capacities {
+			capacities[class] = estimate
+		}
+		pacingStates[authID] = pacingStateSnapshot{
+			DeficitCredits:   state.DeficitCredits,
+			LastAccruedAt:    state.LastAccruedAt,
+			Capacities:       capacities,
+			PendingPredicted: len(state.PendingPredicted),
+		}
+	}
+	decisions := make([]schedulerDecisionAudit, len(s.decisionHistory))
+	for index, decision := range s.decisionHistory {
+		decision.Candidates = append([]schedulerCandidateAudit(nil), decision.Candidates...)
+		decisions[index] = decision
+	}
+	bindings := make(map[string]stickyBinding, len(s.stickyBindings))
+	for key, binding := range s.stickyBindings {
+		bindings[key] = binding
+	}
+	lastRefresh := s.lastRefresh
+	lastError := s.lastError
+	refreshes := s.refreshes
+	pricingModels := len(s.pricing)
+	configGeneration := s.configGeneration
+	sessionSwitches := s.sessionSwitches
+	shadowDisagreements := s.shadowDisagreements
+	serialActiveAuthID := s.serialActiveAuthID
+	serialSelectedAt := s.serialSelectedAt
+	serialSwitches := s.serialSwitches
+	serialLastSwitchAt := s.serialLastSwitchAt
+	serialLastSwitchReason := s.serialLastSwitchReason
+	s.mu.RUnlock()
+
+	s.warmupMu.Lock()
+	warmups := make(map[string]warmupEntry, len(s.warmups))
+	for key, entry := range s.warmups {
+		warmups[key] = entry
+	}
+	s.warmupMu.Unlock()
+
+	now := time.Now()
+	stickyBindings := 0
+	stickyTTL := time.Duration(cfg.StickySeconds) * time.Second
+	for _, binding := range bindings {
+		if cfg.StickySeconds <= 0 || now.Sub(binding.LastUsedAt) <= stickyTTL {
+			stickyBindings++
+		}
+	}
+
+	costProfiles := []runtimeCostProfile{runtimeCostProfileFor("*", "*", globalCostSamples)}
+	for key, samples := range costSamples {
+		parts := strings.SplitN(key, "\x00", 2)
+		model, effort := parts[0], ""
+		if len(parts) == 2 {
+			effort = parts[1]
+		}
+		costProfiles = append(costProfiles, runtimeCostProfileFor(model, effort, samples))
+	}
+	sort.Slice(costProfiles[1:], func(i, j int) bool {
+		a, b := costProfiles[i+1], costProfiles[j+1]
+		if a.Model != b.Model {
+			return a.Model < b.Model
+		}
+		return a.Effort < b.Effort
+	})
+
+	count := 0
+	seen := make(map[string]struct{})
+	snapshots := make([]runtimeQuotaStatus, 0)
+	pacing := make([]runtimePacingStatus, 0)
+	for _, snapshot := range quotas {
+		canonical := strings.TrimSpace(snapshot.AuthID)
+		if canonical == "" {
+			canonical = strings.TrimSpace(snapshot.AuthIndex)
+		}
+		if canonical == "" {
+			continue
+		}
+		if _, ok := seen[canonical]; ok {
+			continue
+		}
+		seen[canonical] = struct{}{}
+		fresh := quotaSnapshotFresh(snapshot, now, cfg.StaleAfter)
+		if fresh {
+			count++
+		}
+		evaluation := quotaEvaluationWithOrder(snapshot, now, cfg.WindowOrder)
+		item := runtimeQuotaStatus{
+			AuthID:        canonical,
+			AuthIndex:     snapshot.AuthIndex,
+			Fresh:         fresh,
+			ResetCredits:  snapshot.ResetCredits,
+			Eligible:      evaluation.Known && evaluation.Eligible,
+			ActiveWindows: evaluation.ActiveWindows,
+			Reason:        evaluation.Reason,
+		}
+		window := evaluation.Bottleneck
+		if window.Class != "" {
+			item.Window = window.Class
+			item.UsedPercent = window.UsedPercent
+			item.Source = string(window.Source)
+			if !window.ResetAt.IsZero() {
+				item.ResetAt = window.ResetAt.Format(time.RFC3339)
+			}
+		}
+		if !snapshot.HeaderObservedAt.IsZero() {
+			item.HeaderObservedAt = snapshot.HeaderObservedAt.Format(time.RFC3339)
+		}
+		for _, quotaWindow := range snapshot.Windows {
+			active := quotaWindow.ResetAt.IsZero() || now.Before(quotaWindow.ResetAt)
+			windowStatus := runtimeQuotaWindowStatus{
+				Window:                  quotaWindow.Class,
+				WindowSeconds:           quotaWindow.WindowSeconds,
+				UsedPercent:             quotaWindow.UsedPercent,
+				RemainingPercent:        math.Max(0, 100-quotaWindow.UsedPercent),
+				Allowed:                 quotaWindow.Allowed,
+				LimitReached:            quotaWindow.LimitReached,
+				Active:                  active,
+				Source:                  string(quotaWindow.Source),
+				WindowUsageCredits:      quotaWindow.WindowUsageCredits,
+				WindowUsageCreditsKnown: quotaWindow.WindowUsageCreditsKnown,
+			}
+			if !quotaWindow.ResetAt.IsZero() {
+				windowStatus.ResetAt = quotaWindow.ResetAt.Format(time.RFC3339)
+			}
+			observedAt := quotaWindow.ObservedAt
+			if observedAt.IsZero() {
+				observedAt = snapshot.RefreshedAt
+			}
+			if !observedAt.IsZero() {
+				windowStatus.ObservedAt = observedAt.Format(time.RFC3339)
+			}
+			item.Windows = append(item.Windows, windowStatus)
+		}
+		sort.Slice(item.Windows, func(i, j int) bool {
+			return windowRankInOrder(item.Windows[i].Window, cfg.WindowOrder) < windowRankInOrder(item.Windows[j].Window, cfg.WindowOrder)
+		})
+		snapshots = append(snapshots, item)
+
+		state, ok := pacingStates[canonical]
+		if !ok && strings.TrimSpace(snapshot.AuthIndex) != "" {
+			state, ok = pacingStates[strings.TrimSpace(snapshot.AuthIndex)]
+		}
+		pacingItem := runtimePacingStatus{AuthID: canonical}
+		if ok {
+			pacingItem.DeficitCredits = state.DeficitCredits
+			pacingItem.PendingPredictedRequests = state.PendingPredicted
+			if !state.LastAccruedAt.IsZero() {
+				pacingItem.LastAccruedAt = state.LastAccruedAt.Format(time.RFC3339)
+			}
+		}
+		accountDebt := math.Inf(1)
+		referenceCapacity := math.Inf(1)
+		for _, quotaWindow := range snapshot.Windows {
+			if !quotaWindow.ResetAt.IsZero() && !now.Before(quotaWindow.ResetAt) {
+				continue
+			}
+			reserve := reserveForWindow(cfg, quotaWindow.Class)
+			estimate := state.Capacities[quotaWindow.Class]
+			windowStatus := runtimePacingWindowStatus{
+				Window:            quotaWindow.Class,
+				RemainingPercent:  math.Max(0, 100-quotaWindow.UsedPercent),
+				ReservePercent:    reserve,
+				PacingDebtPercent: windowPacingDebtPercent(quotaWindow, reserve, now),
+				CapacityCredits:   estimate.Credits,
+				CapacitySamples:   estimate.Samples,
+			}
+			if !estimate.UpdatedAt.IsZero() {
+				windowStatus.CapacityUpdatedAt = estimate.UpdatedAt.Format(time.RFC3339)
+			}
+			if estimate.Credits > 0 {
+				if estimate.Credits < referenceCapacity {
+					referenceCapacity = estimate.Credits
+				}
+				if !quotaWindow.ResetAt.IsZero() {
+					secondsLeft := quotaWindow.ResetAt.Sub(now).Seconds()
+					if secondsLeft > 0 {
+						windowStatus.TargetCreditsPerSecond = estimate.Credits * math.Max(0, windowStatus.RemainingPercent-reserve) / 100 / secondsLeft
+					}
+				}
+			}
+			if windowStatus.PacingDebtPercent < accountDebt {
+				accountDebt = windowStatus.PacingDebtPercent
+			}
+			pacingItem.Windows = append(pacingItem.Windows, windowStatus)
+		}
+		if !math.IsInf(accountDebt, 1) {
+			pacingItem.AccountDebtPercent = accountDebt
+		}
+		if !math.IsInf(referenceCapacity, 1) && referenceCapacity > 0 {
+			pacingItem.ReferenceCapacityCredits = referenceCapacity
+			pacingItem.DeficitPercent = pacingItem.DeficitCredits * 100 / referenceCapacity
+		}
+		sort.Slice(pacingItem.Windows, func(i, j int) bool {
+			return windowRankInOrder(pacingItem.Windows[i].Window, cfg.WindowOrder) < windowRankInOrder(pacingItem.Windows[j].Window, cfg.WindowOrder)
+		})
+		pacing = append(pacing, pacingItem)
+	}
+	sort.Slice(snapshots, func(i, j int) bool { return snapshots[i].AuthID < snapshots[j].AuthID })
+	sort.Slice(pacing, func(i, j int) bool { return pacing[i].AuthID < pacing[j].AuthID })
+
+	banSnapshot := banStore.snapshot()
+	banStats := banStore.stats()
+	quarantine := runtimeQuarantineStatus{
+		Total:          len(banSnapshot),
+		Total429s:      banStats.Total429s,
+		Probation429s:  banStats.Probation429s,
+		ProbeStarts:    banStats.ProbeStarts,
+		ProbeSuccesses: banStats.ProbeSuccesses,
+		ProbeFailures:  banStats.ProbeFailures,
+	}
+	for _, entry := range banSnapshot {
+		if entry.Kind == banKindProbation {
+			quarantine.Probation++
+		}
+		switch banEntryDisposition(entry, now) {
+		case banDispositionCooldown:
+			quarantine.Cooldown++
+		case banDispositionProbeReady:
+			quarantine.ProbeReady++
+		case banDispositionHalfOpen:
+			quarantine.HalfOpen++
+		}
+	}
+
+	out := runtimeStatus{
+		Enabled:             cfg.Enabled,
+		SchedulerMode:       cfg.SchedulerMode,
+		SerialSwitchPercent: cfg.SerialSwitchPercent,
+		SerialActiveAuthID:  serialActiveAuthID,
+		SerialSwitches:      serialSwitches,
+		SerialSwitchReason:  serialLastSwitchReason,
+		ConfigGeneration:    configGeneration,
+		KeeperConfigured:    strings.TrimSpace(cfg.KeeperURL) != "",
+		WarmupEnabled:       cfg.WarmupEnabled,
+		Refreshes:           refreshes,
+		FreshSnapshots:      count,
+		WindowOrder:         append([]string(nil), cfg.WindowOrder...),
+		PricingModels:       pricingModels,
+		CostProfiles:        costProfiles,
+		Pacing:              pacing,
+		StickyBindings:      stickyBindings,
+		SessionSwitches:     sessionSwitches,
+		ShadowDisagreements: shadowDisagreements,
+		Quarantine:          quarantine,
+		LastError:           lastError,
+		Snapshots:           snapshots,
+	}
+	if !serialSelectedAt.IsZero() {
+		out.SerialSelectedAt = serialSelectedAt.Format(time.RFC3339)
+	}
+	if !serialLastSwitchAt.IsZero() {
+		out.SerialLastSwitchAt = serialLastSwitchAt.Format(time.RFC3339)
+	}
+	for index := len(decisions) - 1; index >= 0; index-- {
+		out.RecentDecisions = append(out.RecentDecisions, decisions[index])
+	}
+	for _, entry := range warmups {
+		item := runtimeWarmupStatus{AuthID: entry.AuthID, Window: entry.Window, Status: entry.Status, Error: entry.Error}
+		if !entry.AttemptedAt.IsZero() {
+			item.AttemptedAt = entry.AttemptedAt.Format(time.RFC3339)
+		}
+		if !entry.ActivatedAt.IsZero() {
+			item.ActivatedAt = entry.ActivatedAt.Format(time.RFC3339)
+		}
+		if !entry.ResetAt.IsZero() {
+			item.ResetAt = entry.ResetAt.Format(time.RFC3339)
+		}
+		out.Warmups = append(out.Warmups, item)
+	}
+	sort.Slice(out.Warmups, func(i, j int) bool {
+		if out.Warmups[i].AuthID != out.Warmups[j].AuthID {
+			return out.Warmups[i].AuthID < out.Warmups[j].AuthID
+		}
+		return out.Warmups[i].Window < out.Warmups[j].Window
+	})
+	if !lastRefresh.IsZero() {
+		out.LastRefresh = lastRefresh.Format(time.RFC3339)
+	}
+	return out
+}
+
+func (s *schedulerRuntimeState) persistAfterBanChange() {
+	s.persistBanState()
+}
+
+func (s *schedulerRuntimeState) banDurations() (fallback, max time.Duration) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	fallback, max = s.cfg.FallbackBan, s.cfg.MaxBan
+	if fallback <= 0 {
+		fallback = 15 * time.Minute
+	}
+	if max <= 0 {
+		max = 24 * time.Hour
+	}
+	return fallback, max
+}
+
+func (s *schedulerRuntimeState) halfOpenRetryAfter() time.Duration {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	retryAfter := s.cfg.HalfOpenRetryAfter
+	if retryAfter <= 0 {
+		retryAfter = 2 * time.Minute
+	}
+	return retryAfter
+}

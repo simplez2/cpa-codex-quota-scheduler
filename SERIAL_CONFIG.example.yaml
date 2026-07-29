@@ -1,0 +1,44 @@
+# Recommended configuration for Codex Quota Scheduler v0.1.0.
+# Secrets stay in mounted files. This plugin does not change model names,
+# provider routes, OAuth/PAT state, or third-party APIs.
+plugins:
+  enabled: true
+  configs:
+    codex-quota-scheduler:
+      enabled: true
+      priority: 2000
+
+      # One global active account. It switches only at the configured quota
+      # threshold, on 429/quarantine, or when CPA removes the auth candidate.
+      scheduler_mode: serial
+      serial_switch_percent: 98
+      serial_prefer_active_cycle: true
+
+      keeper_url: http://cpa-usage-keeper:8080/keeper
+      keeper_password_file: /run/secrets/keeper_login_password
+      refresh_interval: 30s
+      stale_after: 45m
+
+      state_path: /var/lib/codex-quota-scheduler/state.json
+
+      fallback_ban: 15m
+      max_ban: 24h
+      half_open_probe_timeout: 15m
+      half_open_retry_after: 2m
+
+      # Weekly accounts are selected before monthly accounts. Within the same
+      # class, an active cycle and then higher used percentage are preferred.
+      prefer_reset_credits: true
+      window_order:
+        - 5h
+        - weekly
+        - monthly
+
+      # Warmup is allowed only for the current serial account. Backups remain
+      # dormant until the scheduler actually switches to them.
+      warmup_enabled: true
+      warmup_model: gpt-5.6-sol
+      warmup_sidecar_url: http://codex-agent-identity-sidecar:8787/backend-api/codex
+      warmup_retry_after: 15m
+      cpa_management_url: http://127.0.0.1:8317/v0/management/api-call
+      cpa_management_key_file: /run/secrets/management_key

@@ -1,0 +1,10 @@
+# Local build artifacts
+*.dll
+*.so
+*.dylib
+*.h
+
+
+# OS clutter
+.DS_Store
+Thumbs.db

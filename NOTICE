@@ -1,0 +1,11 @@
+Codex Quota Scheduler
+
+Copyright (c) 2026 simplez2
+
+This project is derived from codex-429-autoban by ysxk:
+https://github.com/ysxk/codex-429-autoban
+
+The upstream project is licensed under the MIT License. The original copyright
+notice is retained in LICENSE. Modifications include serial fill-first quota
+scheduling, persisted active-account state, active-account-only warmup,
+authenticated management-only diagnostics, and additional tests.
