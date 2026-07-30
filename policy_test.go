@@ -11,7 +11,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-func TestSerialSchedulerPrefersWeeklyAccountBeforeMonthly(t *testing.T) {
+func TestSerialSchedulerFollowsConfiguredWindowOrder(t *testing.T) {
 	now := time.Now()
 	cfg := defaultPluginConfig()
 	cfg.StatePath = ""
@@ -35,8 +35,8 @@ func TestSerialSchedulerPrefersWeeklyAccountBeforeMonthly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.AuthID != "weekly" || !got.Handled {
-		t.Fatalf("selected %q, handled=%v; want weekly/true", got.AuthID, got.Handled)
+	if got.AuthID != "five-hour" || !got.Handled {
+		t.Fatalf("selected %q, handled=%v; want five-hour/true", got.AuthID, got.Handled)
 	}
 }
 
@@ -115,14 +115,97 @@ func TestObserveUsageMergesOnlyPresentHeaderFields(t *testing.T) {
 		},
 	})
 	got = state.quotas["acct"]
+	if got.Windows[0].UsedPercent != 7 || !got.Windows[0].ResetAt.Equal(resetAt) {
+		t.Fatalf("durationless patch overwrote Keeper values: %#v", got.Windows[0])
+	}
+	if !got.RefreshedAt.Equal(refreshedAt) || !got.HeaderObservedAt.IsZero() {
+		t.Fatalf("durationless patch changed freshness: keeper=%v header=%v", got.RefreshedAt, got.HeaderObservedAt)
+	}
+
+	state.observeUsage(pluginapi.UsageRecord{
+		Provider: providerCodex,
+		AuthID:   "acct",
+		ResponseHeaders: http.Header{
+			"X-Codex-Secondary-Window-Minutes": []string{"10080"},
+			"X-Codex-Secondary-Used-Percent":   []string{"9"},
+		},
+	})
+	got = state.quotas["acct"]
 	if got.Windows[0].UsedPercent != 9 || !got.Windows[0].ResetAt.Equal(resetAt) {
-		t.Fatalf("used-percent patch did not preserve reset: %#v", got.Windows[0])
+		t.Fatalf("validated patch did not preserve reset: %#v", got.Windows[0])
 	}
 	if !got.RefreshedAt.Equal(refreshedAt) || got.HeaderObservedAt.IsZero() {
-		t.Fatalf("header signal freshness was not separated: keeper=%v header=%v", got.RefreshedAt, got.HeaderObservedAt)
+		t.Fatalf("validated header freshness was not separated: keeper=%v header=%v", got.RefreshedAt, got.HeaderObservedAt)
 	}
 	if got.Windows[0].Source != quotaSourceMixed {
 		t.Fatalf("merged source=%q; want mixed", got.Windows[0].Source)
+	}
+}
+
+func TestObserveUsageIgnoresZeroDurationPlaceholder(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	state := schedulerRuntimeState{
+		cfg: defaultPluginConfig(),
+		quotas: map[string]quotaSnapshot{
+			"acct": {
+				AuthID:      "acct",
+				RefreshedAt: now,
+				Windows: []quotaWindow{{
+					Class:         "weekly",
+					WindowSeconds: 7 * 24 * 60 * 60,
+					UsedPercent:   92,
+					Allowed:       true,
+					Source:        quotaSourceKeeper,
+				}},
+			},
+		},
+		identities: map[string]string{},
+	}
+
+	state.observeUsage(pluginapi.UsageRecord{
+		Provider: providerCodex,
+		AuthID:   "acct",
+		ResponseHeaders: http.Header{
+			"X-Codex-Secondary-Window-Minutes": []string{"0"},
+			"X-Codex-Secondary-Used-Percent":   []string{"0"},
+		},
+	})
+
+	got := state.quotas["acct"]
+	if len(got.Windows) != 1 || got.Windows[0].UsedPercent != 92 || got.Windows[0].Source != quotaSourceKeeper {
+		t.Fatalf("placeholder corrupted Keeper quota: %#v", got.Windows)
+	}
+}
+
+func TestSerialSchedulerPrefersResetCreditWithinWindowClass(t *testing.T) {
+	now := time.Now()
+	cfg := defaultPluginConfig()
+	cfg.StatePath = ""
+	state := schedulerRuntimeState{
+		cfg: cfg,
+		quotas: map[string]quotaSnapshot{
+			"active": {
+				AuthID: "active", RefreshedAt: now,
+				Windows: []quotaWindow{{Class: "weekly", UsedPercent: 50, Allowed: true}},
+			},
+			"credit": {
+				AuthID: "credit", RefreshedAt: now, ResetCredits: 1,
+				Windows: []quotaWindow{{Class: "weekly", UsedPercent: 0, Allowed: true}},
+			},
+		},
+	}
+	got, err := state.schedulerPick(pluginapi.SchedulerPickRequest{
+		Provider: providerCodex,
+		Candidates: []pluginapi.SchedulerAuthCandidate{
+			{ID: "active", Provider: providerCodex},
+			{ID: "credit", Provider: providerCodex},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Handled || got.AuthID != "credit" {
+		t.Fatalf("selected %#v; want reset-credit account", got)
 	}
 }
 

@@ -763,29 +763,32 @@ func (s *schedulerRuntimeState) observeUsage(record pluginapi.UsageRecord) {
 
 func quotaWindowPatchesFromHeaders(headers http.Header, now time.Time) []quotaWindowPatch {
 	var out []quotaWindowPatch
-	for _, item := range []struct {
-		prefix string
-		class  string
-	}{{"x-codex-primary-", "5h"}, {"x-codex-secondary-", "weekly"}} {
-		patch := quotaWindowPatch{Class: item.class}
-		if raw := strings.TrimSpace(headers.Get(item.prefix + "window-minutes")); raw != "" {
-			if minutes, err := strconv.ParseInt(raw, 10, 64); err == nil && minutes > 0 {
-				seconds := minutes * 60
-				patch.WindowSeconds = &seconds
-				if derived := windowClassFromSeconds(seconds); derived != "" {
-					patch.Class = derived
-				}
-			}
+	for _, prefix := range []string{"x-codex-primary-", "x-codex-secondary-"} {
+		// Primary/secondary describe positions, not window classes. OpenAI can
+		// emit an unused secondary placeholder with zero duration and 0% used.
+		// Inferring a class from the position would then overwrite a real Keeper
+		// weekly/monthly window. Only accept a header window whose positive
+		// duration maps to a class we understand.
+		rawMinutes := strings.TrimSpace(headers.Get(prefix + "window-minutes"))
+		minutes, err := strconv.ParseInt(rawMinutes, 10, 64)
+		if err != nil || minutes <= 0 {
+			continue
 		}
-		if raw := strings.TrimSpace(headers.Get(item.prefix + "used-percent")); raw != "" {
+		seconds := minutes * 60
+		class := windowClassFromSeconds(seconds)
+		if class == "" {
+			continue
+		}
+		patch := quotaWindowPatch{Class: class, WindowSeconds: &seconds}
+		if raw := strings.TrimSpace(headers.Get(prefix + "used-percent")); raw != "" {
 			if used, err := strconv.ParseFloat(raw, 64); err == nil {
 				used = clampPercent(used)
 				patch.UsedPercent = &used
 			}
 		}
-		if reset, ok := parseHeaderTimeValue(headers.Get(item.prefix + "reset-at")); ok {
+		if reset, ok := parseHeaderTimeValue(headers.Get(prefix + "reset-at")); ok {
 			patch.ResetAt = &reset
-		} else if raw := strings.TrimSpace(headers.Get(item.prefix + "reset-after-seconds")); raw != "" {
+		} else if raw := strings.TrimSpace(headers.Get(prefix + "reset-after-seconds")); raw != "" {
 			if after, err := strconv.ParseInt(raw, 10, 64); err == nil && after > 0 {
 				reset = now.Add(time.Duration(after) * time.Second)
 				patch.ResetAt = &reset

@@ -2,7 +2,7 @@
 
 面向 CPA（CLIProxyAPI）的 Codex 串行配额调度与 429 自动隔离插件。
 
-当前版本：`v0.1.2`。
+当前版本：`v0.1.3`。
 
 ## 解决的问题
 
@@ -16,19 +16,20 @@
 
 默认切换阈值是任一活动窗口达到 `98% used`。这是为了在硬 429 前留下很小的并发余量；若你确实希望完全用尽，可把 `serial_switch_percent` 设为 `100`。
 
-CPA 会在上游 `408/5xx` 后把账号临时移出候选池约 60 秒。`v0.1.2` 将这种情况作为 request-local provisional fallback：固定使用一个临时备用账号，但保留原主账号且不增加正式切换次数；主账号恢复后自动回归。只有候选持续缺席至少 90 秒并经过 3 次确认，才以 `candidate_unavailable_confirmed` 正式切换。pinned 预热和半开探测竞争也不会污染全局主账号。
+CPA 会在上游 `408/5xx` 后把账号临时移出候选池约 60 秒。插件将这种情况作为 request-local provisional fallback：固定使用一个临时备用账号，但保留原主账号且不增加正式切换次数；主账号恢复后自动回归。只有候选持续缺席至少 90 秒并经过 3 次确认，才以 `candidate_unavailable_confirmed` 正式切换。pinned 预热和半开探测竞争也不会污染全局主账号。
+
+`v0.1.3` 还会拒绝没有正数窗口时长的 Primary/Secondary 占位配额头，防止 `window-minutes=0`、`used-percent=0` 把 Keeper 的真实周/月窗口覆盖成伪 weekly。
 
 ## 账号选择顺序
 
 首次选择或发生切换时，插件按以下顺序选择下一个健康账号：
 
-1. 周窗口账号；
-2. 月窗口账号；
-3. 只有 5 小时窗口或 Keeper 类型未知的账号；
-4. 同类中优先已经启动周期的账号；
-5. 开启 `prefer_reset_credits` 时，优先有 reset credit 的账号；
-6. 再优先已用比例更高的账号，以集中消耗；
-7. 最后按 CPA priority 和稳定 auth ID 排序。
+1. 按 `window_order` 排序，默认是 5 小时窗口、周窗口、月窗口；
+2. Keeper 类型未知的账号排在已识别窗口之后；
+3. 开启 `prefer_reset_credits` 时，同类中优先有 reset credit 的账号；
+4. 再优先已经启动周期的账号；
+5. 再优先已用比例更高的账号，以集中消耗；
+6. 最后按 CPA priority 和稳定 auth ID 排序。
 
 选定后，其他账号即使出现更高分、更高优先级或来自另一个会话，也不会抢占当前主账号。
 

@@ -32,39 +32,20 @@ type serialCandidate struct {
 	ResetCredits int
 }
 
-func serialWindowClass(snapshot quotaSnapshot) string {
-	hasFiveHour := false
-	hasMonthly := false
+func serialWindowClass(snapshot quotaSnapshot, order []string) string {
+	selected := "unknown"
+	selectedRank := windowRankInOrder(selected, order)
 	for _, window := range snapshot.Windows {
-		switch window.Class {
-		case "weekly":
-			return "weekly"
-		case "monthly":
-			hasMonthly = true
-		case "5h":
-			hasFiveHour = true
+		class := normalizeWindowClass(window.Class)
+		if class == "" {
+			continue
+		}
+		if rank := windowRankInOrder(class, order); rank < selectedRank {
+			selected = class
+			selectedRank = rank
 		}
 	}
-	if hasMonthly {
-		return "monthly"
-	}
-	if hasFiveHour {
-		return "5h"
-	}
-	return "unknown"
-}
-
-func serialWindowRank(class string) int {
-	switch class {
-	case "weekly":
-		return 0
-	case "monthly":
-		return 1
-	case "5h":
-		return 2
-	default:
-		return 3
-	}
+	return selected
 }
 
 func inspectSerialCandidate(candidate pluginapi.SchedulerAuthCandidate, snapshot quotaSnapshot, found bool, cfg pluginConfig, now time.Time) serialCandidate {
@@ -81,7 +62,7 @@ func inspectSerialCandidate(candidate pluginapi.SchedulerAuthCandidate, snapshot
 
 	choice.QuotaKnown = true
 	choice.Reason = "eligible"
-	choice.WindowClass = serialWindowClass(snapshot)
+	choice.WindowClass = serialWindowClass(snapshot, cfg.WindowOrder)
 	choice.ResetCredits = snapshot.ResetCredits
 	threshold := cfg.SerialSwitchPercent
 	if threshold <= 0 || threshold > 100 {
@@ -117,14 +98,14 @@ func inspectSerialCandidate(candidate pluginapi.SchedulerAuthCandidate, snapshot
 }
 
 func serialCandidateLess(a, b serialCandidate, cfg pluginConfig) bool {
-	if rankA, rankB := serialWindowRank(a.WindowClass), serialWindowRank(b.WindowClass); rankA != rankB {
+	if rankA, rankB := windowRankInOrder(a.WindowClass, cfg.WindowOrder), windowRankInOrder(b.WindowClass, cfg.WindowOrder); rankA != rankB {
 		return rankA < rankB
-	}
-	if cfg.SerialPreferActiveCycle && a.CycleActive != b.CycleActive {
-		return a.CycleActive
 	}
 	if cfg.PreferResetCredits && (a.ResetCredits > 0) != (b.ResetCredits > 0) {
 		return a.ResetCredits > 0
+	}
+	if cfg.SerialPreferActiveCycle && a.CycleActive != b.CycleActive {
+		return a.CycleActive
 	}
 	if a.MaxUsed != b.MaxUsed {
 		return a.MaxUsed > b.MaxUsed
