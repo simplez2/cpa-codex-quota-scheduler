@@ -65,7 +65,7 @@ import (
 
 const (
 	pluginName    = "codex-quota-scheduler"
-	pluginVersion = "0.1.3"
+	pluginVersion = "0.1.4"
 
 	// providerCodex is the CPA provider key for OpenAI Codex (ChatGPT backend).
 	providerCodex = "codex"
@@ -492,7 +492,7 @@ func pluginRegistration() registration {
 			Author:           "simplez2",
 			GitHubRepository: "https://github.com/simplez2/cpa-codex-quota-scheduler",
 			ConfigFields: []pluginapi.ConfigField{
-				{Name: "scheduler_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"serial", "legacy", "shadow", "enforce"}, Description: "Runtime policy mode. Serial keeps one global active Codex auth and switches only when it is unsafe or unavailable."},
+				{Name: "scheduler_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"serial", "legacy", "shadow", "enforce"}, Description: "Runtime policy mode. Serial keeps one global active Codex auth, but strictly preempts it when a higher-priority quota window becomes available."},
 				{Name: "serial_switch_percent", Type: pluginapi.ConfigFieldTypeNumber, Description: "In serial mode, switch away when any active quota window reaches this used percentage. Defaults to 98."},
 				{Name: "serial_prefer_active_cycle", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Prefer an already-started quota cycle when choosing the next serial auth."},
 				{Name: "keeper_url", Type: pluginapi.ConfigFieldTypeString, Description: "Keeper base URL, for example http://cpa-usage-keeper:8080/keeper."},

@@ -96,6 +96,123 @@ func TestSerialSchedulerSwitchesAtConfiguredThreshold(t *testing.T) {
 	}
 }
 
+func TestSerialSchedulerPreemptsMonthlyWhenWeeklyBecomesEligible(t *testing.T) {
+	resetBanStoreForTest()
+	now := time.Now()
+	cfg := defaultPluginConfig()
+	cfg.StatePath = ""
+	state := schedulerRuntimeState{
+		cfg: cfg,
+		quotas: map[string]quotaSnapshot{
+			"monthly": {
+				AuthID: "monthly", RefreshedAt: now,
+				Windows: []quotaWindow{{Class: "monthly", UsedPercent: 4, Allowed: true, ResetAt: now.Add(30 * 24 * time.Hour), ObservedAt: now}},
+			},
+			"weekly": {
+				AuthID: "weekly", RefreshedAt: now,
+				Windows: []quotaWindow{{Class: "weekly", UsedPercent: 100, Allowed: true, LimitReached: true, ResetAt: now.Add(7 * 24 * time.Hour), ObservedAt: now}},
+			},
+		},
+		warmups: make(map[string]warmupEntry),
+	}
+	req := pluginapi.SchedulerPickRequest{
+		Provider: providerCodex,
+		Model:    "gpt-5.6-sol",
+		Candidates: []pluginapi.SchedulerAuthCandidate{
+			{ID: "monthly", Provider: providerCodex, Priority: 10},
+			{ID: "weekly", Provider: providerCodex, Priority: 10},
+		},
+	}
+
+	if got, err := state.schedulerPick(req); err != nil || got.AuthID != "monthly" {
+		t.Fatalf("initial monthly pick = %#v, err=%v", got, err)
+	}
+	state.mu.Lock()
+	weekly := state.quotas["weekly"]
+	weekly.Windows[0].UsedPercent = 0
+	weekly.Windows[0].LimitReached = false
+	refreshedAt := time.Now()
+	weekly.RefreshedAt = refreshedAt
+	weekly.Windows[0].ObservedAt = refreshedAt
+	state.quotas["weekly"] = weekly
+	state.mu.Unlock()
+
+	got, err := state.schedulerPick(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Handled || got.AuthID != "weekly" {
+		t.Fatalf("weekly reset did not preempt monthly: %#v", got)
+	}
+	if state.serialActiveAuthID != "weekly" || state.serialSwitches != 1 || state.serialLastSwitchReason != "higher_priority_window_available" {
+		t.Fatalf("preemption state auth=%q switches=%d reason=%q", state.serialActiveAuthID, state.serialSwitches, state.serialLastSwitchReason)
+	}
+}
+
+func TestSerialSchedulerHigherPriorityPreemptionIsAtomic(t *testing.T) {
+	resetBanStoreForTest()
+	now := time.Now()
+	cfg := defaultPluginConfig()
+	cfg.StatePath = ""
+	state := schedulerRuntimeState{
+		cfg:                cfg,
+		serialActiveAuthID: "monthly",
+		quotas: map[string]quotaSnapshot{
+			"monthly": {
+				AuthID: "monthly", RefreshedAt: now,
+				Windows: []quotaWindow{{Class: "monthly", UsedPercent: 4, Allowed: true, ResetAt: now.Add(30 * 24 * time.Hour), ObservedAt: now}},
+			},
+			"weekly": {
+				AuthID: "weekly", RefreshedAt: now,
+				Windows: []quotaWindow{{Class: "weekly", UsedPercent: 0, Allowed: true, ResetAt: now.Add(7 * 24 * time.Hour), ObservedAt: now}},
+			},
+		},
+		warmups: make(map[string]warmupEntry),
+	}
+	req := pluginapi.SchedulerPickRequest{
+		Provider: providerCodex,
+		Model:    "gpt-5.6-sol",
+		Candidates: []pluginapi.SchedulerAuthCandidate{
+			{ID: "monthly", Provider: providerCodex, Priority: 10},
+			{ID: "weekly", Provider: providerCodex, Priority: 10},
+		},
+	}
+
+	const workers = 64
+	start := make(chan struct{})
+	results := make(chan pluginapi.SchedulerPickResponse, workers)
+	errs := make(chan error, workers)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			got, err := state.schedulerPick(req)
+			results <- got
+			errs <- err
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	close(errs)
+
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	for got := range results {
+		if !got.Handled || got.AuthID != "weekly" {
+			t.Fatalf("concurrent preemption pick = %#v", got)
+		}
+	}
+	if state.serialActiveAuthID != "weekly" || state.serialSwitches != 1 || state.serialLastSwitchReason != "higher_priority_window_available" {
+		t.Fatalf("atomic preemption state auth=%q switches=%d reason=%q", state.serialActiveAuthID, state.serialSwitches, state.serialLastSwitchReason)
+	}
+}
+
 func TestSerialSchedulerSwitchesAfterQuarantine(t *testing.T) {
 	resetBanStoreForTest()
 	now := time.Now()

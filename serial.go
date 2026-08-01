@@ -191,6 +191,8 @@ func (s *schedulerRuntimeState) serialPick(req pluginapi.SchedulerPickRequest, n
 	}
 	previous := strings.TrimSpace(s.serialActiveAuthID)
 	currentSeen := false
+	currentEligible := false
+	currentChoice := serialCandidate{}
 	currentReason := "candidate_unavailable"
 	choices := make([]serialCandidate, 0, len(req.Candidates))
 	thresholdChoices := make([]serialCandidate, 0, len(req.Candidates))
@@ -219,9 +221,9 @@ func (s *schedulerRuntimeState) serialPick(req pluginapi.SchedulerPickRequest, n
 		if candidate.ID == previous {
 			currentSeen = true
 			if choice.Eligible {
-				s.resetSerialMissingLocked()
-				s.mu.Unlock()
-				return pluginapi.SchedulerPickResponse{AuthID: candidate.ID, Handled: true}
+				currentEligible = true
+				currentChoice = choice
+				continue
 			}
 			currentReason = choice.Reason
 			continue
@@ -237,6 +239,29 @@ func (s *schedulerRuntimeState) serialPick(req pluginapi.SchedulerPickRequest, n
 	}
 	if currentSeen {
 		s.resetSerialMissingLocked()
+	}
+	if currentEligible {
+		// Serial mode remains fill-first within one quota class, but window_order
+		// is a strict pool priority. When a higher-priority class becomes usable
+		// again (for example, weekly resets while monthly is active), preempt the
+		// lower-priority auth exactly once. Unknown/stale quota snapshots never
+		// trigger a preemption.
+		sort.SliceStable(choices, func(i, j int) bool { return serialCandidateLess(choices[i], choices[j], cfg) })
+		currentRank := windowRankInOrder(currentChoice.WindowClass, cfg.WindowOrder)
+		if currentChoice.QuotaKnown && len(choices) > 0 && choices[0].QuotaKnown &&
+			windowRankInOrder(choices[0].WindowClass, cfg.WindowOrder) < currentRank {
+			selected := choices[0].Candidate.ID
+			s.serialActiveAuthID = selected
+			s.serialSelectedAt = now
+			s.serialSwitches++
+			s.serialLastSwitchAt = now
+			s.serialLastSwitchReason = "higher_priority_window_available"
+			s.mu.Unlock()
+			s.persistBanState()
+			return pluginapi.SchedulerPickResponse{AuthID: selected, Handled: true}
+		}
+		s.mu.Unlock()
+		return pluginapi.SchedulerPickResponse{AuthID: previous, Handled: true}
 	}
 
 	thresholdFallback := false
