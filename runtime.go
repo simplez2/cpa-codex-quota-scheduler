@@ -43,6 +43,8 @@ const (
 type quotaWindow struct {
 	Class                   string
 	WindowSeconds           int64
+	ResetAfterSeconds       int64
+	ResetAfterSecondsKnown  bool
 	UsedPercent             float64
 	Allowed                 bool
 	LimitReached            bool
@@ -485,6 +487,10 @@ func normalizeQuotaSnapshot(index, fileName string, response keeperCheckResponse
 			ResetAt:       resetAt,
 			Source:        quotaSourceKeeper,
 			ObservedAt:    refreshedAt,
+		}
+		if row.ResetAfterSeconds != nil && *row.ResetAfterSeconds >= 0 {
+			window.ResetAfterSeconds = *row.ResetAfterSeconds
+			window.ResetAfterSecondsKnown = true
 		}
 		if row.WindowUsageCost != nil && *row.WindowUsageCost >= 0 {
 			window.WindowUsageCredits = *row.WindowUsageCost
@@ -1398,11 +1404,15 @@ type runtimeQuotaStatus struct {
 type runtimeQuotaWindowStatus struct {
 	Window                  string  `json:"window"`
 	WindowSeconds           int64   `json:"window_seconds,omitempty"`
+	ResetAfterSeconds       int64   `json:"reset_after_seconds,omitempty"`
+	ResetAfterSecondsKnown  bool    `json:"reset_after_seconds_known"`
 	UsedPercent             float64 `json:"used_percent"`
 	RemainingPercent        float64 `json:"remaining_percent"`
 	Allowed                 bool    `json:"allowed"`
 	LimitReached            bool    `json:"limit_reached"`
 	Active                  bool    `json:"active"`
+	CycleStarted            bool    `json:"cycle_started"`
+	PlaceholderReset        bool    `json:"placeholder_reset"`
 	ResetAt                 string  `json:"reset_at,omitempty"`
 	Source                  string  `json:"source,omitempty"`
 	ObservedAt              string  `json:"observed_at,omitempty"`
@@ -1619,14 +1629,19 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 		}
 		for _, quotaWindow := range snapshot.Windows {
 			active := quotaWindow.ResetAt.IsZero() || now.Before(quotaWindow.ResetAt)
+			placeholderReset := quotaWindowHasPlaceholderReset(quotaWindow, snapshot.RefreshedAt, now)
 			windowStatus := runtimeQuotaWindowStatus{
 				Window:                  quotaWindow.Class,
 				WindowSeconds:           quotaWindow.WindowSeconds,
+				ResetAfterSeconds:       quotaWindow.ResetAfterSeconds,
+				ResetAfterSecondsKnown:  quotaWindow.ResetAfterSecondsKnown,
 				UsedPercent:             quotaWindow.UsedPercent,
 				RemainingPercent:        math.Max(0, 100-quotaWindow.UsedPercent),
 				Allowed:                 quotaWindow.Allowed,
 				LimitReached:            quotaWindow.LimitReached,
 				Active:                  active,
+				CycleStarted:            quotaWindowCycleStarted(quotaWindow, snapshot.RefreshedAt, now),
+				PlaceholderReset:        placeholderReset,
 				Source:                  string(quotaWindow.Source),
 				WindowUsageCredits:      quotaWindow.WindowUsageCredits,
 				WindowUsageCreditsKnown: quotaWindow.WindowUsageCreditsKnown,

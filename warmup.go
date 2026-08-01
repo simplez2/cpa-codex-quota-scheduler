@@ -62,6 +62,9 @@ type cpaAuthFileEntry struct {
 
 const (
 	warmupMinimumAvailablePercent = 0.000001
+	warmupMinimumUsageCredits     = 0.000001
+	warmupResetPlaceholderSkew    = 3 * time.Second
+	warmupStaleActivationGrace    = 30 * time.Minute
 	warmupMaxResponseBytes        = 2 << 20
 	warmupRequestTimeout          = 45 * time.Second
 )
@@ -190,19 +193,21 @@ func (s *schedulerRuntimeState) findWarmupCandidates(eligible map[string]bool, n
 }
 
 func unstartedWarmupWindow(snapshot quotaSnapshot, now time.Time) (quotaWindow, bool) {
-	// A warmup is intentionally limited to the short primary and weekly
-	// windows. Starting a monthly window for an account that may remain idle is
-	// not cost-optimal.
-	for _, class := range []string{"5h", "weekly"} {
+	// Keeper reports a future reset even for a window that has not started yet:
+	// resetAfterSeconds equals the full window duration and the reset timestamp
+	// moves forward with every observation. Treat that as a placeholder rather
+	// than proof of activation. Monthly-only accounts are included because their
+	// primary cycle otherwise never receives a real anchor.
+	for _, class := range []string{"5h", "weekly", "monthly"} {
 		for _, window := range snapshot.Windows {
 			if window.Class != class || window.UsedPercent > warmupMinimumAvailablePercent ||
 				window.LimitReached || !window.Allowed {
 				continue
 			}
-			if !window.ResetAt.IsZero() && now.Before(window.ResetAt) {
+			if window.WindowUsageCreditsKnown && window.WindowUsageCredits > warmupMinimumUsageCredits {
 				continue
 			}
-			if window.ResetAt.IsZero() {
+			if quotaWindowNeedsActivation(window, snapshot.RefreshedAt, now) {
 				return window, true
 			}
 		}
@@ -216,9 +221,66 @@ func warmupWindowRank(class string) int {
 		return 0
 	case "weekly":
 		return 1
+	case "monthly":
+		return 2
 	default:
 		return 10
 	}
+}
+
+func quotaWindowNeedsActivation(window quotaWindow, refreshedAt, now time.Time) bool {
+	if window.UsedPercent > warmupMinimumAvailablePercent || window.LimitReached || !window.Allowed {
+		return false
+	}
+	if window.WindowUsageCreditsKnown && window.WindowUsageCredits > warmupMinimumUsageCredits {
+		return false
+	}
+	if window.ResetAt.IsZero() || !now.Before(window.ResetAt) {
+		return true
+	}
+	return quotaWindowHasPlaceholderReset(window, refreshedAt, now)
+}
+
+func quotaWindowHasPlaceholderReset(window quotaWindow, refreshedAt, now time.Time) bool {
+	if window.ResetAt.IsZero() || !now.Before(window.ResetAt) || window.WindowSeconds <= 0 {
+		return false
+	}
+	if window.UsedPercent > warmupMinimumAvailablePercent {
+		return false
+	}
+	if window.WindowUsageCreditsKnown && window.WindowUsageCredits > warmupMinimumUsageCredits {
+		return false
+	}
+	toleranceSeconds := int64(warmupResetPlaceholderSkew / time.Second)
+	if window.ResetAfterSecondsKnown {
+		return window.ResetAfterSeconds >= window.WindowSeconds-toleranceSeconds
+	}
+	observedAt := window.ObservedAt
+	if observedAt.IsZero() {
+		observedAt = refreshedAt
+	}
+	if observedAt.IsZero() {
+		return false
+	}
+	expectedReset := observedAt.Add(time.Duration(window.WindowSeconds) * time.Second)
+	delta := window.ResetAt.Sub(expectedReset)
+	if delta < 0 {
+		delta = -delta
+	}
+	return delta <= warmupResetPlaceholderSkew
+}
+
+func quotaWindowCycleStarted(window quotaWindow, refreshedAt, now time.Time) bool {
+	if window.UsedPercent > warmupMinimumAvailablePercent {
+		return true
+	}
+	if window.WindowUsageCreditsKnown && window.WindowUsageCredits > warmupMinimumUsageCredits {
+		return true
+	}
+	if window.ResetAt.IsZero() || !now.Before(window.ResetAt) {
+		return false
+	}
+	return !quotaWindowHasPlaceholderReset(window, refreshedAt, now)
 }
 
 func warmupKey(authID, window string) string {
@@ -231,12 +293,32 @@ func warmupKey(authID, window string) string {
 func (s *schedulerRuntimeState) nextWarmupCandidateLocked(candidates []warmupCandidate, now time.Time, retryAfter time.Duration) (warmupCandidate, string, bool) {
 	for _, candidate := range candidates {
 		key := warmupKey(candidate.Snapshot.AuthID, candidate.Window.Class)
+		if entry, ok := s.warmups[key]; ok && staleWarmupActivation(entry, candidate, now) {
+			delete(s.warmups, key)
+			slog.Info("codex-quota-scheduler: discarded stale warmup activation after quota reset",
+				"auth_id", candidate.Snapshot.AuthID,
+				"window", candidate.Window.Class)
+		}
 		if s.warmupSuppressedLocked(key, now, retryAfter) {
 			continue
 		}
 		return candidate, key, true
 	}
 	return warmupCandidate{}, "", false
+}
+
+func staleWarmupActivation(entry warmupEntry, candidate warmupCandidate, now time.Time) bool {
+	if entry.ActivatedAt.IsZero() || entry.ResetAt.IsZero() || candidate.Window.ResetAt.IsZero() {
+		return false
+	}
+	if now.Sub(entry.ActivatedAt) < warmupStaleActivationGrace {
+		return false
+	}
+	delta := candidate.Window.ResetAt.Sub(entry.ResetAt)
+	if delta < 0 {
+		delta = -delta
+	}
+	return delta > warmupResetPlaceholderSkew
 }
 
 func (s *schedulerRuntimeState) pruneExpiredWarmups(now time.Time) bool {
@@ -425,16 +507,22 @@ func (s *schedulerRuntimeState) recordWarmupOutcome(candidate warmupCandidate, s
 	// few minutes and wastes quota on the same idle account.
 	if err == nil && status >= 200 && status < 300 && target.ActivatedAt.IsZero() {
 		target.ActivatedAt = now
-		target.ResetAt = now.Add(warmupFallbackWindow(candidate.Window.Class))
+		target.ResetAt = now.Add(warmupFallbackWindow(candidate.Window))
 		s.warmups[targetKey] = target
 	}
 	s.warmupMu.Unlock()
 	s.persistBanState()
 }
 
-func warmupFallbackWindow(class string) time.Duration {
-	if class == "weekly" {
+func warmupFallbackWindow(window quotaWindow) time.Duration {
+	if window.WindowSeconds > 0 {
+		return time.Duration(window.WindowSeconds) * time.Second
+	}
+	if window.Class == "weekly" {
 		return 7 * 24 * time.Hour
+	}
+	if window.Class == "monthly" {
+		return 30 * 24 * time.Hour
 	}
 	return 5 * time.Hour
 }

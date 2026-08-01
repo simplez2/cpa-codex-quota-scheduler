@@ -65,7 +65,7 @@ import (
 
 const (
 	pluginName    = "codex-quota-scheduler"
-	pluginVersion = "0.1.4"
+	pluginVersion = "0.1.5"
 
 	// providerCodex is the CPA provider key for OpenAI Codex (ChatGPT backend).
 	providerCodex = "codex"
@@ -499,7 +499,7 @@ func pluginRegistration() registration {
 				{Name: "keeper_password_file", Type: pluginapi.ConfigFieldTypeString, Description: "Mounted Keeper login-password file; the password is never placed in YAML."},
 				{Name: "cpa_management_url", Type: pluginapi.ConfigFieldTypeString, Description: "CPA localhost Management API call endpoint used only for pinned warmup requests."},
 				{Name: "cpa_management_key_file", Type: pluginapi.ConfigFieldTypeString, Description: "Mounted owner-readable CPA management key file; the key is never placed in YAML or logs."},
-				{Name: "warmup_enabled", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Activate only Codex accounts with 100% available quota and no active reset window."},
+				{Name: "warmup_enabled", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Activate Codex accounts with 100% available quota whose Keeper reset is missing, expired, or still a full-duration moving placeholder."},
 				{Name: "warmup_model", Type: pluginapi.ConfigFieldTypeString, Description: "Model used for the minimal pinned hello activation request; this does not change any route default."},
 				{Name: "warmup_sidecar_url", Type: pluginapi.ConfigFieldTypeString, Description: "Internal Codex Agent Identity sidecar base URL used by pinned warmup."},
 				{Name: "warmup_retry_after", Type: pluginapi.ConfigFieldTypeString, Description: "Minimum delay before retrying a warmup that did not return a reset window."},

@@ -85,7 +85,7 @@ func inspectSerialCandidate(candidate pluginapi.SchedulerAuthCandidate, snapshot
 		if window.UsedPercent > choice.MaxUsed {
 			choice.MaxUsed = window.UsedPercent
 		}
-		if window.UsedPercent > warmupMinimumAvailablePercent || (!window.ResetAt.IsZero() && now.Before(window.ResetAt)) {
+		if quotaWindowCycleStarted(window, snapshot.RefreshedAt, now) {
 			choice.CycleActive = true
 		}
 		if window.UsedPercent >= threshold {
