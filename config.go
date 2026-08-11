@@ -22,9 +22,11 @@ type pluginConfig struct {
 	CPAManagementURL        string
 	CPAManagementKeyFile    string
 	WarmupEnabled           bool
+	WarmupExecutionMode     string
 	WarmupModel             string
 	WarmupSidecarURL        string
 	WarmupRetryAfter        time.Duration
+	KeeperRefreshCooldown   time.Duration
 	RefreshInterval         time.Duration
 	StaleAfter              time.Duration
 	StatePath               string
@@ -61,9 +63,11 @@ type yamlPluginConfig struct {
 	CPAManagementURL        string   `yaml:"cpa_management_url"`
 	CPAManagementKeyFile    string   `yaml:"cpa_management_key_file"`
 	WarmupEnabled           *bool    `yaml:"warmup_enabled"`
+	WarmupExecutionMode     string   `yaml:"warmup_execution_mode"`
 	WarmupModel             string   `yaml:"warmup_model"`
 	WarmupSidecarURL        string   `yaml:"warmup_sidecar_url"`
 	WarmupRetryAfter        string   `yaml:"warmup_retry_after"`
+	KeeperRefreshCooldown   string   `yaml:"keeper_refresh_cooldown"`
 	RefreshInterval         string   `yaml:"refresh_interval"`
 	StaleAfter              string   `yaml:"stale_after"`
 	StatePath               string   `yaml:"state_path"`
@@ -98,9 +102,11 @@ func defaultPluginConfig() pluginConfig {
 		KeeperPasswordFile:      "/run/secrets/keeper_login_password",
 		CPAManagementURL:        "http://127.0.0.1:8317/v0/management/api-call",
 		CPAManagementKeyFile:    "/run/secrets/management_key",
-		WarmupModel:             "gpt-5.6-sol",
-		WarmupSidecarURL:        "http://codex-agent-identity-sidecar:8787/backend-api/codex",
+		WarmupExecutionMode:     "management",
+		WarmupModel:             "gpt-5.6-luna",
+		WarmupSidecarURL:        "http://codex-agent-identity-gateway:8787/backend-api/codex",
 		WarmupRetryAfter:        15 * time.Minute,
+		KeeperRefreshCooldown:   2 * time.Minute,
 		RefreshInterval:         30 * time.Second,
 		StaleAfter:              15 * time.Minute,
 		StatePath:               "/var/lib/codex-quota-scheduler/state.json",
@@ -166,6 +172,9 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 	if in.WarmupEnabled != nil {
 		cfg.WarmupEnabled = *in.WarmupEnabled
 	}
+	if strings.TrimSpace(in.WarmupExecutionMode) != "" {
+		cfg.WarmupExecutionMode = strings.TrimSpace(in.WarmupExecutionMode)
+	}
 	if strings.TrimSpace(in.WarmupModel) != "" {
 		cfg.WarmupModel = strings.TrimSpace(in.WarmupModel)
 	}
@@ -174,6 +183,9 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 	}
 	if v, ok := parseDuration(in.WarmupRetryAfter); ok {
 		cfg.WarmupRetryAfter = v
+	}
+	if v, ok := parseDuration(in.KeeperRefreshCooldown); ok {
+		cfg.KeeperRefreshCooldown = v
 	}
 	if v, ok := parseDuration(in.RefreshInterval); ok {
 		cfg.RefreshInterval = v
@@ -249,17 +261,21 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 	// routing outage.  The plugin remains loaded and falls back to CPA's native
 	// scheduler until a usable Keeper snapshot is available.
 	cfg.SchedulerMode = normalizeSchedulerMode(cfg.SchedulerMode)
+	cfg.WarmupExecutionMode = normalizeWarmupExecutionMode(cfg.WarmupExecutionMode)
 	if cfg.RefreshInterval < time.Second {
 		cfg.RefreshInterval = time.Second
 	}
 	if cfg.WarmupRetryAfter < time.Minute {
 		cfg.WarmupRetryAfter = 15 * time.Minute
 	}
+	if cfg.KeeperRefreshCooldown < 30*time.Second || cfg.KeeperRefreshCooldown > 24*time.Hour {
+		cfg.KeeperRefreshCooldown = 2 * time.Minute
+	}
 	if cfg.WarmupModel == "" {
-		cfg.WarmupModel = "gpt-5.6-sol"
+		cfg.WarmupModel = "gpt-5.6-luna"
 	}
 	if cfg.WarmupSidecarURL == "" {
-		cfg.WarmupSidecarURL = "http://codex-agent-identity-sidecar:8787/backend-api/codex"
+		cfg.WarmupSidecarURL = "http://codex-agent-identity-gateway:8787/backend-api/codex"
 	}
 	if cfg.StaleAfter < cfg.RefreshInterval {
 		cfg.StaleAfter = 15 * time.Minute
@@ -324,6 +340,15 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 		cfg.WindowOrder = []string{"5h", "weekly", "monthly"}
 	}
 	return cfg, nil
+}
+
+func normalizeWarmupExecutionMode(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "native", "host", "host-model", "host_model":
+		return "native"
+	default:
+		return "management"
+	}
 }
 
 func parseDuration(raw string) (time.Duration, bool) {

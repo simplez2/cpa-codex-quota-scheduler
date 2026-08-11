@@ -212,7 +212,7 @@ func bootstrapCost(quantile float64) float64 {
 }
 
 func (s *schedulerRuntimeState) observeUsageCost(record pluginapi.UsageRecord) {
-	if !strings.EqualFold(strings.TrimSpace(record.Provider), providerCodex) {
+	if !record.Generate || !strings.EqualFold(strings.TrimSpace(record.Provider), providerCodex) {
 		return
 	}
 	s.mu.Lock()

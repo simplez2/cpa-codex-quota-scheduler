@@ -201,7 +201,7 @@ func TestStickyBindingRequiresHysteresisConfirmations(t *testing.T) {
 func TestPredictionDebitIsReconciledWhenUsageHasNoTokens(t *testing.T) {
 	state := schedulerRuntimeState{cfg: defaultPluginConfig(), pacingAccounts: make(map[string]*accountPacingState)}
 	state.recordPredictedDebit("acct", 3)
-	state.observeUsageCost(pluginapi.UsageRecord{Provider: providerCodex, AuthID: "acct"})
+	state.observeUsageCost(pluginapi.UsageRecord{Provider: providerCodex, AuthID: "acct", Generate: true})
 	account := state.pacingAccounts["acct"]
 	if account.DeficitCredits != 0 || len(account.PendingPredicted) != 0 {
 		t.Fatalf("speculative debit was not reconciled: %#v", account)

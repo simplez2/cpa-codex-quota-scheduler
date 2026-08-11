@@ -515,6 +515,11 @@ func TestSerialStatePersistenceIncludesActiveAuth(t *testing.T) {
 		serialLastSwitchAt:     now,
 		serialLastSwitchReason: "serial_threshold",
 	}
+	state.initializeGenerationOwnership(path)
+	if err := state.reserveGenerationOwnership(path); err != nil {
+		t.Fatal(err)
+	}
+	claimManagedRuntimeForTest(t, &state)
 	state.persistBanState()
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -524,7 +529,7 @@ func TestSerialStatePersistenceIncludesActiveAuth(t *testing.T) {
 	if err := json.Unmarshal(raw, &persisted); err != nil {
 		t.Fatal(err)
 	}
-	if persisted.Version != 4 || persisted.SerialActiveAuthID != "primary" || persisted.SerialSwitches != 3 || persisted.SerialFallbacks != 7 {
+	if persisted.Version != 5 || persisted.SerialActiveAuthID != "primary" || persisted.SerialSwitches != 3 || persisted.SerialFallbacks != 7 {
 		t.Fatalf("serial persistence = %#v", persisted)
 	}
 }
@@ -548,8 +553,11 @@ func TestSerialWarmupActivatesFullBackupWithoutReplacingActiveTrafficAuth(t *tes
 			},
 		},
 	}
-	candidate, ok := state.findWarmupCandidate(map[string]bool{
-		"primary": true, "idx-primary": true, "backup": true, "idx-backup": true,
+	candidate, ok := state.findWarmupCandidate(map[string]warmupAuthBinding{
+		"primary":     {AuthID: "primary", AuthIndex: "idx-primary"},
+		"idx-primary": {AuthID: "primary", AuthIndex: "idx-primary"},
+		"backup":      {AuthID: "backup", AuthIndex: "idx-backup"},
+		"idx-backup":  {AuthID: "backup", AuthIndex: "idx-backup"},
 	}, now)
 	if !ok || candidate.Snapshot.AuthID != "backup" {
 		t.Fatalf("warmup candidate = %#v, ok=%v; want full backup", candidate, ok)

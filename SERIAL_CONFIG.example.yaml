@@ -1,4 +1,4 @@
-# Recommended configuration for Codex Quota Scheduler v0.1.0.
+# Recommended configuration for Codex Quota Scheduler v0.1.6.
 # Secrets stay in mounted files. This plugin does not change model names,
 # provider routes, OAuth/PAT state, or third-party APIs.
 plugins:
@@ -34,11 +34,17 @@ plugins:
         - weekly
         - monthly
 
-      # Warmup is allowed only for the current serial account. Backups remain
-      # dormant until the scheduler actually switches to them.
+      # Warmup is separate from normal serial routing. Every fully available,
+      # not-yet-started account is activated strictly one at a time; normal
+      # traffic keeps using the committed serial account.
       warmup_enabled: true
-      warmup_model: gpt-5.6-sol
-      warmup_sidecar_url: http://codex-agent-identity-sidecar:8787/backend-api/codex
+      # Production-safe default for hot reload. Native HostModel warmup is an
+      # explicit canary-only opt-in until CPA exposes a bounded callback timeout.
+      warmup_execution_mode: management
+      # Used only by the pinned activation request. It does not change CPA's
+      # default channel or the model selected for normal traffic.
+      warmup_model: gpt-5.6-luna
+      warmup_sidecar_url: http://codex-agent-identity-gateway:8787/backend-api/codex
       warmup_retry_after: 15m
       cpa_management_url: http://127.0.0.1:8317/v0/management/api-call
       cpa_management_key_file: /run/secrets/management_key

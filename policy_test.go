@@ -69,6 +69,22 @@ func TestClassifyBanAcceptsResetAfterHeaders(t *testing.T) {
 	}
 }
 
+func TestClassifyBanUsesDurationForMonthlyPrimaryWindow(t *testing.T) {
+	now := time.Now()
+	h := http.Header{
+		"X-Codex-Primary-Used-Percent":        []string{"100"},
+		"X-Codex-Primary-Window-Minutes":      []string{"43800"},
+		"X-Codex-Primary-Reset-After-Seconds": []string{"2000000"},
+	}
+	entry, ok := classifyAndBuildBanAt(h, now)
+	if !ok || entry.Window != "monthly" {
+		t.Fatalf("monthly primary ban = %#v, ok=%v", entry, ok)
+	}
+	if entry.ResetAt.Before(now.Add(20 * 24 * time.Hour)) {
+		t.Fatalf("monthly reset was truncated: %v", entry.ResetAt)
+	}
+}
+
 func TestObserveUsageMergesOnlyPresentHeaderFields(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	resetAt := now.Add(6 * time.Hour)
@@ -95,6 +111,7 @@ func TestObserveUsageMergesOnlyPresentHeaderFields(t *testing.T) {
 	state.observeUsage(pluginapi.UsageRecord{
 		Provider: providerCodex,
 		AuthID:   "acct",
+		Generate: true,
 		ResponseHeaders: http.Header{
 			"X-Codex-Secondary-Window-Minutes": []string{"10080"},
 		},
@@ -110,6 +127,7 @@ func TestObserveUsageMergesOnlyPresentHeaderFields(t *testing.T) {
 	state.observeUsage(pluginapi.UsageRecord{
 		Provider: providerCodex,
 		AuthID:   "acct",
+		Generate: true,
 		ResponseHeaders: http.Header{
 			"X-Codex-Secondary-Used-Percent": []string{"9"},
 		},
@@ -125,6 +143,7 @@ func TestObserveUsageMergesOnlyPresentHeaderFields(t *testing.T) {
 	state.observeUsage(pluginapi.UsageRecord{
 		Provider: providerCodex,
 		AuthID:   "acct",
+		Generate: true,
 		ResponseHeaders: http.Header{
 			"X-Codex-Secondary-Window-Minutes": []string{"10080"},
 			"X-Codex-Secondary-Used-Percent":   []string{"9"},
@@ -165,6 +184,7 @@ func TestObserveUsageIgnoresZeroDurationPlaceholder(t *testing.T) {
 	state.observeUsage(pluginapi.UsageRecord{
 		Provider: providerCodex,
 		AuthID:   "acct",
+		Generate: true,
 		ResponseHeaders: http.Header{
 			"X-Codex-Secondary-Window-Minutes": []string{"0"},
 			"X-Codex-Secondary-Used-Percent":   []string{"0"},
@@ -281,6 +301,36 @@ func TestSchedulerConfigDefaultsToSerialAndValidatesThreshold(t *testing.T) {
 	if cfg.NormalCostQuantile != 0.75 || cfg.GuardCostQuantile != 0.90 || cfg.HighCostQuantile != 0.95 {
 		t.Fatalf("invalid quantiles were not reset: %#v", cfg)
 	}
+	if cfg.WarmupExecutionMode != "management" {
+		t.Fatalf("unsafe warmup transport default = %q; want management", cfg.WarmupExecutionMode)
+	}
+	native, err := parsePluginConfig([]byte("warmup_execution_mode: native\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if native.WarmupExecutionMode != "native" {
+		t.Fatalf("explicit native warmup mode = %q", native.WarmupExecutionMode)
+	}
+}
+
+func TestPluginRegistrationExposesKeeperRefreshCooldown(t *testing.T) {
+	registration := pluginRegistration()
+	matched := 0
+	for _, field := range registration.Metadata.ConfigFields {
+		if field.Name != "keeper_refresh_cooldown" {
+			continue
+		}
+		matched++
+		if field.Type != pluginapi.ConfigFieldTypeString {
+			t.Fatalf("keeper_refresh_cooldown type = %q; want string", field.Type)
+		}
+		if !strings.Contains(field.Description, "targeted Keeper quota refresh") || !strings.Contains(field.Description, "2m") {
+			t.Fatalf("keeper_refresh_cooldown description = %q", field.Description)
+		}
+	}
+	if matched != 1 {
+		t.Fatalf("keeper_refresh_cooldown registration count = %d; want 1", matched)
+	}
 }
 
 func TestSerialConfigExampleParsesWithSafeRolloutValues(t *testing.T) {
@@ -311,7 +361,7 @@ func TestSerialConfigExampleParsesWithSafeRolloutValues(t *testing.T) {
 	if cfg.SchedulerMode != "serial" || cfg.SerialSwitchPercent != 98 || !cfg.SerialPreferActiveCycle || !cfg.WarmupEnabled {
 		t.Fatalf("unsafe serial example: mode=%q threshold=%v active_cycle=%v warmup=%v", cfg.SchedulerMode, cfg.SerialSwitchPercent, cfg.SerialPreferActiveCycle, cfg.WarmupEnabled)
 	}
-	if cfg.WarmupModel != "gpt-5.6-sol" || strings.Join(cfg.WindowOrder, ",") != "5h,weekly,monthly" {
-		t.Fatalf("unexpected warmup/window config: model=%q order=%v", cfg.WarmupModel, cfg.WindowOrder)
+	if cfg.WarmupExecutionMode != "management" || cfg.WarmupModel != "gpt-5.6-luna" || strings.Join(cfg.WindowOrder, ",") != "5h,weekly,monthly" {
+		t.Fatalf("unexpected warmup/window config: mode=%q model=%q order=%v", cfg.WarmupExecutionMode, cfg.WarmupModel, cfg.WindowOrder)
 	}
 }

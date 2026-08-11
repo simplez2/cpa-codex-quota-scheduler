@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/simplez2/cpa-codex-quota-scheduler/cpasdk/pluginapi"
 )
 
 func TestUnstartedWarmupWindowRecognizesMissingAndPlaceholderReset(t *testing.T) {
@@ -69,6 +71,22 @@ func TestWarmupWindowPrefersFiveHourOverWeekly(t *testing.T) {
 	}
 }
 
+func TestUnstartedWarmupIgnoresUnknownKeeperRows(t *testing.T) {
+	now := time.Now()
+	window, ok := unstartedWarmupWindow(quotaSnapshot{Windows: []quotaWindow{
+		{Class: "unknown", UsedPercent: 100, Allowed: false, LimitReached: true},
+		{Class: "5h", UsedPercent: 0, Allowed: true, ObservedAt: now},
+	}}, now)
+	if !ok || window.Class != "5h" {
+		t.Fatalf("recognized warmup window = %#v, ok=%v; unrelated unknown row must be ignored", window, ok)
+	}
+	if _, ok := unstartedWarmupWindow(quotaSnapshot{Windows: []quotaWindow{{
+		Class: "unknown", UsedPercent: 0, Allowed: true,
+	}}}, now); ok {
+		t.Fatal("unknown-only quota snapshot must not become a warmup candidate")
+	}
+}
+
 func TestWarmupIncludesMonthlyOnlyAccount(t *testing.T) {
 	now := time.Now()
 	window, ok := unstartedWarmupWindow(quotaSnapshot{RefreshedAt: now, Windows: []quotaWindow{
@@ -102,13 +120,214 @@ func TestWarmupEligibleAuthsRequiresActiveSidecarCredential(t *testing.T) {
 		{ID: "third-party", AuthIndex: "idx-third", Provider: "openai", Status: "active", Note: "via sidecar"},
 	}
 	got := warmupEligibleAuths(files)
-	if !got["sidecar"] || !got["idx-sidecar"] {
-		t.Fatal("active sidecar credential should be eligible")
+	for _, key := range []string{"sidecar", "idx-sidecar"} {
+		binding, ok := got[key]
+		if !ok || binding.AuthID != "sidecar" || binding.AuthIndex != "idx-sidecar" {
+			t.Fatalf("active sidecar binding for %q = %#v, ok=%v", key, binding, ok)
+		}
 	}
 	for _, key := range []string{"native", "idx-native", "disabled", "idx-disabled", "third-party", "idx-third"} {
-		if got[key] {
+		if _, ok := got[key]; ok {
 			t.Fatalf("%q must not be warmup eligible", key)
 		}
+	}
+}
+
+func TestWarmupEligibilityDiagnosticsExplainRejectedAuths(t *testing.T) {
+	files := []cpaAuthFileEntry{
+		{ID: "sidecar", AuthIndex: "idx-sidecar", Provider: "codex", Status: "active", Note: "Codex Access Token via sidecar"},
+		{ID: "oauth", AuthIndex: "idx-oauth", Provider: "codex", Status: "active", Note: "Official OAuth"},
+		{ID: "disabled", AuthIndex: "idx-disabled", Provider: "codex", Disabled: true, Note: "via sidecar"},
+		{ID: "unavailable", AuthIndex: "idx-unavailable", Provider: "codex", Unavailable: true, Note: "via sidecar"},
+		{ID: "inactive", AuthIndex: "idx-inactive", Provider: "codex", Status: "error", Note: "via sidecar"},
+		{ID: "missing-index", Provider: "codex", Status: "active", Note: "via sidecar"},
+		{ID: "other", AuthIndex: "idx-other", Provider: "openai", Status: "active", Note: "via sidecar"},
+	}
+	eligible, stats := warmupEligibleAuthsWithStats(files)
+	if len(eligible) != 2 || stats.Seen != len(files) || stats.Eligible != 1 {
+		t.Fatalf("eligible=%#v stats=%#v", eligible, stats)
+	}
+	wantRejected := map[string]int{
+		"missing_sidecar_marker": 1,
+		"disabled":               1,
+		"unavailable":            1,
+		"inactive_status":        1,
+		"missing_auth_index":     1,
+		"provider_mismatch":      1,
+	}
+	for reason, want := range wantRejected {
+		if got := stats.Rejected[reason]; got != want {
+			t.Fatalf("rejected[%q]=%d want %d; all=%#v", reason, got, want, stats.Rejected)
+		}
+	}
+}
+
+func TestHostAuthDiscoveryRequiresSidecarMarkerOnlyForManagement(t *testing.T) {
+	files := []pluginapi.HostAuthFileEntry{
+		{ID: "sidecar", AuthIndex: "idx-sidecar", Provider: "codex", Status: "active", Note: "via sidecar"},
+		{ID: "oauth", AuthIndex: "idx-oauth", Provider: "codex", Status: "active", Note: "Official OAuth"},
+	}
+	management, stats := warmupEligibleHostAuthsWithStats(files, true)
+	if _, ok := management["sidecar"]; !ok || stats.Eligible != 1 || stats.Rejected["missing_sidecar_marker"] != 1 {
+		t.Fatalf("management auth discovery = %#v stats=%#v", management, stats)
+	}
+	native, nativeStats := warmupEligibleHostAuthsWithStats(files, false)
+	if _, ok := native["oauth"]; !ok || nativeStats.Eligible != 2 {
+		t.Fatalf("native auth discovery = %#v stats=%#v", native, nativeStats)
+	}
+}
+
+func TestNativeWarmupDoesNotFallBackToManagementAuthDiscovery(t *testing.T) {
+	hits := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"files":[]}`))
+	}))
+	defer server.Close()
+	cfg := defaultPluginConfig()
+	cfg.WarmupExecutionMode = "native"
+	cfg.CPAManagementURL = server.URL + "/v0/management/api-call"
+	cfg.CPAManagementKeyFile = filepath.Join(t.TempDir(), "management-key")
+	if err := os.WriteFile(cfg.CPAManagementKeyFile, []byte("test-key"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&schedulerRuntimeState{}).cpaWarmupEligibleAuths(context.Background(), cfg); err == nil {
+		t.Fatal("native mode without Host API must fail closed")
+	}
+	if hits != 0 {
+		t.Fatalf("native auth discovery silently fell back to management: hits=%d", hits)
+	}
+}
+
+func TestManagementWarmupUsesOnlyActiveSidecarAuths(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v0/management/auth-files" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"files":[{"id":"sidecar","auth_index":"idx-sidecar","provider":"codex","status":"active","note":"via sidecar"},{"id":"native","auth_index":"idx-native","provider":"codex","status":"active","note":"official oauth"}]}`))
+	}))
+	defer server.Close()
+	cfg := defaultPluginConfig()
+	cfg.WarmupExecutionMode = "management"
+	cfg.CPAManagementURL = server.URL + "/v0/management/api-call"
+	cfg.CPAManagementKeyFile = filepath.Join(t.TempDir(), "management-key")
+	if err := os.WriteFile(cfg.CPAManagementKeyFile, []byte("test-key"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	eligible, err := (&schedulerRuntimeState{}).cpaWarmupEligibleAuths(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if binding, ok := eligible["sidecar"]; !ok || binding.AuthIndex != "idx-sidecar" {
+		t.Fatalf("sidecar binding = %#v ok=%v", binding, ok)
+	}
+	if _, ok := eligible["native"]; ok {
+		t.Fatal("management warmup must not send an official native credential to the sidecar endpoint")
+	}
+}
+
+func TestFindWarmupCandidateUsesCurrentCPAAuthIndex(t *testing.T) {
+	now := time.Now()
+	state := schedulerRuntimeState{
+		cfg: defaultPluginConfig(),
+		quotas: map[string]quotaSnapshot{
+			"account": {
+				AuthID: "account", AuthIndex: "stale-index", RefreshedAt: now,
+				Windows: []quotaWindow{{Class: "monthly", UsedPercent: 0, Allowed: true, ObservedAt: now}},
+			},
+		},
+	}
+	candidate, ok := state.findWarmupCandidate(map[string]warmupAuthBinding{
+		"account": {AuthID: "account", AuthIndex: "current-index"},
+	}, now)
+	if !ok || candidate.Snapshot.AuthIndex != "current-index" {
+		t.Fatalf("candidate = %#v, ok=%v; want current CPA auth index", candidate, ok)
+	}
+}
+
+func TestManagementWarmupRevalidatesAuthBindingBeforeAPICall(t *testing.T) {
+	keyPath := filepath.Join(t.TempDir(), "management-key")
+	if err := os.WriteFile(keyPath, []byte("secret"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	apiCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v0/management/auth-files":
+			_ = json.NewEncoder(w).Encode(map[string]any{"files": []any{}})
+		case "/v0/management/api-call":
+			apiCalls++
+			_ = json.NewEncoder(w).Encode(cpaAPICallResponse{StatusCode: http.StatusOK, Body: `{"status":"completed"}`})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	cfg := defaultPluginConfig()
+	cfg.CPAManagementURL = server.URL + "/v0/management/api-call"
+	cfg.CPAManagementKeyFile = keyPath
+	cfg.StatePath = ""
+	state := schedulerRuntimeState{cfg: cfg, warmups: make(map[string]warmupEntry)}
+	candidate := warmupCandidate{Snapshot: quotaSnapshot{AuthID: "acct", AuthIndex: "stale"}, Window: quotaWindow{Class: "5h", Allowed: true}}
+	state.executeManagementWarmup(context.Background(), cfg, candidate)
+	if apiCalls != 0 {
+		t.Fatalf("stale auth binding reached api-call: calls=%d", apiCalls)
+	}
+	entry := state.warmups[warmupKey("acct", "5h")]
+	if entry.Error != "auth_binding_stale" || entry.Blocked {
+		t.Fatalf("stale binding outcome=%#v", entry)
+	}
+}
+
+func TestManagementWarmupUsesMinimalResponsesRequest(t *testing.T) {
+	keyPath := filepath.Join(t.TempDir(), "management-key")
+	if err := os.WriteFile(keyPath, []byte("secret"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v0/management/auth-files":
+			_ = json.NewEncoder(w).Encode(map[string]any{"files": []map[string]any{{
+				"id": "acct", "auth_index": "current", "provider": "codex", "status": "active", "note": "via sidecar",
+			}}})
+		case "/v0/management/api-call":
+			var call cpaAPICallRequest
+			if err := json.NewDecoder(r.Body).Decode(&call); err != nil {
+				t.Errorf("decode api-call: %v", err)
+			}
+			if call.AuthIndex != "current" {
+				t.Errorf("auth_index=%q", call.AuthIndex)
+			}
+			var payload map[string]any
+			if err := json.Unmarshal([]byte(call.Data), &payload); err != nil {
+				t.Errorf("decode responses payload: %v", err)
+			}
+			reasoning, _ := payload["reasoning"].(map[string]any)
+			if payload["input"] != "Reply with OK." || payload["store"] != false || payload["stream"] != false ||
+				reasoning["effort"] != "low" || payload["max_output_tokens"] != float64(16) {
+				t.Errorf("non-minimal warmup payload: %#v", payload)
+			}
+			_ = json.NewEncoder(w).Encode(cpaAPICallResponse{StatusCode: http.StatusOK, Body: `{"status":"completed"}`})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	cfg := defaultPluginConfig()
+	cfg.CPAManagementURL = server.URL + "/v0/management/api-call"
+	cfg.CPAManagementKeyFile = keyPath
+	cfg.StatePath = ""
+	state := schedulerRuntimeState{cfg: cfg, warmups: make(map[string]warmupEntry)}
+	candidate := warmupCandidate{Snapshot: quotaSnapshot{AuthID: "acct", AuthIndex: "stale"}, Window: quotaWindow{Class: "5h", Allowed: true}}
+	state.executeManagementWarmup(context.Background(), cfg, candidate)
+	entry := state.warmups[warmupKey("acct", "5h")]
+	if entry.Status != http.StatusOK || entry.Error != "" {
+		t.Fatalf("warmup outcome=%#v", entry)
 	}
 }
 
@@ -174,8 +393,16 @@ func TestNextWarmupCandidateDiscardsStaleActivationAfterExternalReset(t *testing
 		},
 	}}
 	candidates := []warmupCandidate{{
-		Snapshot: quotaSnapshot{AuthID: "monthly"},
-		Window:   quotaWindow{Class: "monthly", ResetAt: newPlaceholderReset},
+		Snapshot: quotaSnapshot{AuthID: "monthly", RefreshedAt: now},
+		Window: quotaWindow{
+			Class:                  "monthly",
+			WindowSeconds:          int64((30 * 24 * time.Hour).Seconds()),
+			ResetAfterSeconds:      int64((30 * 24 * time.Hour).Seconds()),
+			ResetAfterSecondsKnown: true,
+			UsedPercent:            0,
+			Allowed:                true,
+			ResetAt:                newPlaceholderReset,
+		},
 	}}
 
 	s.warmupMu.Lock()
@@ -186,6 +413,157 @@ func TestNextWarmupCandidateDiscardsStaleActivationAfterExternalReset(t *testing
 	}
 	if _, exists := s.warmups[key]; exists {
 		t.Fatal("stale warmup activation was not removed")
+	}
+}
+
+func TestNextWarmupCandidateRetriesUnconfirmedWarmupAfterFreshGrace(t *testing.T) {
+	now := time.Now()
+	windowSeconds := int64((5 * time.Hour).Seconds())
+	key := warmupKey("pending", "5h")
+	s := &schedulerRuntimeState{warmups: map[string]warmupEntry{
+		key: {
+			AuthID: "pending", Window: "5h", AttemptedAt: now.Add(-time.Hour),
+			CompletedAt: now.Add(-time.Hour), SuppressUntil: now.Add(4 * time.Hour), Status: http.StatusOK,
+		},
+	}}
+	candidates := []warmupCandidate{{
+		Snapshot: quotaSnapshot{AuthID: "pending", RefreshedAt: now},
+		Window: quotaWindow{
+			Class: "5h", WindowSeconds: windowSeconds, ResetAfterSeconds: windowSeconds,
+			ResetAfterSecondsKnown: true, UsedPercent: 0, Allowed: true, ResetAt: now.Add(5 * time.Hour),
+		},
+	}}
+
+	s.warmupMu.Lock()
+	candidate, gotKey, ok := s.nextWarmupCandidateLocked(candidates, now, 15*time.Minute)
+	s.warmupMu.Unlock()
+	if !ok || candidate.Snapshot.AuthID != "pending" || gotKey != key {
+		t.Fatalf("candidate = %#v, key=%q, ok=%v; unconfirmed warmup should retry after fresh grace", candidate, gotKey, ok)
+	}
+	if _, exists := s.warmups[key]; exists {
+		t.Fatal("stale pending warmup state was not removed")
+	}
+}
+
+func TestNextWarmupCandidateKeepsPendingWarmupDuringGrace(t *testing.T) {
+	now := time.Now()
+	windowSeconds := int64((5 * time.Hour).Seconds())
+	key := warmupKey("pending", "5h")
+	s := &schedulerRuntimeState{warmups: map[string]warmupEntry{
+		key: {
+			AuthID: "pending", Window: "5h", AttemptedAt: now.Add(-10 * time.Minute),
+			CompletedAt: now.Add(-10 * time.Minute), SuppressUntil: now.Add(5 * time.Hour), Status: http.StatusOK,
+		},
+	}}
+	candidates := []warmupCandidate{{
+		Snapshot: quotaSnapshot{AuthID: "pending", RefreshedAt: now},
+		Window: quotaWindow{
+			Class: "5h", WindowSeconds: windowSeconds, ResetAfterSeconds: windowSeconds,
+			ResetAfterSecondsKnown: true, UsedPercent: 0, Allowed: true, ResetAt: now.Add(5 * time.Hour),
+		},
+	}}
+
+	s.warmupMu.Lock()
+	_, _, ok := s.nextWarmupCandidateLocked(candidates, now, 15*time.Minute)
+	s.warmupMu.Unlock()
+	if ok {
+		t.Fatal("pending warmup must remain suppressed during confirmation grace")
+	}
+	if _, exists := s.warmups[key]; !exists {
+		t.Fatal("pending warmup state was removed before confirmation grace elapsed")
+	}
+}
+
+func TestBlockedWarmupRequiresChangedCPAAuthBinding(t *testing.T) {
+	now := time.Now()
+	key := warmupKey("acct", "5h")
+	state := &schedulerRuntimeState{warmups: map[string]warmupEntry{
+		key: {AuthID: "acct", AuthIndex: "old-index", Window: "5h", AttemptedAt: now.Add(-time.Hour), Error: "cyber_policy", Blocked: true},
+	}}
+	candidate := warmupCandidate{
+		Snapshot: quotaSnapshot{AuthID: "acct", AuthIndex: "old-index", RefreshedAt: now},
+		Window:   quotaWindow{Class: "5h", UsedPercent: 0, Allowed: true},
+	}
+	state.warmupMu.Lock()
+	_, _, ok := state.nextWarmupCandidateLocked([]warmupCandidate{candidate}, now, 15*time.Minute)
+	state.warmupMu.Unlock()
+	if ok {
+		t.Fatal("blocked policy failure must not retry with the same CPA auth binding")
+	}
+
+	candidate.Snapshot.AuthIndex = "new-index"
+	state.warmupMu.Lock()
+	got, gotKey, ok := state.nextWarmupCandidateLocked([]warmupCandidate{candidate}, now, 15*time.Minute)
+	state.warmupMu.Unlock()
+	if !ok || got.Snapshot.AuthIndex != "new-index" || gotKey != key {
+		t.Fatalf("changed binding candidate = %#v key=%q ok=%v", got, gotKey, ok)
+	}
+	if _, exists := state.warmups[key]; exists {
+		t.Fatal("blocked warmup state was not cleared after CPA auth binding changed")
+	}
+}
+
+func TestExplicitWarmupRetryClearsOnlyBlockedTarget(t *testing.T) {
+	state := schedulerRuntimeState{warmups: map[string]warmupEntry{
+		warmupKey("first", "5h"):  {AuthID: "first", Window: "5h", Blocked: true, Error: "cyber_policy"},
+		warmupKey("second", "5h"): {AuthID: "second", Window: "5h", Blocked: true, Error: "http_403"},
+		warmupKey("retry", "5h"):  {AuthID: "retry", Window: "5h", Error: "http_503"},
+	}}
+	if removed := state.clearBlockedWarmupState("first", false); removed != 1 {
+		t.Fatalf("removed blocked target = %d; want 1", removed)
+	}
+	if _, ok := state.warmups[warmupKey("first", "5h")]; ok {
+		t.Fatal("explicit target remained blocked")
+	}
+	if _, ok := state.warmups[warmupKey("second", "5h")]; !ok {
+		t.Fatal("unrelated blocked target was cleared")
+	}
+	if removed := state.clearBlockedWarmupState("", true); removed != 1 {
+		t.Fatalf("clear all blocked removed = %d; want 1", removed)
+	}
+	if _, ok := state.warmups[warmupKey("retry", "5h")]; !ok {
+		t.Fatal("retryable warmup failure must not be removed by blocked-only reset")
+	}
+}
+
+func TestCompletedWarmupWithoutHeadersStaysPendingWithoutFakeReset(t *testing.T) {
+	state := schedulerRuntimeState{cfg: defaultPluginConfig(), warmups: make(map[string]warmupEntry)}
+	state.cfg.StatePath = ""
+	candidate := warmupCandidate{
+		Snapshot: quotaSnapshot{AuthID: "acct", AuthIndex: "idx-acct"},
+		Window:   quotaWindow{Class: "weekly", WindowSeconds: int64((7 * 24 * time.Hour).Seconds())},
+	}
+	state.recordWarmupOutcome(candidate, http.StatusOK, nil, nil)
+	entry := state.warmups[warmupKey("acct", "weekly")]
+	if entry.CompletedAt.IsZero() || !entry.ActivatedAt.IsZero() || !entry.ResetAt.IsZero() || entry.SuppressUntil.IsZero() {
+		t.Fatalf("pending warmup entry = %#v", entry)
+	}
+}
+
+func TestPendingWarmupConfirmsOnlyFromFreshStableKeeperAnchor(t *testing.T) {
+	now := time.Now().UTC()
+	key := warmupKey("acct", "weekly")
+	state := schedulerRuntimeState{warmups: map[string]warmupEntry{
+		key: {
+			AuthID: "acct", AuthIndex: "idx-acct", Window: "weekly",
+			AttemptedAt: now.Add(-2 * time.Minute), CompletedAt: now.Add(-2 * time.Minute),
+			SuppressUntil: now.Add(7 * 24 * time.Hour), Status: http.StatusOK,
+		},
+	}}
+	stableReset := now.Add(6 * 24 * time.Hour)
+	quotas := map[string]quotaSnapshot{"acct": {
+		AuthID: "acct", RefreshedAt: now,
+		Windows: []quotaWindow{{
+			Class: "weekly", WindowSeconds: int64((7 * 24 * time.Hour).Seconds()),
+			UsedPercent: 0, Allowed: true, ResetAt: stableReset, ObservedAt: now,
+		}},
+	}}
+	if !state.confirmPendingWarmups(quotas, now) {
+		t.Fatal("fresh stable Keeper anchor did not confirm pending warmup")
+	}
+	entry := state.warmups[key]
+	if entry.ActivatedAt.IsZero() || !entry.ResetAt.Equal(stableReset) || !entry.SuppressUntil.Equal(stableReset) {
+		t.Fatalf("confirmed warmup entry = %#v", entry)
 	}
 }
 
@@ -227,11 +605,65 @@ func TestFindWarmupCandidateSkipsQuarantinedAuth(t *testing.T) {
 	banStore.set("quarantined", banEntry{
 		ResetAt: now.Add(-time.Minute), Window: "probation", Kind: banKindProbation,
 	})
-	candidate, ok := state.findWarmupCandidate(map[string]bool{
-		"quarantined": true, "idx-q": true, "healthy": true, "idx-h": true,
+	candidate, ok := state.findWarmupCandidate(map[string]warmupAuthBinding{
+		"quarantined": {AuthID: "quarantined", AuthIndex: "idx-q"},
+		"idx-q":       {AuthID: "quarantined", AuthIndex: "idx-q"},
+		"healthy":     {AuthID: "healthy", AuthIndex: "idx-h"},
+		"idx-h":       {AuthID: "healthy", AuthIndex: "idx-h"},
 	}, now)
 	if !ok || candidate.Snapshot.AuthID != "healthy" {
 		t.Fatalf("warmup candidate = %#v, ok=%v; quarantined auth must be skipped", candidate, ok)
+	}
+}
+
+func TestFindWarmupCandidateRejectsCarriedStaleRecognizedWindow(t *testing.T) {
+	resetBanStoreForTest()
+	now := time.Now().UTC().Truncate(time.Second)
+	cfg := defaultPluginConfig()
+	cfg.StatePath = ""
+	cfg.StaleAfter = 15 * time.Minute
+
+	// The outer snapshot and weekly row are fresh, but the monthly row was
+	// carried through successive partial Keeper responses. Its own observation
+	// is authoritative for warmup and must not be refreshed by the envelope.
+	state := schedulerRuntimeState{
+		cfg: cfg,
+		quotas: map[string]quotaSnapshot{
+			"acct": {
+				AuthID: "acct", AuthIndex: "idx-acct", RefreshedAt: now,
+				Windows: []quotaWindow{
+					{Class: "weekly", UsedPercent: 0, Allowed: true, ObservedAt: now},
+					{Class: "monthly", UsedPercent: 0, Allowed: true, ObservedAt: now.Add(-16 * time.Minute)},
+				},
+			},
+		},
+	}
+	candidates := state.findWarmupCandidates(map[string]warmupAuthBinding{
+		"acct": {AuthID: "acct", AuthIndex: "idx-acct"},
+	}, nil, now)
+	if len(candidates) != 0 {
+		t.Fatalf("stale carried window admitted warmup candidates: %#v", candidates)
+	}
+	if state.warmupSkippedStaleLast != 1 {
+		t.Fatalf("stale warmup diagnostics = %d; want 1", state.warmupSkippedStaleLast)
+	}
+}
+
+func TestWarmupSnapshotFreshRequiresOwnObservationForEveryRecognizedWindow(t *testing.T) {
+	now := time.Now().UTC()
+	snapshot := quotaSnapshot{
+		RefreshedAt: now,
+		Windows: []quotaWindow{
+			{Class: "5h", Allowed: true, ObservedAt: now},
+			{Class: "unknown", Allowed: true},
+		},
+	}
+	if !warmupSnapshotFresh(snapshot, now, 15*time.Minute) {
+		t.Fatal("an unobserved unknown row should not invalidate a fresh recognized window")
+	}
+	snapshot.Windows = append(snapshot.Windows, quotaWindow{Class: "weekly", Allowed: true})
+	if warmupSnapshotFresh(snapshot, now, 15*time.Minute) {
+		t.Fatal("recognized row without its own ObservedAt was accepted for warmup")
 	}
 }
 
@@ -246,6 +678,10 @@ func TestWarmupHeaderless429EntersProbation(t *testing.T) {
 			t.Errorf("authorization = %q", got)
 		}
 		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/auth-files" {
+			_, _ = w.Write([]byte(`{"files":[{"id":"acct","auth_index":"idx","provider":"codex","status":"active","note":"via sidecar"}]}`))
+			return
+		}
 		if err := json.NewEncoder(w).Encode(cpaAPICallResponse{StatusCode: statusTooManyRequests}); err != nil {
 			t.Errorf("encode response: %v", err)
 		}

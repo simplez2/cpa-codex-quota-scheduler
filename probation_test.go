@@ -30,6 +30,7 @@ func TestHeaderless429CreatesProbation(t *testing.T) {
 	raw, err := json.Marshal(pluginapi.UsageRecord{
 		Provider: providerCodex,
 		AuthID:   "acct",
+		Generate: true,
 		Failed:   true,
 		Failure:  pluginapi.UsageFailure{StatusCode: statusTooManyRequests},
 	})

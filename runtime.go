@@ -65,8 +65,11 @@ type quotaSnapshot struct {
 }
 
 type schedulerRuntimeState struct {
-	mu        sync.RWMutex
-	persistMu sync.Mutex
+	lifecycleMu  sync.Mutex
+	mu           sync.RWMutex
+	persistMu    sync.Mutex
+	generationMu sync.Mutex
+	generation   schedulerGenerationOwnership
 
 	cfg         pluginConfig
 	quotas      map[string]quotaSnapshot // indexed by AuthID and AuthIndex aliases
@@ -75,11 +78,42 @@ type schedulerRuntimeState struct {
 	lastError   string
 	refreshes   int
 
-	cancel        context.CancelFunc
-	wg            sync.WaitGroup
-	warmupMu      sync.Mutex
-	warmupRunning bool
-	warmups       map[string]warmupEntry
+	cancel                      context.CancelFunc
+	wg                          sync.WaitGroup
+	stopping                    bool
+	warmupMu                    sync.Mutex
+	warmupRunning               bool
+	warmups                     map[string]warmupEntry
+	warmupLeases                map[string]warmupLease
+	warmupCandidatesLast        int
+	warmupSkippedBannedLast     int
+	warmupSkippedStaleLast      int
+	warmupSkippedIneligibleLast int
+	warmupSkippedNotNeededLast  int
+	warmupAuthSourceLast        string
+	warmupAuthCheckedAt         time.Time
+	warmupAuthFilesSeenLast     int
+	warmupAuthEligibleLast      int
+	warmupAuthRejectedLast      map[string]int
+	warmupAuthLastError         string
+	keeperRefreshTargetsLast    int
+	keeperRefreshRequests       uint64
+	keeperRefreshRequestedAt    time.Time
+	keeperRefreshNextAllowedAt  time.Time
+	keeperRefreshAttempt        int
+	keeperRefreshAcceptedLast   int
+	keeperRefreshSkippedLast    int
+	keeperRefreshRejectedLast   map[string]int
+	keeperRefreshLastError      string
+	keeperRefreshFingerprint    string
+	keeperRefreshRecoveries     uint64
+
+	banResetMu                 sync.Mutex
+	banResetConfirmations      map[string]banResetConfirmation
+	banResetConfirmationEvents uint64
+	banExternalResetClears     uint64
+	lastBanClearReason         string
+	lastBanClearAt             time.Time
 
 	sessionToken  string
 	sessionExpiry time.Time
@@ -111,6 +145,9 @@ type schedulerRuntimeState struct {
 var schedulerRuntime schedulerRuntimeState
 
 func configureSchedulerRuntime(raw []byte) {
+	schedulerRuntime.lifecycleMu.Lock()
+	defer schedulerRuntime.lifecycleMu.Unlock()
+
 	cfg, err := parsePluginConfig(raw)
 	if err != nil {
 		// A malformed optional plugin config must never prevent CPA from
@@ -121,7 +158,8 @@ func configureSchedulerRuntime(raw []byte) {
 		cfg.Enabled = false
 	}
 
-	schedulerRuntime.stop()
+	schedulerRuntime.stopLocked()
+	schedulerRuntime.initializeGenerationOwnership(cfg.StatePath)
 	schedulerRuntime.mu.Lock()
 	schedulerRuntime.cfg = cfg
 	schedulerRuntime.quotas = make(map[string]quotaSnapshot)
@@ -129,7 +167,32 @@ func configureSchedulerRuntime(raw []byte) {
 	schedulerRuntime.lastRefresh = time.Time{}
 	schedulerRuntime.lastError = ""
 	schedulerRuntime.refreshes = 0
+	schedulerRuntime.stopping = false
 	schedulerRuntime.warmups = make(map[string]warmupEntry)
+	schedulerRuntime.warmupLeases = make(map[string]warmupLease)
+	schedulerRuntime.warmupCandidatesLast = 0
+	schedulerRuntime.warmupSkippedBannedLast = 0
+	schedulerRuntime.warmupSkippedStaleLast = 0
+	schedulerRuntime.warmupSkippedIneligibleLast = 0
+	schedulerRuntime.warmupSkippedNotNeededLast = 0
+	schedulerRuntime.warmupAuthSourceLast = ""
+	schedulerRuntime.warmupAuthCheckedAt = time.Time{}
+	schedulerRuntime.warmupAuthFilesSeenLast = 0
+	schedulerRuntime.warmupAuthEligibleLast = 0
+	schedulerRuntime.warmupAuthRejectedLast = make(map[string]int)
+	schedulerRuntime.warmupAuthLastError = ""
+	schedulerRuntime.keeperRefreshTargetsLast = 0
+	schedulerRuntime.keeperRefreshRequests = 0
+	schedulerRuntime.keeperRefreshRequestedAt = time.Time{}
+	schedulerRuntime.keeperRefreshNextAllowedAt = time.Time{}
+	schedulerRuntime.keeperRefreshAttempt = 0
+	schedulerRuntime.keeperRefreshAcceptedLast = 0
+	schedulerRuntime.keeperRefreshSkippedLast = 0
+	schedulerRuntime.keeperRefreshRejectedLast = make(map[string]int)
+	schedulerRuntime.keeperRefreshLastError = ""
+	schedulerRuntime.keeperRefreshFingerprint = ""
+	schedulerRuntime.keeperRefreshRecoveries = 0
+	schedulerRuntime.banResetConfirmations = make(map[string]banResetConfirmation)
 	schedulerRuntime.sessionToken = ""
 	schedulerRuntime.sessionExpiry = time.Time{}
 	schedulerRuntime.serialActiveAuthID = ""
@@ -161,6 +224,10 @@ func configureSchedulerRuntime(raw []byte) {
 	if !cfg.Enabled || strings.TrimSpace(cfg.KeeperURL) == "" {
 		return
 	}
+	if err := schedulerRuntime.reserveGenerationOwnership(cfg.StatePath); err != nil {
+		schedulerRuntime.recordRefreshError(err)
+		return
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	schedulerRuntime.mu.Lock()
@@ -171,7 +238,17 @@ func configureSchedulerRuntime(raw []byte) {
 }
 
 func (s *schedulerRuntimeState) stop() {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	s.stopLocked()
+}
+
+// stopLocked drains all admitted workers while the lifecycle gate prevents a
+// concurrent reconfigure from adding a new refresh worker to the same
+// WaitGroup. Callers must hold lifecycleMu.
+func (s *schedulerRuntimeState) stopLocked() {
 	s.mu.Lock()
+	s.stopping = true
 	cancel := s.cancel
 	s.cancel = nil
 	s.sessionToken = ""
@@ -179,11 +256,45 @@ func (s *schedulerRuntimeState) stop() {
 	s.mu.Unlock()
 	if cancel != nil {
 		cancel()
-		s.wg.Wait()
 	}
-	// Persist bans before CPA unloads the shared object.  The file contains
-	// only auth IDs and reset timestamps, never PATs, cookies, or passwords.
-	s.persistBanState()
+	s.wg.Wait()
+	s.warmupMu.Lock()
+	s.warmupRunning = false
+	s.warmupLeases = make(map[string]warmupLease)
+	s.warmupMu.Unlock()
+	// Only the durable generation owner may commit or release shared state.
+	// A superseded retired DSO must never overwrite the active instance.
+	if s.generationOwnerActive() {
+		s.persistBanState()
+		if err := s.releaseGenerationOwnership(); err != nil {
+			slog.Warn("codex-quota-scheduler: could not release generation ownership", "error", err)
+		}
+	}
+}
+
+func (s *schedulerRuntimeState) admitBackgroundWorker() bool {
+	// A runtime with a durable state_path may only start background work after
+	// it owns the active generation. Check before touching the WaitGroup so an
+	// unclaimed/retired DSO fails closed during a hot reload.
+	if !s.generationOwnerActive() {
+		return false
+	}
+	s.mu.Lock()
+	if s.stopping {
+		s.mu.Unlock()
+		return false
+	}
+	s.wg.Add(1)
+	s.mu.Unlock()
+
+	// A takeover can occur between the first ownership check and admission.
+	// Revalidate after Add so stop() can still drain deterministically; if the
+	// generation changed, balance the WaitGroup and never launch the worker.
+	if !s.generationOwnerActive() {
+		s.wg.Done()
+		return false
+	}
+	return true
 }
 
 func (s *schedulerRuntimeState) refreshLoop(ctx context.Context) {
@@ -211,6 +322,9 @@ func (s *schedulerRuntimeState) refreshLoop(ctx context.Context) {
 }
 
 func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
+	if !s.generationCanRefresh() {
+		return
+	}
 	s.mu.RLock()
 	cfg := s.cfg
 	s.mu.RUnlock()
@@ -301,11 +415,6 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 		s.recordRefreshError(fmt.Errorf("decode Keeper quota cache: %w", err))
 		return
 	}
-	if len(cacheResp.Items) == 0 {
-		s.recordRefreshError(errors.New("Keeper quota cache returned no completed items"))
-		return
-	}
-
 	now := time.Now()
 	quotas := make(map[string]quotaSnapshot, len(cacheResp.Items)*2)
 	for _, item := range cacheResp.Items {
@@ -321,9 +430,6 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 			continue
 		}
 		refreshedAt := parseKeeperTime(item.RefreshedAt)
-		if refreshedAt.IsZero() {
-			refreshedAt = now
-		}
 		snapshot := normalizeQuotaSnapshot(index, fileName, *item.Quota, refreshedAt, now)
 		if len(snapshot.Windows) == 0 {
 			continue
@@ -335,12 +441,26 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 			quotas[index] = snapshot
 		}
 	}
+	if err := s.maybeRequestKeeperQuotaRefresh(ctx, cfg, password, token, indexes, cacheResp, quotas, now); err != nil {
+		s.recordRefreshError(err)
+	}
 	if len(quotas) == 0 {
 		s.recordRefreshError(errors.New("Keeper quota cache contained no usable Codex windows"))
 		return
 	}
 
 	pricing, pricingOK := fetchKeeperPricing(ctx, cfg, token)
+	_, active, err := s.claimGenerationAfterSuccessfulRefresh()
+	if err != nil {
+		s.recordRefreshError(err)
+		return
+	}
+	if !active {
+		return
+	}
+	if !s.generationOwnerActive() {
+		return
+	}
 
 	s.mu.Lock()
 	quotas = s.mergePartialQuotaSnapshotsLocked(quotas, now)
@@ -354,7 +474,19 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 	s.lastError = ""
 	s.refreshes++
 	s.mu.Unlock()
-	s.scheduleWarmup(ctx)
+	if !s.generationOwnerActive() {
+		return
+	}
+	if s.confirmPendingWarmups(quotas, now) {
+		s.persistBanState()
+	}
+	s.reconcileExternallyResetQuotaBans(quotas, now)
+	if confirmationTargets := s.pendingBanResetKeeperRefreshTargets(quotas); len(confirmationTargets) > 0 {
+		if err := s.requestKeeperQuotaRefreshTargets(ctx, cfg, password, token, confirmationTargets, now); err != nil {
+			s.recordRefreshError(err)
+		}
+	}
+	s.scheduleWarmup(ctx, nil)
 }
 
 func fetchKeeperPricing(ctx context.Context, cfg pluginConfig, token string) (map[string]modelPricing, bool) {
@@ -415,11 +547,14 @@ type keeperCacheResponse struct {
 }
 
 type keeperCacheItem struct {
-	AuthIndex   string               `json:"auth_index"`
-	FileName    string               `json:"file_name"`
-	Status      string               `json:"status"`
-	Quota       *keeperCheckResponse `json:"quota"`
-	RefreshedAt json.RawMessage      `json:"refreshed_at"`
+	AuthIndex      string               `json:"auth_index"`
+	FileName       string               `json:"file_name"`
+	Status         string               `json:"status"`
+	Quota          *keeperCheckResponse `json:"quota"`
+	Error          string               `json:"error"`
+	HTTPStatusCode *int                 `json:"http_status_code"`
+	ExpiresAt      json.RawMessage      `json:"expires_at"`
+	RefreshedAt    json.RawMessage      `json:"refreshed_at"`
 }
 
 type keeperCheckResponse struct {
@@ -711,7 +846,7 @@ func (p quotaWindowPatch) hasQuotaSignal() bool {
 // header-only observation never advances RefreshedAt, which remains the
 // authoritative Keeper freshness boundary.
 func (s *schedulerRuntimeState) observeUsage(record pluginapi.UsageRecord) {
-	if !strings.EqualFold(strings.TrimSpace(record.Provider), providerCodex) {
+	if !record.Generate || !strings.EqualFold(strings.TrimSpace(record.Provider), providerCodex) {
 		return
 	}
 	s.observeUsageCost(record)
@@ -927,6 +1062,28 @@ func codexOnlySchedulerRequest(req pluginapi.SchedulerPickRequest) bool {
 }
 
 func (s *schedulerRuntimeState) schedulerPick(req pluginapi.SchedulerPickRequest) (pluginapi.SchedulerPickResponse, error) {
+	if nonce := schedulerOptionHeader(req.Options.Headers, warmupRequestHeader); nonce != "" {
+		now := time.Now()
+		targetAuthID, validLease := s.consumeWarmupLease(nonce, now)
+		if !validLease {
+			return pluginapi.SchedulerPickResponse{}, fmt.Errorf("invalid or expired internal warmup lease")
+		}
+		if len(req.Candidates) == 0 || !codexOnlySchedulerRequest(req) {
+			return pluginapi.SchedulerPickResponse{}, fmt.Errorf("internal warmup target has no Codex candidates")
+		}
+		if _, quarantined := banStore.lookup(targetAuthID); quarantined {
+			return pluginapi.SchedulerPickResponse{}, fmt.Errorf("internal warmup target is quarantined")
+		}
+		for _, candidate := range req.Candidates {
+			if strings.TrimSpace(candidate.ID) == targetAuthID && strings.EqualFold(strings.TrimSpace(candidate.Provider), providerCodex) {
+				return pluginapi.SchedulerPickResponse{Handled: true, AuthID: targetAuthID}, nil
+			}
+		}
+		return pluginapi.SchedulerPickResponse{}, fmt.Errorf("internal warmup target is unavailable")
+	}
+	if schedulerRequestGenerationDisabled(req) {
+		return pluginapi.SchedulerPickResponse{Handled: false}, nil
+	}
 	if len(req.Candidates) == 0 || !codexOnlySchedulerRequest(req) {
 		// Codex-only isolation is a hard boundary. Mixed and third-party routes
 		// always fall through to CPA without a plugin decision.
@@ -1005,6 +1162,31 @@ func (s *schedulerRuntimeState) schedulerPick(req pluginapi.SchedulerPickRequest
 	returned := pluginapi.SchedulerPickResponse{Handled: false}
 	s.recordDecisionAudit(req, mode, lastLegacy, lastDynamic, returned, lastCandidates, now)
 	return returned, nil
+}
+
+func schedulerRequestGenerationDisabled(req pluginapi.SchedulerPickRequest) bool {
+	for key, value := range req.Options.Metadata {
+		if !strings.EqualFold(strings.TrimSpace(key), "generate") {
+			continue
+		}
+		generate, ok := value.(bool)
+		return ok && !generate
+	}
+	return false
+}
+
+func schedulerOptionHeader(headers map[string][]string, key string) string {
+	for candidateKey, values := range headers {
+		if !strings.EqualFold(strings.TrimSpace(candidateKey), key) {
+			continue
+		}
+		for _, value := range values {
+			if value = strings.TrimSpace(value); value != "" {
+				return value
+			}
+		}
+	}
+	return ""
 }
 
 func schedulerCandidatesWithout(candidates []pluginapi.SchedulerAuthCandidate, authID string) []pluginapi.SchedulerAuthCandidate {
@@ -1226,21 +1408,43 @@ func (s *schedulerRuntimeState) nextPick(n int) int {
 }
 
 type persistedBanState struct {
-	Version                int                    `json:"version"`
-	Bans                   map[string]banEntry    `json:"bans"`
-	Warmups                map[string]warmupEntry `json:"warmups,omitempty"`
-	SerialActiveAuthID     string                 `json:"serial_active_auth_id,omitempty"`
-	SerialSelectedAt       time.Time              `json:"serial_selected_at,omitempty"`
-	SerialSwitches         uint64                 `json:"serial_switches,omitempty"`
-	SerialFallbacks        uint64                 `json:"serial_provisional_fallbacks,omitempty"`
-	SerialLastSwitchAt     time.Time              `json:"serial_last_switch_at,omitempty"`
-	SerialLastSwitchReason string                 `json:"serial_last_switch_reason,omitempty"`
-	SavedAt                time.Time              `json:"saved_at"`
+	Version                int                             `json:"version"`
+	Bans                   map[string]banEntry             `json:"bans"`
+	Warmups                map[string]warmupEntry          `json:"warmups,omitempty"`
+	BanResetConfirmations  map[string]banResetConfirmation `json:"ban_reset_confirmations,omitempty"`
+	SerialActiveAuthID     string                          `json:"serial_active_auth_id,omitempty"`
+	SerialSelectedAt       time.Time                       `json:"serial_selected_at,omitempty"`
+	SerialSwitches         uint64                          `json:"serial_switches,omitempty"`
+	SerialFallbacks        uint64                          `json:"serial_provisional_fallbacks,omitempty"`
+	SerialLastSwitchAt     time.Time                       `json:"serial_last_switch_at,omitempty"`
+	SerialLastSwitchReason string                          `json:"serial_last_switch_reason,omitempty"`
+	SavedAt                time.Time                       `json:"saved_at"`
 }
 
 func loadBanState(path string) {
+	schedulerRuntime.loadBanState(path)
+}
+
+func (s *schedulerRuntimeState) loadBanState(path string) {
+	s.loadBanStateWithConfirmationMode(path, false)
+}
+
+// loadBanStateAfterGenerationClaim is called after the durable generation
+// fence has moved but before the incoming runtime marks itself claimed in
+// memory. Bans and warmup outcomes keep merge semantics so usage delivered to
+// the incoming CPA capability is not lost. Reset confirmations are different:
+// deletion is meaningful evidence that an intervening snapshot invalidated the
+// first proof, so the just-fenced on-disk set is authoritative.
+func (s *schedulerRuntimeState) loadBanStateAfterGenerationClaim(path string) {
+	s.loadBanStateWithConfirmationMode(path, true)
+}
+
+func (s *schedulerRuntimeState) loadBanStateWithConfirmationMode(path string, replaceConfirmations bool) {
 	path = strings.TrimSpace(path)
 	if path == "" {
+		if replaceConfirmations {
+			s.replaceBanResetConfirmations(nil)
+		}
 		return
 	}
 	raw, err := os.ReadFile(path)
@@ -1248,11 +1452,17 @@ func loadBanState(path string) {
 		if !os.IsNotExist(err) {
 			slog.Warn("codex-quota-scheduler: could not read persisted ban state", "error", err)
 		}
+		if replaceConfirmations {
+			s.replaceBanResetConfirmations(nil)
+		}
 		return
 	}
 	var state persistedBanState
 	if err := json.Unmarshal(raw, &state); err != nil {
 		slog.Warn("codex-quota-scheduler: ignoring invalid persisted ban state", "error", err)
+		if replaceConfirmations {
+			s.replaceBanResetConfirmations(nil)
+		}
 		return
 	}
 	for authID, entry := range state.Bans {
@@ -1261,33 +1471,63 @@ func loadBanState(path string) {
 		}
 		banStore.set(authID, entry)
 	}
-	schedulerRuntime.warmupMu.Lock()
-	if schedulerRuntime.warmups == nil {
-		schedulerRuntime.warmups = make(map[string]warmupEntry)
+	s.warmupMu.Lock()
+	if s.warmups == nil {
+		s.warmups = make(map[string]warmupEntry)
 	}
 	for key, entry := range state.Warmups {
 		if strings.TrimSpace(key) == "" || strings.TrimSpace(entry.AuthID) == "" || entry.AttemptedAt.IsZero() {
 			continue
 		}
-		schedulerRuntime.warmups[key] = entry
+		s.warmups[key] = entry
 	}
-	schedulerRuntime.warmupMu.Unlock()
-	schedulerRuntime.mu.Lock()
-	schedulerRuntime.serialActiveAuthID = strings.TrimSpace(state.SerialActiveAuthID)
-	schedulerRuntime.serialSelectedAt = state.SerialSelectedAt
-	schedulerRuntime.serialSwitches = state.SerialSwitches
-	schedulerRuntime.serialFallbacks = state.SerialFallbacks
-	schedulerRuntime.serialLastSwitchAt = state.SerialLastSwitchAt
-	schedulerRuntime.serialLastSwitchReason = strings.TrimSpace(state.SerialLastSwitchReason)
-	schedulerRuntime.mu.Unlock()
+	s.warmupMu.Unlock()
+	validConfirmations := make(map[string]banResetConfirmation, len(state.BanResetConfirmations))
+	for authID, confirmation := range state.BanResetConfirmations {
+		if strings.TrimSpace(authID) == "" || confirmation.Confirmations < 1 || confirmation.LastSnapshotAt.IsZero() {
+			continue
+		}
+		validConfirmations[authID] = confirmation
+	}
+	s.banResetMu.Lock()
+	if replaceConfirmations || s.banResetConfirmations == nil {
+		s.banResetConfirmations = make(map[string]banResetConfirmation, len(validConfirmations))
+	}
+	for authID, confirmation := range validConfirmations {
+		s.banResetConfirmations[authID] = confirmation
+	}
+	s.banResetMu.Unlock()
+	s.mu.Lock()
+	s.serialActiveAuthID = strings.TrimSpace(state.SerialActiveAuthID)
+	s.serialSelectedAt = state.SerialSelectedAt
+	s.serialSwitches = state.SerialSwitches
+	s.serialFallbacks = state.SerialFallbacks
+	s.serialLastSwitchAt = state.SerialLastSwitchAt
+	s.serialLastSwitchReason = strings.TrimSpace(state.SerialLastSwitchReason)
+	s.mu.Unlock()
 }
 
-func (s *schedulerRuntimeState) persistBanState() {
+func (s *schedulerRuntimeState) replaceBanResetConfirmations(confirmations map[string]banResetConfirmation) {
+	s.banResetMu.Lock()
+	s.banResetConfirmations = make(map[string]banResetConfirmation, len(confirmations))
+	for authID, confirmation := range confirmations {
+		s.banResetConfirmations[authID] = confirmation
+	}
+	s.banResetMu.Unlock()
+}
+
+func (s *schedulerRuntimeState) persistBanState() bool {
+	if !s.generationOwnerActive() {
+		return false
+	}
 	// Serialize snapshot-and-rename, not only the rename. Otherwise an older
 	// concurrent snapshot could land after a newer one and lose quarantine
 	// state on the next process restart.
 	s.persistMu.Lock()
 	defer s.persistMu.Unlock()
+	if !s.generationOwnerActive() {
+		return false
+	}
 
 	s.mu.RLock()
 	path := strings.TrimSpace(s.cfg.StatePath)
@@ -1299,7 +1539,7 @@ func (s *schedulerRuntimeState) persistBanState() {
 	serialLastSwitchReason := strings.TrimSpace(s.serialLastSwitchReason)
 	s.mu.RUnlock()
 	if path == "" {
-		return
+		return false
 	}
 	s.warmupMu.Lock()
 	warmups := make(map[string]warmupEntry, len(s.warmups))
@@ -1307,10 +1547,17 @@ func (s *schedulerRuntimeState) persistBanState() {
 		warmups[key] = entry
 	}
 	s.warmupMu.Unlock()
+	s.banResetMu.Lock()
+	confirmations := make(map[string]banResetConfirmation, len(s.banResetConfirmations))
+	for authID, confirmation := range s.banResetConfirmations {
+		confirmations[authID] = confirmation
+	}
+	s.banResetMu.Unlock()
 	state := persistedBanState{
-		Version:                4,
+		Version:                5,
 		Bans:                   banStore.snapshot(),
 		Warmups:                warmups,
+		BanResetConfirmations:  confirmations,
 		SerialActiveAuthID:     serialActiveAuthID,
 		SerialSelectedAt:       serialSelectedAt,
 		SerialSwitches:         serialSwitches,
@@ -1321,68 +1568,116 @@ func (s *schedulerRuntimeState) persistBanState() {
 	}
 	raw, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
-		return
+		return false
 	}
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		slog.Warn("codex-quota-scheduler: could not create ban state directory", "error", err)
-		return
+		return false
 	}
 	tmp, err := os.CreateTemp(dir, ".state-*.tmp")
 	if err != nil {
 		slog.Warn("codex-quota-scheduler: could not create ban state temp file", "error", err)
-		return
+		return false
 	}
 	tmpName := tmp.Name()
 	defer os.Remove(tmpName)
 	_ = tmp.Chmod(0600)
-	if _, err := tmp.Write(raw); err != nil {
+	if err := writeFileAll(tmp, raw); err != nil {
 		_ = tmp.Close()
-		return
+		return false
 	}
 	if err := tmp.Sync(); err != nil {
 		_ = tmp.Close()
-		return
+		return false
 	}
 	if err := tmp.Close(); err != nil {
-		return
+		return false
 	}
-	if err := os.Rename(tmpName, path); err != nil {
+	// Verify and rename under the same generation-file OS lock used by claim.
+	// A new owner therefore cannot interleave between the fence check and the
+	// shared-state commit.
+	committed, err := s.withGenerationOwnerCommit(func() error {
+		return os.Rename(tmpName, path)
+	})
+	if err != nil {
 		slog.Warn("codex-quota-scheduler: could not persist ban state", "error", err)
+		return false
 	}
+	if !committed {
+		return false
+	}
+	return true
 }
 
 type runtimeStatus struct {
-	Enabled             bool                     `json:"enabled"`
-	SchedulerMode       string                   `json:"scheduler_mode"`
-	SerialSwitchPercent float64                  `json:"serial_switch_percent"`
-	SerialActiveAuthID  string                   `json:"serial_active_auth_id,omitempty"`
-	SerialSelectedAt    string                   `json:"serial_selected_at,omitempty"`
-	SerialSwitches      uint64                   `json:"serial_switches"`
-	SerialFallbacks     uint64                   `json:"serial_provisional_fallbacks"`
-	SerialFallbackAuth  string                   `json:"serial_provisional_auth_id,omitempty"`
-	SerialMissingSince  string                   `json:"serial_candidate_missing_since,omitempty"`
-	SerialMissingCount  int                      `json:"serial_candidate_missing_confirmations,omitempty"`
-	SerialLastSwitchAt  string                   `json:"serial_last_switch_at,omitempty"`
-	SerialSwitchReason  string                   `json:"serial_last_switch_reason,omitempty"`
-	ConfigGeneration    uint64                   `json:"config_generation"`
-	KeeperConfigured    bool                     `json:"keeper_configured"`
-	WarmupEnabled       bool                     `json:"warmup_enabled"`
-	Refreshes           int                      `json:"refreshes"`
-	LastRefresh         string                   `json:"last_refresh,omitempty"`
-	LastError           string                   `json:"last_error,omitempty"`
-	FreshSnapshots      int                      `json:"fresh_snapshots"`
-	WindowOrder         []string                 `json:"window_order"`
-	PricingModels       int                      `json:"pricing_models"`
-	CostProfiles        []runtimeCostProfile     `json:"cost_profiles"`
-	Pacing              []runtimePacingStatus    `json:"pacing,omitempty"`
-	StickyBindings      int                      `json:"sticky_bindings"`
-	SessionSwitches     uint64                   `json:"session_switches"`
-	ShadowDisagreements uint64                   `json:"shadow_disagreements"`
-	Quarantine          runtimeQuarantineStatus  `json:"quarantine"`
-	RecentDecisions     []schedulerDecisionAudit `json:"recent_decisions,omitempty"`
-	Snapshots           []runtimeQuotaStatus     `json:"snapshots,omitempty"`
-	Warmups             []runtimeWarmupStatus    `json:"warmups,omitempty"`
+	Enabled                  bool                     `json:"enabled"`
+	SchedulerMode            string                   `json:"scheduler_mode"`
+	SerialSwitchPercent      float64                  `json:"serial_switch_percent"`
+	SerialActiveAuthID       string                   `json:"serial_active_auth_id,omitempty"`
+	SerialSelectedAt         string                   `json:"serial_selected_at,omitempty"`
+	SerialSwitches           uint64                   `json:"serial_switches"`
+	SerialFallbacks          uint64                   `json:"serial_provisional_fallbacks"`
+	SerialFallbackAuth       string                   `json:"serial_provisional_auth_id,omitempty"`
+	SerialMissingSince       string                   `json:"serial_candidate_missing_since,omitempty"`
+	SerialMissingCount       int                      `json:"serial_candidate_missing_confirmations,omitempty"`
+	SerialLastSwitchAt       string                   `json:"serial_last_switch_at,omitempty"`
+	SerialSwitchReason       string                   `json:"serial_last_switch_reason,omitempty"`
+	ConfigGeneration         uint64                   `json:"config_generation"`
+	RuntimeGeneration        uint64                   `json:"runtime_generation"`
+	GenerationManaged        bool                     `json:"generation_managed"`
+	GenerationClaimed        bool                     `json:"generation_claimed"`
+	GenerationActive         bool                     `json:"generation_active"`
+	GenerationReleased       bool                     `json:"generation_released"`
+	GenerationSuperseded     bool                     `json:"generation_superseded"`
+	GenerationObserved       uint64                   `json:"generation_observed"`
+	GenerationOwner          string                   `json:"generation_owner,omitempty"`
+	GenerationClaimedAt      string                   `json:"generation_claimed_at,omitempty"`
+	GenerationReason         string                   `json:"generation_supersede_reason,omitempty"`
+	KeeperConfigured         bool                     `json:"keeper_configured"`
+	WarmupEnabled            bool                     `json:"warmup_enabled"`
+	WarmupExecutionMode      string                   `json:"warmup_execution_mode"`
+	WarmupCandidates         int                      `json:"warmup_candidates"`
+	WarmupSkippedBanned      int                      `json:"warmup_skipped_banned"`
+	WarmupSkippedStale       int                      `json:"warmup_skipped_stale"`
+	WarmupSkippedIneligible  int                      `json:"warmup_skipped_ineligible"`
+	WarmupSkippedNotNeeded   int                      `json:"warmup_skipped_not_unstarted"`
+	WarmupAuthSource         string                   `json:"warmup_auth_source,omitempty"`
+	WarmupAuthCheckedAt      string                   `json:"warmup_auth_checked_at,omitempty"`
+	WarmupAuthFilesSeen      int                      `json:"warmup_auth_files_seen"`
+	WarmupAuthEligible       int                      `json:"warmup_auth_eligible"`
+	WarmupAuthRejected       map[string]int           `json:"warmup_auth_rejected,omitempty"`
+	WarmupAuthLastError      string                   `json:"warmup_auth_last_error,omitempty"`
+	KeeperRefreshTargets     int                      `json:"keeper_refresh_targets"`
+	KeeperRefreshRequests    uint64                   `json:"keeper_refresh_requests"`
+	KeeperRefreshRequestedAt string                   `json:"keeper_refresh_requested_at,omitempty"`
+	KeeperRefreshNextAt      string                   `json:"keeper_refresh_next_allowed_at,omitempty"`
+	KeeperRefreshAttempt     int                      `json:"keeper_refresh_attempt"`
+	KeeperRefreshAccepted    int                      `json:"keeper_refresh_accepted"`
+	KeeperRefreshSkipped     int                      `json:"keeper_refresh_skipped"`
+	KeeperRefreshRejected    map[string]int           `json:"keeper_refresh_rejected,omitempty"`
+	KeeperRefreshError       string                   `json:"keeper_refresh_error,omitempty"`
+	KeeperRefreshRecoveries  uint64                   `json:"keeper_refresh_gate_recoveries"`
+	BanResetPending          int                      `json:"ban_reset_pending_confirmations"`
+	BanResetEvents           uint64                   `json:"ban_reset_confirmation_events"`
+	BanExternalClears        uint64                   `json:"ban_external_reset_clears"`
+	LastBanClearReason       string                   `json:"last_ban_clear_reason,omitempty"`
+	LastBanClearAt           string                   `json:"last_ban_clear_at,omitempty"`
+	Refreshes                int                      `json:"refreshes"`
+	LastRefresh              string                   `json:"last_refresh,omitempty"`
+	LastError                string                   `json:"last_error,omitempty"`
+	FreshSnapshots           int                      `json:"fresh_snapshots"`
+	WindowOrder              []string                 `json:"window_order"`
+	PricingModels            int                      `json:"pricing_models"`
+	CostProfiles             []runtimeCostProfile     `json:"cost_profiles"`
+	Pacing                   []runtimePacingStatus    `json:"pacing,omitempty"`
+	StickyBindings           int                      `json:"sticky_bindings"`
+	SessionSwitches          uint64                   `json:"session_switches"`
+	ShadowDisagreements      uint64                   `json:"shadow_disagreements"`
+	Quarantine               runtimeQuarantineStatus  `json:"quarantine"`
+	RecentDecisions          []schedulerDecisionAudit `json:"recent_decisions,omitempty"`
+	Snapshots                []runtimeQuotaStatus     `json:"snapshots,omitempty"`
+	Warmups                  []runtimeWarmupStatus    `json:"warmups,omitempty"`
 }
 
 type runtimeQuotaStatus struct {
@@ -1421,13 +1716,17 @@ type runtimeQuotaWindowStatus struct {
 }
 
 type runtimeWarmupStatus struct {
-	AuthID      string `json:"auth_id"`
-	Window      string `json:"window"`
-	AttemptedAt string `json:"attempted_at,omitempty"`
-	ActivatedAt string `json:"activated_at,omitempty"`
-	ResetAt     string `json:"reset_at,omitempty"`
-	Status      int    `json:"status,omitempty"`
-	Error       string `json:"error,omitempty"`
+	AuthID        string `json:"auth_id"`
+	Window        string `json:"window"`
+	State         string `json:"state"`
+	AttemptedAt   string `json:"attempted_at,omitempty"`
+	CompletedAt   string `json:"completed_at,omitempty"`
+	ActivatedAt   string `json:"activated_at,omitempty"`
+	ResetAt       string `json:"reset_at,omitempty"`
+	SuppressUntil string `json:"suppress_until,omitempty"`
+	Status        int    `json:"status,omitempty"`
+	Error         string `json:"error,omitempty"`
+	Blocked       bool   `json:"blocked,omitempty"`
 }
 
 type runtimeCostProfile struct {
@@ -1550,7 +1849,39 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 	serialMissingCount := s.serialMissingCount
 	serialLastSwitchAt := s.serialLastSwitchAt
 	serialLastSwitchReason := s.serialLastSwitchReason
+	warmupCandidates := s.warmupCandidatesLast
+	warmupSkippedBanned := s.warmupSkippedBannedLast
+	warmupSkippedStale := s.warmupSkippedStaleLast
+	warmupSkippedIneligible := s.warmupSkippedIneligibleLast
+	warmupSkippedNotNeeded := s.warmupSkippedNotNeededLast
+	warmupAuthSource := s.warmupAuthSourceLast
+	warmupAuthCheckedAt := s.warmupAuthCheckedAt
+	warmupAuthFilesSeen := s.warmupAuthFilesSeenLast
+	warmupAuthEligible := s.warmupAuthEligibleLast
+	warmupAuthRejected := make(map[string]int, len(s.warmupAuthRejectedLast))
+	for reason, count := range s.warmupAuthRejectedLast {
+		warmupAuthRejected[reason] = count
+	}
+	warmupAuthLastError := s.warmupAuthLastError
+	keeperRefreshTargets := s.keeperRefreshTargetsLast
+	keeperRefreshRequests := s.keeperRefreshRequests
+	keeperRefreshRequestedAt := s.keeperRefreshRequestedAt
+	keeperRefreshNextAt := s.keeperRefreshNextAllowedAt
+	keeperRefreshAttempt := s.keeperRefreshAttempt
+	keeperRefreshAccepted := s.keeperRefreshAcceptedLast
+	keeperRefreshSkipped := s.keeperRefreshSkippedLast
+	keeperRefreshRejected := make(map[string]int, len(s.keeperRefreshRejectedLast))
+	for reason, count := range s.keeperRefreshRejectedLast {
+		keeperRefreshRejected[reason] = count
+	}
+	keeperRefreshLastError := s.keeperRefreshLastError
+	keeperRefreshRecoveries := s.keeperRefreshRecoveries
+	banResetEvents := s.banResetConfirmationEvents
+	banExternalClears := s.banExternalResetClears
+	lastBanClearReason := s.lastBanClearReason
+	lastBanClearAt := s.lastBanClearAt
 	s.mu.RUnlock()
+	generation := s.generationStatus()
 
 	s.warmupMu.Lock()
 	warmups := make(map[string]warmupEntry, len(s.warmups))
@@ -1558,6 +1889,9 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 		warmups[key] = entry
 	}
 	s.warmupMu.Unlock()
+	s.banResetMu.Lock()
+	banResetPending := len(s.banResetConfirmations)
+	s.banResetMu.Unlock()
 
 	now := time.Now()
 	stickyBindings := 0
@@ -1750,30 +2084,74 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 	}
 
 	out := runtimeStatus{
-		Enabled:             cfg.Enabled,
-		SchedulerMode:       cfg.SchedulerMode,
-		SerialSwitchPercent: cfg.SerialSwitchPercent,
-		SerialActiveAuthID:  serialActiveAuthID,
-		SerialSwitches:      serialSwitches,
-		SerialFallbacks:     serialFallbacks,
-		SerialFallbackAuth:  serialFallbackAuthID,
-		SerialMissingCount:  serialMissingCount,
-		SerialSwitchReason:  serialLastSwitchReason,
-		ConfigGeneration:    configGeneration,
-		KeeperConfigured:    strings.TrimSpace(cfg.KeeperURL) != "",
-		WarmupEnabled:       cfg.WarmupEnabled,
-		Refreshes:           refreshes,
-		FreshSnapshots:      count,
-		WindowOrder:         append([]string(nil), cfg.WindowOrder...),
-		PricingModels:       pricingModels,
-		CostProfiles:        costProfiles,
-		Pacing:              pacing,
-		StickyBindings:      stickyBindings,
-		SessionSwitches:     sessionSwitches,
-		ShadowDisagreements: shadowDisagreements,
-		Quarantine:          quarantine,
-		LastError:           lastError,
-		Snapshots:           snapshots,
+		Enabled:                 cfg.Enabled,
+		SchedulerMode:           cfg.SchedulerMode,
+		SerialSwitchPercent:     cfg.SerialSwitchPercent,
+		SerialActiveAuthID:      serialActiveAuthID,
+		SerialSwitches:          serialSwitches,
+		SerialFallbacks:         serialFallbacks,
+		SerialFallbackAuth:      serialFallbackAuthID,
+		SerialMissingCount:      serialMissingCount,
+		SerialSwitchReason:      serialLastSwitchReason,
+		ConfigGeneration:        configGeneration,
+		RuntimeGeneration:       generation.Ticket,
+		GenerationManaged:       generation.Managed,
+		GenerationClaimed:       generation.Claimed,
+		GenerationActive:        generation.Active,
+		GenerationReleased:      generation.Released,
+		GenerationSuperseded:    generation.Superseded,
+		GenerationObserved:      generation.ObservedGeneration,
+		GenerationOwner:         generation.OwnerFingerprint,
+		GenerationReason:        generation.SupersedeReason,
+		KeeperConfigured:        strings.TrimSpace(cfg.KeeperURL) != "",
+		WarmupEnabled:           cfg.WarmupEnabled,
+		WarmupExecutionMode:     normalizeWarmupExecutionMode(cfg.WarmupExecutionMode),
+		Refreshes:               refreshes,
+		FreshSnapshots:          count,
+		WindowOrder:             append([]string(nil), cfg.WindowOrder...),
+		PricingModels:           pricingModels,
+		CostProfiles:            costProfiles,
+		Pacing:                  pacing,
+		StickyBindings:          stickyBindings,
+		SessionSwitches:         sessionSwitches,
+		ShadowDisagreements:     shadowDisagreements,
+		WarmupCandidates:        warmupCandidates,
+		WarmupSkippedBanned:     warmupSkippedBanned,
+		WarmupSkippedStale:      warmupSkippedStale,
+		WarmupSkippedIneligible: warmupSkippedIneligible,
+		WarmupSkippedNotNeeded:  warmupSkippedNotNeeded,
+		WarmupAuthSource:        warmupAuthSource,
+		WarmupAuthFilesSeen:     warmupAuthFilesSeen,
+		WarmupAuthEligible:      warmupAuthEligible,
+		WarmupAuthRejected:      warmupAuthRejected,
+		WarmupAuthLastError:     warmupAuthLastError,
+		KeeperRefreshTargets:    keeperRefreshTargets,
+		KeeperRefreshRequests:   keeperRefreshRequests,
+		KeeperRefreshAttempt:    keeperRefreshAttempt,
+		KeeperRefreshAccepted:   keeperRefreshAccepted,
+		KeeperRefreshSkipped:    keeperRefreshSkipped,
+		KeeperRefreshRejected:   keeperRefreshRejected,
+		KeeperRefreshError:      keeperRefreshLastError,
+		KeeperRefreshRecoveries: keeperRefreshRecoveries,
+		BanResetPending:         banResetPending,
+		BanResetEvents:          banResetEvents,
+		BanExternalClears:       banExternalClears,
+		LastBanClearReason:      lastBanClearReason,
+		Quarantine:              quarantine,
+		LastError:               lastError,
+		Snapshots:               snapshots,
+	}
+	if !generation.ClaimedAt.IsZero() {
+		out.GenerationClaimedAt = generation.ClaimedAt.Format(time.RFC3339)
+	}
+	if !warmupAuthCheckedAt.IsZero() {
+		out.WarmupAuthCheckedAt = warmupAuthCheckedAt.Format(time.RFC3339)
+	}
+	if !keeperRefreshRequestedAt.IsZero() {
+		out.KeeperRefreshRequestedAt = keeperRefreshRequestedAt.Format(time.RFC3339)
+	}
+	if !keeperRefreshNextAt.IsZero() {
+		out.KeeperRefreshNextAt = keeperRefreshNextAt.Format(time.RFC3339)
 	}
 	if !serialSelectedAt.IsZero() {
 		out.SerialSelectedAt = serialSelectedAt.Format(time.RFC3339)
@@ -1784,19 +2162,38 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 	if !serialLastSwitchAt.IsZero() {
 		out.SerialLastSwitchAt = serialLastSwitchAt.Format(time.RFC3339)
 	}
+	if !lastBanClearAt.IsZero() {
+		out.LastBanClearAt = lastBanClearAt.Format(time.RFC3339)
+	}
 	for index := len(decisions) - 1; index >= 0; index-- {
 		out.RecentDecisions = append(out.RecentDecisions, decisions[index])
 	}
 	for _, entry := range warmups {
-		item := runtimeWarmupStatus{AuthID: entry.AuthID, Window: entry.Window, Status: entry.Status, Error: entry.Error}
+		state := "attempted"
+		if entry.Blocked {
+			state = "blocked"
+		} else if entry.Error != "" {
+			state = "failed"
+		} else if !entry.ActivatedAt.IsZero() && !entry.ResetAt.IsZero() {
+			state = "confirmed"
+		} else if !entry.CompletedAt.IsZero() {
+			state = "pending_confirmation"
+		}
+		item := runtimeWarmupStatus{AuthID: entry.AuthID, Window: entry.Window, State: state, Status: entry.Status, Error: entry.Error, Blocked: entry.Blocked}
 		if !entry.AttemptedAt.IsZero() {
 			item.AttemptedAt = entry.AttemptedAt.Format(time.RFC3339)
+		}
+		if !entry.CompletedAt.IsZero() {
+			item.CompletedAt = entry.CompletedAt.Format(time.RFC3339)
 		}
 		if !entry.ActivatedAt.IsZero() {
 			item.ActivatedAt = entry.ActivatedAt.Format(time.RFC3339)
 		}
 		if !entry.ResetAt.IsZero() {
 			item.ResetAt = entry.ResetAt.Format(time.RFC3339)
+		}
+		if !entry.SuppressUntil.IsZero() {
+			item.SuppressUntil = entry.SuppressUntil.Format(time.RFC3339)
 		}
 		out.Warmups = append(out.Warmups, item)
 	}

@@ -385,6 +385,11 @@ func TestConcurrentPersistenceKeepsLatestQuarantineState(t *testing.T) {
 	cfg := defaultPluginConfig()
 	cfg.StatePath = path
 	state := schedulerRuntimeState{cfg: cfg, warmups: make(map[string]warmupEntry)}
+	state.initializeGenerationOwnership(path)
+	if err := state.reserveGenerationOwnership(path); err != nil {
+		t.Fatal(err)
+	}
+	claimManagedRuntimeForTest(t, &state)
 
 	const entries = 32
 	start := make(chan struct{})
@@ -412,7 +417,7 @@ func TestConcurrentPersistenceKeepsLatestQuarantineState(t *testing.T) {
 	if err := json.Unmarshal(raw, &persisted); err != nil {
 		t.Fatal(err)
 	}
-	if persisted.Version != 4 || len(persisted.Bans) != entries {
-		t.Fatalf("persisted state version=%d bans=%d; want version 4 and %d bans", persisted.Version, len(persisted.Bans), entries)
+	if persisted.Version != 5 || len(persisted.Bans) != entries {
+		t.Fatalf("persisted state version=%d bans=%d; want version 5 and %d bans", persisted.Version, len(persisted.Bans), entries)
 	}
 }

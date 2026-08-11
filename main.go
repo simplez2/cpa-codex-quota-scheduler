@@ -24,11 +24,14 @@ typedef struct {
 	size_t len;
 } cliproxy_buffer;
 
+typedef int (*cliproxy_host_call_fn)(void*, const char*, const uint8_t*, size_t, cliproxy_buffer*);
+typedef void (*cliproxy_host_free_fn)(void*, size_t);
+
 typedef struct {
 	uint32_t abi_version;
 	void* host_ctx;
-	void* call;
-	void* free_buffer;
+	cliproxy_host_call_fn call;
+	cliproxy_host_free_fn free_buffer;
 } cliproxy_host_api;
 
 typedef int (*cliproxy_plugin_call_fn)(char*, uint8_t*, size_t, cliproxy_buffer*);
@@ -45,11 +48,48 @@ typedef struct {
 extern int cliproxyPluginCall(char*, uint8_t*, size_t, cliproxy_buffer*);
 extern void cliproxyPluginFree(void*, size_t);
 extern void cliproxyPluginShutdown(void);
+
+static cliproxy_host_api stored_host;
+static int stored_host_ready;
+
+static void store_host_api(const cliproxy_host_api* host) {
+	if (host == NULL) {
+		stored_host_ready = 0;
+		return;
+	}
+	stored_host = *host;
+	stored_host_ready = 1;
+}
+
+static void clear_host_api(void) {
+	stored_host_ready = 0;
+	stored_host.host_ctx = NULL;
+	stored_host.call = NULL;
+	stored_host.free_buffer = NULL;
+}
+
+static int host_api_available(void) {
+	return stored_host_ready && stored_host.call != NULL;
+}
+
+static int call_host_api(const char* method, const uint8_t* request, size_t request_len, cliproxy_buffer* response) {
+	if (!host_api_available()) {
+		return 1;
+	}
+	return stored_host.call(stored_host.host_ctx, method, request, request_len, response);
+}
+
+static void free_host_buffer(void* ptr, size_t len) {
+	if (stored_host_ready && stored_host.free_buffer != NULL && ptr != NULL) {
+		stored_host.free_buffer(ptr, len);
+	}
+}
 */
 import "C"
 
 import (
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"sort"
@@ -65,7 +105,7 @@ import (
 
 const (
 	pluginName    = "codex-quota-scheduler"
-	pluginVersion = "0.1.5"
+	pluginVersion = "0.1.6"
 
 	// providerCodex is the CPA provider key for OpenAI Codex (ChatGPT backend).
 	providerCodex = "codex"
@@ -84,6 +124,7 @@ const (
 	usedPercentThreshold = 100
 
 	managementRoutePrefix = "/plugins/" + pluginName
+	warmupRequestHeader   = "X-CPA-Warmup-Request"
 )
 
 // banStore keeps a credential quarantined until an explicit half-open probe
@@ -405,10 +446,11 @@ func main() {}
 // function pointers.
 //
 //export cliproxy_plugin_init
-func cliproxy_plugin_init(_ *C.cliproxy_host_api, plugin *C.cliproxy_plugin_api) C.int {
+func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_api) C.int {
 	if plugin == nil {
 		return 1
 	}
+	C.store_host_api(host)
 	plugin.abi_version = C.uint32_t(pluginabi.ABIVersion)
 	plugin.call = C.cliproxy_plugin_call_fn(C.cliproxyPluginCall)
 	plugin.free_buffer = C.cliproxy_plugin_free_fn(C.cliproxyPluginFree)
@@ -451,6 +493,7 @@ func cliproxyPluginFree(ptr unsafe.Pointer, len C.size_t) {
 //export cliproxyPluginShutdown
 func cliproxyPluginShutdown() {
 	schedulerRuntime.stop()
+	C.clear_host_api()
 }
 
 // handleMethod routes a CPA method to its handler.
@@ -497,9 +540,11 @@ func pluginRegistration() registration {
 				{Name: "serial_prefer_active_cycle", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Prefer an already-started quota cycle when choosing the next serial auth."},
 				{Name: "keeper_url", Type: pluginapi.ConfigFieldTypeString, Description: "Keeper base URL, for example http://cpa-usage-keeper:8080/keeper."},
 				{Name: "keeper_password_file", Type: pluginapi.ConfigFieldTypeString, Description: "Mounted Keeper login-password file; the password is never placed in YAML."},
+				{Name: "keeper_refresh_cooldown", Type: pluginapi.ConfigFieldTypeString, Description: "Cross-instance minimum cooldown for targeted Keeper quota refresh requests. Defaults to 2m."},
 				{Name: "cpa_management_url", Type: pluginapi.ConfigFieldTypeString, Description: "CPA localhost Management API call endpoint used only for pinned warmup requests."},
 				{Name: "cpa_management_key_file", Type: pluginapi.ConfigFieldTypeString, Description: "Mounted owner-readable CPA management key file; the key is never placed in YAML or logs."},
 				{Name: "warmup_enabled", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Activate Codex accounts with 100% available quota whose Keeper reset is missing, expired, or still a full-duration moving placeholder."},
+				{Name: "warmup_execution_mode", Type: pluginapi.ConfigFieldTypeString, Description: "Warmup transport. management is bounded and hot-reload safe; native requires a CPA HostModel implementation with a verified bounded timeout."},
 				{Name: "warmup_model", Type: pluginapi.ConfigFieldTypeString, Description: "Model used for the minimal pinned hello activation request; this does not change any route default."},
 				{Name: "warmup_sidecar_url", Type: pluginapi.ConfigFieldTypeString, Description: "Internal Codex Agent Identity sidecar base URL used by pinned warmup."},
 				{Name: "warmup_retry_after", Type: pluginapi.ConfigFieldTypeString, Description: "Minimum delay before retrying a warmup that did not return a reset window."},
@@ -536,8 +581,10 @@ func pluginRegistration() registration {
 	}
 }
 
-// handleUsage observes a completed request. On a Codex 429 it records the
-// ban; otherwise it is a no-op.
+// handleUsage observes a completed generation request. Explicit generate=false
+// traffic (for example count-tokens) must not mutate quota, pacing, probe, or
+// quarantine state. Older hosts that omit Generate retain the historical
+// generate=true behavior.
 func handleUsage(raw []byte) ([]byte, error) {
 	if len(raw) == 0 {
 		return okEnvelope(map[string]any{})
@@ -552,6 +599,12 @@ func handleUsage(raw []byte) ([]byte, error) {
 	if !strings.EqualFold(record.Provider, providerCodex) {
 		return okEnvelope(map[string]any{})
 	}
+	if !usageRecordGenerateEnabled(raw) {
+		return okEnvelope(map[string]any{})
+	}
+	// Normalize the legacy omitted-field case before passing the record to
+	// helpers that consume the current CPA SDK contract.
+	record.Generate = true
 	// Every Codex response can carry fresh primary/secondary window headers and
 	// token accounting. Feed both into the pacing runtime first.
 	schedulerRuntime.observeUsage(record)
@@ -605,6 +658,21 @@ func handleUsage(raw []byte) ([]byte, error) {
 	return okEnvelope(map[string]any{})
 }
 
+// usageRecordGenerateEnabled preserves compatibility with hosts older than the
+// UsageRecord.Generate field. CPA v7.2.95 serializes the normalized bool on
+// every usage callback; an absent field therefore means a legacy host and must
+// keep the historical generate=true behavior. Only an explicit false is a
+// non-generating request.
+func usageRecordGenerateEnabled(raw []byte) bool {
+	var marker struct {
+		Generate *bool
+	}
+	if err := json.Unmarshal(raw, &marker); err == nil && marker.Generate != nil {
+		return *marker.Generate
+	}
+	return true
+}
+
 // quarantineEntryFor429 applies the same cooldown policy to ordinary traffic,
 // half-open probes, and warmup requests. A 429 without usable quota headers is
 // probationary: its deadline only makes the credential probe-ready.
@@ -651,6 +719,12 @@ func classifyAndBuildBan(headers http.Header) (banEntry, bool) {
 }
 
 func classifyAndBuildBanAt(headers http.Header, now time.Time) (banEntry, bool) {
+	if entry, ok := classifyWindowHeadersByDuration(headers, now); ok {
+		return entry, true
+	}
+	if recognizedWindowDurationHeaders(headers) > 0 {
+		return banEntry{}, false
+	}
 	h := headers
 
 	primaryUsed := headerFloat(h, "x-codex-primary-used-percent")
@@ -694,6 +768,72 @@ func classifyAndBuildBanAt(headers http.Header, now time.Time) (banEntry, bool) 
 	return banEntry{}, false
 }
 
+func recognizedWindowDurationHeaders(headers http.Header) int {
+	count := 0
+	for _, prefix := range []string{"x-codex-primary-", "x-codex-secondary-"} {
+		minutes := headerInt(headers, prefix+"window-minutes")
+		if windowClassFromSeconds(int64(minutes)*60) != "" {
+			count++
+		}
+	}
+	return count
+}
+
+// classifyWindowHeadersByDuration treats primary/secondary as positions, not
+// fixed 5h/weekly classes. Monthly-only plans can place a monthly window in the
+// primary header family, so the duration must determine the class.
+func classifyWindowHeadersByDuration(headers http.Header, now time.Time) (banEntry, bool) {
+	type headerWindow struct {
+		class   string
+		used    float64
+		resetAt time.Time
+	}
+	windows := make([]headerWindow, 0, 2)
+	for _, prefix := range []string{"x-codex-primary-", "x-codex-secondary-"} {
+		minutes := headerInt(headers, prefix+"window-minutes")
+		if minutes <= 0 {
+			continue
+		}
+		class := windowClassFromSeconds(int64(minutes) * 60)
+		if class == "" {
+			continue
+		}
+		resetAt := headerResetTime(headers, prefix+"reset-at", prefix+"reset-after-seconds", now)
+		if resetAt.IsZero() {
+			continue
+		}
+		windows = append(windows, headerWindow{
+			class: class, used: headerFloat(headers, prefix+"used-percent"), resetAt: resetAt,
+		})
+	}
+	if len(windows) == 0 {
+		return banEntry{}, false
+	}
+	full := windows[:0]
+	for _, window := range windows {
+		if window.used >= usedPercentThreshold {
+			full = append(full, window)
+		}
+	}
+	if len(full) == 0 {
+		// A single duration/reset pair is still useful for monthly-only plans.
+		// Multiple non-full windows are ambiguous and must not create a long,
+		// authoritative cooldown from whichever reset happens to be latest.
+		if len(windows) == 1 {
+			return banEntry{ResetAt: windows[0].resetAt, Window: windows[0].class}, true
+		}
+		return banEntry{}, false
+	}
+	windows = full
+	chosen := windows[0]
+	for _, window := range windows[1:] {
+		if window.resetAt.After(chosen.resetAt) {
+			chosen = window
+		}
+	}
+	return banEntry{ResetAt: chosen.resetAt, Window: chosen.class}, true
+}
+
 // handleSchedulerPick applies the Codex-only quota policy. Serial mode keeps a
 // deterministic single active auth even during a Keeper outage; legacy modes
 // retain their native-fallback behavior.
@@ -735,6 +875,11 @@ func managementRegistration() pluginapi.ManagementRegistrationResponse {
 				Path:        managementRoutePrefix + "/quota",
 				Description: "Show the active serial auth, Keeper freshness, pacing diagnostics, and redacted decisions.",
 			},
+			{
+				Method:      http.MethodPost,
+				Path:        managementRoutePrefix + "/warmup-retry",
+				Description: `Explicitly clear a blocked warmup result after the credential or configuration was repaired. Body: {"auth_id":"..."} or {"all":true}.`,
+			},
 		},
 	}
 }
@@ -762,6 +907,8 @@ func dispatchManagement(req pluginapi.ManagementRequest) pluginapi.ManagementRes
 		return handleManagementUnbanAll()
 	case method == http.MethodGet && matchesManagementPath(req.Path, "/quota"):
 		return jsonManagementResponse(http.StatusOK, schedulerRuntime.status())
+	case method == http.MethodPost && matchesManagementPath(req.Path, "/warmup-retry"):
+		return handleManagementWarmupRetry(req)
 	default:
 		return jsonManagementResponse(http.StatusNotFound, map[string]any{
 			"error":  "not_found",
@@ -862,6 +1009,33 @@ func currentBanStatus() managementBanStatus {
 type managementUnbanRequest struct {
 	AuthID string `json:"auth_id"`
 	All    bool   `json:"all"`
+}
+
+func handleManagementWarmupRetry(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
+	var body managementUnbanRequest
+	if len(req.Body) > 0 {
+		if err := json.Unmarshal(req.Body, &body); err != nil {
+			return jsonManagementResponse(http.StatusBadRequest, map[string]any{"error": "invalid_json"})
+		}
+	}
+	all := body.All || strings.EqualFold(req.Query.Get("all"), "true")
+	authID := strings.TrimSpace(body.AuthID)
+	if authID == "" {
+		authID = strings.TrimSpace(req.Query.Get("auth_id"))
+	}
+	if !all && authID == "" {
+		return jsonManagementResponse(http.StatusBadRequest, map[string]any{
+			"error":   "missing_auth_id",
+			"message": "provide auth_id or explicitly set all=true",
+		})
+	}
+	removed := schedulerRuntime.clearBlockedWarmupState(authID, all)
+	if removed > 0 {
+		schedulerRuntime.persistBanState()
+	}
+	return jsonManagementResponse(http.StatusOK, map[string]any{
+		"ok": true, "auth_id": authID, "all": all, "removed": removed,
+	})
 }
 
 func handleManagementUnban(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
@@ -1062,4 +1236,70 @@ func writeResponse(response *C.cliproxy_buffer, raw []byte) {
 	}
 	response.ptr = ptr
 	response.len = C.size_t(len(raw))
+}
+
+func hostAPIAvailable() bool {
+	return C.host_api_available() != 0
+}
+
+func callHost(method string, payload any) (json.RawMessage, error) {
+	if !hostAPIAvailable() {
+		return nil, fmt.Errorf("CPA host callback API is unavailable")
+	}
+	rawPayload, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("marshal host callback payload %s: %w", method, err)
+	}
+	cMethod := C.CString(method)
+	defer C.free(unsafe.Pointer(cMethod))
+
+	var response C.cliproxy_buffer
+	var requestPtr *C.uint8_t
+	if len(rawPayload) > 0 {
+		cPayload := C.CBytes(rawPayload)
+		if cPayload == nil {
+			return nil, fmt.Errorf("allocate host callback payload %s", method)
+		}
+		defer C.free(cPayload)
+		requestPtr = (*C.uint8_t)(cPayload)
+	}
+	callCode := C.call_host_api(cMethod, requestPtr, C.size_t(len(rawPayload)), &response)
+	var rawResponse []byte
+	if response.ptr != nil && response.len > 0 {
+		rawResponse = C.GoBytes(response.ptr, C.int(response.len))
+	}
+	if response.ptr != nil {
+		C.free_host_buffer(response.ptr, response.len)
+	}
+	if len(rawResponse) == 0 {
+		return nil, fmt.Errorf("host callback %s returned no response, code=%d", method, int(callCode))
+	}
+	var env envelope
+	if err := json.Unmarshal(rawResponse, &env); err != nil {
+		return nil, fmt.Errorf("decode host callback envelope %s: %w", method, err)
+	}
+	if !env.OK {
+		if env.Error != nil {
+			return nil, fmt.Errorf("host callback %s failed: %s", method, safeHostCallbackFailureCode(env.Error.Code, env.Error.Message))
+		}
+		return nil, fmt.Errorf("host callback %s failed", method)
+	}
+	if callCode != 0 {
+		return nil, fmt.Errorf("host callback %s returned code=%d", method, int(callCode))
+	}
+	return append(json.RawMessage(nil), env.Result...), nil
+}
+
+// safeHostCallbackFailureCode extracts only the operational classification
+// needed by warmup retry policy. Host callback messages can contain upstream
+// response text and must never be returned to logs, state, or management UI.
+func safeHostCallbackFailureCode(code, message string) string {
+	classified, _ := classifyWarmupFailure(0, fmt.Errorf("%s %s", code, message))
+	if classified != "" && classified != "warmup_failed" {
+		return classified
+	}
+	if sanitized := sanitizeWarmupCode(code); sanitized != "" {
+		return sanitized
+	}
+	return "host_callback_failed"
 }

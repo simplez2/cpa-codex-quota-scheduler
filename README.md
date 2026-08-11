@@ -2,7 +2,7 @@
 
 面向 CPA（CLIProxyAPI）的 Codex 串行配额调度与 429 自动隔离插件。
 
-当前版本：`v0.1.3`。
+当前版本：`v0.1.6`。
 
 ## 解决的问题
 
@@ -18,7 +18,9 @@
 
 CPA 会在上游 `408/5xx` 后把账号临时移出候选池约 60 秒。插件将这种情况作为 request-local provisional fallback：固定使用一个临时备用账号，但保留原主账号且不增加正式切换次数；主账号恢复后自动回归。只有候选持续缺席至少 90 秒并经过 3 次确认，才以 `candidate_unavailable_confirmed` 正式切换。pinned 预热和半开探测竞争也不会污染全局主账号。
 
-`v0.1.3` 还会拒绝没有正数窗口时长的 Primary/Secondary 占位配额头，防止 `window-minutes=0`、`used-percent=0` 把 Keeper 的真实周/月窗口覆盖成伪 weekly。
+`v0.1.6` 还会拒绝没有正数窗口时长的 Primary/Secondary 占位配额头，防止 `window-minutes=0`、`used-percent=0` 把 Keeper 的真实周/月窗口覆盖成伪 weekly；显式 `generate=false` 的 count-tokens/检查请求会完全旁路插件状态，不会误扣预测额度、启动 half-open probe 或写入 429 隔离。
+
+当 OpenAI 提前重置额度时，插件不会继续盲信旧的持久化 quota ban。只有 Keeper 连续提供两个时间严格递增且互不相同的新鲜“全部窗口 0% used、允许使用、未触限”的快照，并且出现占位 reset、reset anchor 变化或窗口分类变化时，才会清除旧 quota cooldown；probation、half-open、cyber/auth blocked 状态绝不会被这种对账清除。清除后可在同一刷新轮次进入严格串行预热。
 
 ## 账号选择顺序
 
@@ -74,15 +76,19 @@ plugins:
       prefer_reset_credits: true
 
       warmup_enabled: true
-      warmup_model: gpt-5.6-sol
-      warmup_sidecar_url: http://codex-agent-identity-sidecar:8787/backend-api/codex
+      warmup_execution_mode: management
+      warmup_model: gpt-5.6-luna
+      warmup_sidecar_url: http://codex-agent-identity-gateway:8787/backend-api/codex
       warmup_retry_after: 15m
       cpa_management_url: http://127.0.0.1:8317/v0/management/api-call
       cpa_management_key_file: /run/secrets/management_key
 ```
 
-`warmup_model` 只用于一次最小化的 pinned hello 激活请求，不会修改 CPA 的默认模型。
-预热器每轮最多执行一个请求，并跳过本周期已成功或仍在重试冷却期的账号；下一轮会继续处理后续满额账号，不会并发唤醒整个账号池。Keeper 对未启动窗口也可能返回 `观测时间 + 完整周期` 的动态占位重置时间；插件会结合 `resetAfterSeconds`、窗口时长、实际用量和观测锚点识别这种漂移值，并顺序激活 5h、weekly 与 monthly 主窗口。外部重置导致旧预热记录失效时，插件会自动丢弃旧周期锚点。
+`warmup_execution_mode: management` 是生产默认：优先通过 CPA 原生 `host.auth.list` 读取当前凭据绑定，并在宿主未提供完整 sidecar 标记时回退到受 Management key 保护的 `auth-files`；真正的 pinned 请求仍经 `api-call` 转发到 Agent Identity sidecar。单次发现、请求与响应解析共享 45 秒硬超时，适合 CPA 热卸载与热重载。`native` 只应在宿主提供可验证的 bounded HostModel contract 时用于 canary；当前不应在生产热迭代中启用，也不会静默回退到 Management。
+
+`warmup_model` 只用于一次最小化的 pinned 激活请求；默认的 `gpt-5.6-luna` 用于降低这一内部激活请求的额度成本，不会修改 CPA 的 default 渠道、正常模型选择、模型名称或模型列表。请求固定使用 `store=false`、`stream=false`、`max_output_tokens=16` 和该模型实际支持的最低推理档 `low`。预热与正常串行流量分离：所有符合条件的 100% 可用账号按顺序一次一个激活，绝不并发唤醒整个账号池，也不会替换当前正常流量主账号。每次 `api-call` 前会重新核对 `auth_id/auth_index`；热替换导致的 stale binding 会在真正请求前终止并进入短暂重试冷却。无额度头的成功请求先进入 `pending_confirmation`，只设置本地防重复窗口；Keeper 后续提供真实稳定 reset anchor 后才转为 `confirmed`。Keeper 对未启动窗口也可能返回 `观测时间 + 完整周期` 的动态占位重置时间；插件会结合 `resetAfterSeconds`、窗口时长、实际用量和观测锚点识别这种漂移值。外部重置导致旧预热记录失效时，插件会自动丢弃旧周期锚点。
+
+`cyber_policy`、`cyber_abuse`、abuse、401、403、`deactivated_workspace`、`invalid_refresh_token`、`auth_unavailable` 等结果会记为仅含安全 code 的 `blocked` 状态，不自动重试。修复凭据或配置后，必须通过受 CPA Management key 保护的 `warmup-retry` 路由显式解除。
 
 ## 构建
 
@@ -114,16 +120,17 @@ Windows PowerShell：
 /var/lib/codex-quota-scheduler/state.json
 ```
 
-状态文件版本 4，包含：
+状态文件版本 5，包含：
 
 - 429 quarantine / probation / half-open 状态；
 - 当前主账号及选择时间；
 - 正式串行切换计数、临时故障转移计数和最近切换原因；
-- 已执行的预热记录。
+- 已执行的预热记录、`pending_confirmation` / `confirmed` / `blocked` 状态；
+- 外部满额重置的双快照确认状态和最近一次安全清 ban 原因。
 
 它不包含 token、PAT、cookie、Keeper 密码或 Management key。文件以 `0600` 权限原子写入。
 
-从旧 `codex-429-autoban` 升级时，如果需要沿用旧的 ban/warmup 状态，可先把 `state_path` 显式指向旧文件；插件兼容读取旧版 v2/v3 状态，并在下次写入时升级为 v4。
+从旧 `codex-429-autoban` 升级时，如果需要沿用旧的 ban/warmup 状态，可先把 `state_path` 显式指向旧文件；插件兼容读取旧版 v2/v3/v4 状态，并在下次写入时升级为 v5。
 
 ## Management API
 
@@ -134,9 +141,10 @@ GET  /v0/management/plugins/codex-quota-scheduler/bans
 GET  /v0/management/plugins/codex-quota-scheduler/quota
 POST /v0/management/plugins/codex-quota-scheduler/unban
 POST /v0/management/plugins/codex-quota-scheduler/unban-all
+POST /v0/management/plugins/codex-quota-scheduler/warmup-retry
 ```
 
-`/quota` 会显示当前主账号、切换阈值、正式切换、临时故障转移、候选缺席确认、Keeper 快照、预热和隔离状态。
+`/quota` 会显示当前主账号、切换阈值、正式切换、临时故障转移、候选缺席确认、Keeper 快照、预热状态、外部 reset 对账和隔离状态。预热诊断额外暴露 auth 来源、检查时间、可用数，以及按 `provider/status/disabled/unavailable/missing-index/missing-sidecar-marker` 分类的非敏感筛除计数；候选阶段还会区分 banned、stale、CPA auth 不可用和无需预热。`warmup-retry` 只清除指定账号或显式 `all=true` 的 blocked 预热状态，不会清除 quota ban。
 
 ## 兼容模式
 
