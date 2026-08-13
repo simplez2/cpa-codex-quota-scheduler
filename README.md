@@ -60,6 +60,8 @@ Once selected, a more attractive backup does **not** preempt the active auth. A 
 
 A warmup candidate must have a fresh Keeper row, all recognized active windows at 0% used and allowed, a credible “not started” reset signal, a valid CPA auth binding, no quarantine, no active/pending/blocked warmup record, and no competing generation or instance lease. The plugin then sends a pinned non-streaming `hello` request with `store=false` and `max_output_tokens=16`. Success is not assumed from HTTP 2xx alone: later Keeper data must confirm a stable reset anchor. Cyber-policy, abuse, auth, deactivated-workspace, and similar terminal failures are stored only as redacted blocked codes and are never retried automatically.
 
+Platform-wide resets are reconciled without trusting one transient quota row. Two strictly newer Keeper observations must independently prove the new cycle before an obsolete quota cooldown is removed. This also repairs historical cooldowns whose persisted `5h` label conflicts with their recorded weekly or monthly span, including a later weekly-only Team plan shape. Once confirmed, the stale warmup record is cleared and that same fresh snapshot may become a warmup candidate in the current refresh cycle.
+
 See [Runtime logic](RUNTIME_LOGIC.zh-CN.md) for the complete state machine and [Operations handoff](HANDOFF.zh-CN.md) for deployment and incident procedures.
 
 ## Recommended configuration

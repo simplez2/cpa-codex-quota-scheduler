@@ -150,6 +150,8 @@ warmup_candidates=0 只说明当前轮没有可执行候选，不等于功能关
 
 第一次确认会触发一次有跨实例 cooldown 的定向 Keeper refresh，用独立观测完成第二次确认。确认后只清除对应 quota cooldown，并清理旧 warmup 状态，使账号可以在同一刷新循环重新进入预热候选。
 
+历史版本曾可能把周/月级 reset 统一保存成 `Window: 5h`。对账不会直接相信这个标签，而会先用 `BannedAt -> ResetAt` 的完整跨度修复可证明的低估分类；若新 Keeper 计划已经变成更短且完整的 weekly-only Team 窗口，则仍须两个独立新鲜观测才能确认旧 monthly cooldown 已失效。第二次确认完成后，当前这份 weekly 快照会在同一轮参与预热候选判断，不需要等待下一次全局刷新。
+
 ## 8. 热加载与 generation ownership
 
 CPA 热重载可能让新旧动态库 generation 短时间同时存在。v0.1.13 使用两层互斥：

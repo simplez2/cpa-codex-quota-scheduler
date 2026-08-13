@@ -113,6 +113,63 @@ func TestReconcileExternalResetClearsObsoleteMonthlyBanAfterWeeklyOnlyPlanChange
 	}
 }
 
+func TestPlatformResetRepairsMisclassifiedCooldownAndAdmitsSameCycleWarmup(t *testing.T) {
+	resetBanStoreForTest()
+	location := time.FixedZone("UTC+8", 8*60*60)
+	now := time.Date(2026, time.August, 12, 18, 50, 30, 0, location)
+	state := schedulerRuntimeState{
+		cfg: defaultPluginConfig(), warmups: make(map[string]warmupEntry),
+		warmupLeases: make(map[string]warmupLease), banResetConfirmations: make(map[string]banResetConfirmation),
+		quotas: make(map[string]quotaSnapshot),
+	}
+	state.cfg.StatePath = ""
+	state.cfg.StaleAfter = time.Hour
+	// Production incident: a roughly monthly cooldown was persisted under the
+	// historical generic 5h label before a platform reset exposed a fresh
+	// weekly-only Team quota shape.
+	banStore.set("jspp-team", banEntry{
+		Kind: banKindQuota, Phase: banPhaseCooldown, Window: "5h",
+		BannedAt: time.Date(2026, time.August, 7, 15, 22, 15, 0, location),
+		ResetAt:  time.Date(2026, time.August, 31, 21, 37, 38, 0, location),
+	})
+	weekly := func(observedAt time.Time) quotaSnapshot {
+		const seconds = int64(7 * 24 * 60 * 60)
+		return quotaSnapshot{
+			AuthID: "jspp-team", AuthIndex: "idx-jspp-team", RefreshedAt: observedAt,
+			Windows: []quotaWindow{{
+				Class: "weekly", WindowSeconds: seconds, ResetAfterSeconds: seconds, ResetAfterSecondsKnown: true,
+				Allowed: true, ResetAt: observedAt.Add(7 * 24 * time.Hour), ObservedAt: observedAt,
+				Source: quotaSourceKeeper, WindowUsageCreditsKnown: true,
+			}},
+		}
+	}
+	binding := map[string]warmupAuthBinding{"jspp-team": {AuthID: "jspp-team", AuthIndex: "idx-jspp-team"}}
+	first := weekly(time.Date(2026, time.August, 12, 18, 49, 50, 0, location))
+	if cleared := state.reconcileExternallyResetQuotaBans(map[string]quotaSnapshot{"jspp-team": first}, now); len(cleared) != 0 {
+		t.Fatalf("first platform-reset observation cleared = %#v", cleared)
+	}
+	confirmation := state.banResetConfirmations["jspp-team"]
+	if confirmation.Confirmations != 1 || confirmation.Reason != "monthly_window_set_replaced_by_weekly" {
+		t.Fatalf("first platform-reset confirmation = %#v", confirmation)
+	}
+	state.quotas["jspp-team"] = first
+	if candidates := state.findWarmupCandidates(binding, nil, now); len(candidates) != 0 {
+		t.Fatalf("quarantined account warmed before second observation: %#v", candidates)
+	}
+	second := weekly(time.Date(2026, time.August, 12, 18, 50, 25, 0, location))
+	if cleared := state.reconcileExternallyResetQuotaBans(map[string]quotaSnapshot{"jspp-team": second}, now); len(cleared) != 1 {
+		t.Fatalf("second platform-reset observation cleared = %#v", cleared)
+	}
+	if _, banned := banStore.lookup("jspp-team"); banned {
+		t.Fatal("misclassified cooldown survived two fresh observations")
+	}
+	state.quotas["jspp-team"] = second
+	candidates := state.findWarmupCandidates(binding, nil, now)
+	if len(candidates) != 1 || candidates[0].Window.Class != "weekly" {
+		t.Fatalf("same-cycle platform-reset warmup candidates = %#v", candidates)
+	}
+}
+
 func TestReconcileExternalResetWindowSetReplacementFailsClosed(t *testing.T) {
 	now := time.Date(2026, time.August, 12, 10, 0, 0, 0, time.UTC)
 	tests := []struct {
