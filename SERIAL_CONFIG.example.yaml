@@ -1,4 +1,4 @@
-# Recommended configuration for Codex Quota Scheduler v0.1.6.
+# Recommended configuration for Codex Quota Scheduler v0.1.13.
 # Secrets stay in mounted files. This plugin does not change model names,
 # provider routes, OAuth/PAT state, or third-party APIs.
 plugins:
@@ -17,7 +17,7 @@ plugins:
       keeper_url: http://cpa-usage-keeper:8080/keeper
       keeper_password_file: /run/secrets/keeper_login_password
       refresh_interval: 30s
-      stale_after: 45m
+      stale_after: 15m
 
       state_path: /var/lib/codex-quota-scheduler/state.json
 

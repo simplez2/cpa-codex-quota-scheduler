@@ -112,18 +112,45 @@ func TestCPAAuthFilesEndpoint(t *testing.T) {
 	}
 }
 
+func TestTrustedWarmupCredentialNote(t *testing.T) {
+	tests := map[string]bool{
+		"Agent Identity via sidecar":             true,
+		"Codex Access Token via sidecar":         true,
+		"Agent Identity via gateway":             true,
+		"Codex Access Token via gateway":         true,
+		"  cOdEx AcCeSs ToKeN vIa GaTeWaY\t\r\n": true,
+		"":                                       false,
+		"via sidecar":                            false,
+		"via gateway":                            false,
+		"Official OAuth":                         false,
+		"Agent Identity via gateway extra":       false,
+		"prefix Codex Access Token via sidecar":  false,
+	}
+	for note, want := range tests {
+		if got := trustedWarmupCredentialNote(note); got != want {
+			t.Errorf("trustedWarmupCredentialNote(%q)=%v want %v", note, got, want)
+		}
+	}
+}
+
 func TestWarmupEligibleAuthsRequiresActiveSidecarCredential(t *testing.T) {
 	files := []cpaAuthFileEntry{
 		{ID: "sidecar", AuthIndex: "idx-sidecar", Provider: "codex", Status: "active", Note: "Codex Access Token via sidecar"},
+		{ID: "gateway", AuthIndex: "idx-gateway", Provider: "codex", Status: "active", Note: "Agent Identity via gateway"},
 		{ID: "native", AuthIndex: "idx-native", Provider: "codex", Status: "active", Note: "Official OAuth"},
 		{ID: "disabled", AuthIndex: "idx-disabled", Provider: "codex", Status: "disabled", Disabled: true, Note: "Agent Identity via sidecar"},
 		{ID: "third-party", AuthIndex: "idx-third", Provider: "openai", Status: "active", Note: "via sidecar"},
 	}
 	got := warmupEligibleAuths(files)
-	for _, key := range []string{"sidecar", "idx-sidecar"} {
-		binding, ok := got[key]
-		if !ok || binding.AuthID != "sidecar" || binding.AuthIndex != "idx-sidecar" {
-			t.Fatalf("active sidecar binding for %q = %#v, ok=%v", key, binding, ok)
+	wantBindings := map[string]warmupAuthBinding{
+		"sidecar":     {AuthID: "sidecar", AuthIndex: "idx-sidecar"},
+		"idx-sidecar": {AuthID: "sidecar", AuthIndex: "idx-sidecar"},
+		"gateway":     {AuthID: "gateway", AuthIndex: "idx-gateway"},
+		"idx-gateway": {AuthID: "gateway", AuthIndex: "idx-gateway"},
+	}
+	for key, want := range wantBindings {
+		if binding, ok := got[key]; !ok || binding != want {
+			t.Fatalf("active Identity binding for %q = %#v, ok=%v want %#v", key, binding, ok, want)
 		}
 	}
 	for _, key := range []string{"native", "idx-native", "disabled", "idx-disabled", "third-party", "idx-third"} {
@@ -164,15 +191,16 @@ func TestWarmupEligibilityDiagnosticsExplainRejectedAuths(t *testing.T) {
 
 func TestHostAuthDiscoveryRequiresSidecarMarkerOnlyForManagement(t *testing.T) {
 	files := []pluginapi.HostAuthFileEntry{
-		{ID: "sidecar", AuthIndex: "idx-sidecar", Provider: "codex", Status: "active", Note: "via sidecar"},
+		{ID: "sidecar", AuthIndex: "idx-sidecar", Provider: "codex", Status: "active", Note: "Agent Identity via sidecar"},
+		{ID: "gateway", AuthIndex: "idx-gateway", Provider: "codex", Status: "active", Note: "Codex Access Token via gateway"},
 		{ID: "oauth", AuthIndex: "idx-oauth", Provider: "codex", Status: "active", Note: "Official OAuth"},
 	}
 	management, stats := warmupEligibleHostAuthsWithStats(files, true)
-	if _, ok := management["sidecar"]; !ok || stats.Eligible != 1 || stats.Rejected["missing_sidecar_marker"] != 1 {
+	if _, ok := management["sidecar"]; !ok || stats.Eligible != 2 || stats.Rejected["missing_sidecar_marker"] != 1 {
 		t.Fatalf("management auth discovery = %#v stats=%#v", management, stats)
 	}
 	native, nativeStats := warmupEligibleHostAuthsWithStats(files, false)
-	if _, ok := native["oauth"]; !ok || nativeStats.Eligible != 2 {
+	if _, ok := native["oauth"]; !ok || nativeStats.Eligible != 3 {
 		t.Fatalf("native auth discovery = %#v stats=%#v", native, nativeStats)
 	}
 }
@@ -200,14 +228,14 @@ func TestNativeWarmupDoesNotFallBackToManagementAuthDiscovery(t *testing.T) {
 	}
 }
 
-func TestManagementWarmupUsesOnlyActiveSidecarAuths(t *testing.T) {
+func TestManagementWarmupUsesOnlyActiveIdentityProxyAuths(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v0/management/auth-files" {
 			http.NotFound(w, r)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"files":[{"id":"sidecar","auth_index":"idx-sidecar","provider":"codex","status":"active","note":"via sidecar"},{"id":"native","auth_index":"idx-native","provider":"codex","status":"active","note":"official oauth"}]}`))
+		_, _ = w.Write([]byte(`{"files":[{"id":"gateway","auth_index":"idx-gateway","provider":"codex","status":"active","note":"Codex Access Token via gateway"},{"id":"native","auth_index":"idx-native","provider":"codex","status":"active","note":"official oauth"}]}`))
 	}))
 	defer server.Close()
 	cfg := defaultPluginConfig()
@@ -221,8 +249,8 @@ func TestManagementWarmupUsesOnlyActiveSidecarAuths(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if binding, ok := eligible["sidecar"]; !ok || binding.AuthIndex != "idx-sidecar" {
-		t.Fatalf("sidecar binding = %#v ok=%v", binding, ok)
+	if binding, ok := eligible["gateway"]; !ok || binding.AuthIndex != "idx-gateway" {
+		t.Fatalf("gateway binding = %#v ok=%v", binding, ok)
 	}
 	if _, ok := eligible["native"]; ok {
 		t.Fatal("management warmup must not send an official native credential to the sidecar endpoint")
@@ -293,7 +321,7 @@ func TestManagementWarmupUsesMinimalResponsesRequest(t *testing.T) {
 		switch r.URL.Path {
 		case "/v0/management/auth-files":
 			_ = json.NewEncoder(w).Encode(map[string]any{"files": []map[string]any{{
-				"id": "acct", "auth_index": "current", "provider": "codex", "status": "active", "note": "via sidecar",
+				"id": "acct", "auth_index": "current", "provider": "codex", "status": "active", "note": "Codex Access Token via sidecar",
 			}}})
 		case "/v0/management/api-call":
 			var call cpaAPICallRequest
@@ -303,13 +331,56 @@ func TestManagementWarmupUsesMinimalResponsesRequest(t *testing.T) {
 			if call.AuthIndex != "current" {
 				t.Errorf("auth_index=%q", call.AuthIndex)
 			}
+			if call.Header["Accept"] != "text/event-stream" {
+				t.Errorf("Accept=%q", call.Header["Accept"])
+			}
+			if call.Header["X-OpenAI-Internal-Codex-Responses-Lite"] != "true" {
+				t.Errorf("responses-lite=%q", call.Header["X-OpenAI-Internal-Codex-Responses-Lite"])
+			}
+			if call.Header["Originator"] != "codex_cli_rs" || call.Header["X-Codex-Routing-Hint"] != "model=gpt-5.6-luna" {
+				t.Errorf("Codex headers=%#v", call.Header)
+			}
 			var payload map[string]any
 			if err := json.Unmarshal([]byte(call.Data), &payload); err != nil {
 				t.Errorf("decode responses payload: %v", err)
 			}
 			reasoning, _ := payload["reasoning"].(map[string]any)
-			if payload["input"] != "Reply with OK." || payload["store"] != false || payload["stream"] != false ||
-				reasoning["effort"] != "low" || payload["max_output_tokens"] != float64(16) {
+			input, _ := payload["input"].([]any)
+			var additionalTools map[string]any
+			var developerMessage map[string]any
+			var userMessage map[string]any
+			var developerContent []any
+			var userContent []any
+			var developerText map[string]any
+			var userText map[string]any
+			if len(input) == 3 {
+				additionalTools, _ = input[0].(map[string]any)
+				developerMessage, _ = input[1].(map[string]any)
+				userMessage, _ = input[2].(map[string]any)
+				developerContent, _ = developerMessage["content"].([]any)
+				userContent, _ = userMessage["content"].([]any)
+			}
+			if len(developerContent) == 1 {
+				developerText, _ = developerContent[0].(map[string]any)
+			}
+			if len(userContent) == 1 {
+				userText, _ = userContent[0].(map[string]any)
+			}
+			additionalToolsList, additionalToolsOK := additionalTools["tools"].([]any)
+			_, hasTopLevelTools := payload["tools"]
+			include, includeOK := payload["include"].([]any)
+			textControls, _ := payload["text"].(map[string]any)
+			_, hasMaxOutputTokens := payload["max_output_tokens"]
+			if payload["store"] != false || payload["stream"] != true || payload["tool_choice"] != "auto" ||
+				payload["parallel_tool_calls"] != false || reasoning["effort"] != "low" || reasoning["context"] != "all_turns" ||
+				additionalTools["type"] != "additional_tools" || additionalTools["role"] != "developer" ||
+				!additionalToolsOK || len(additionalToolsList) != 0 || hasTopLevelTools ||
+				developerMessage["type"] != "message" || developerMessage["role"] != "developer" ||
+				developerText["type"] != "input_text" || developerText["text"] != "Reply briefly." ||
+				userMessage["type"] != "message" || userMessage["role"] != "user" ||
+				userText["type"] != "input_text" || userText["text"] != "hello" ||
+				!includeOK || len(include) != 1 || include[0] != "reasoning.encrypted_content" ||
+				textControls["verbosity"] != "low" || hasMaxOutputTokens {
 				t.Errorf("non-minimal warmup payload: %#v", payload)
 			}
 			_ = json.NewEncoder(w).Encode(cpaAPICallResponse{StatusCode: http.StatusOK, Body: `{"status":"completed"}`})
@@ -358,6 +429,132 @@ func TestWarmupSuppressionExpiresAtReset(t *testing.T) {
 	s.warmupMu.Unlock()
 }
 
+func TestWarmupSuppressionDiscardsLifecycleCancellation(t *testing.T) {
+	now := time.Now()
+	key := warmupKey("a", "weekly")
+	s := &schedulerRuntimeState{warmups: map[string]warmupEntry{
+		key: {
+			AuthID: "a", Window: "weekly", AttemptedAt: now.Add(-time.Second),
+			Error: "cancelled",
+		},
+	}}
+	s.warmupMu.Lock()
+	if s.warmupSuppressedLocked(key, now, 15*time.Minute) {
+		t.Fatal("lifecycle cancellation should not suppress the next active generation")
+	}
+	if _, ok := s.warmups[key]; ok {
+		t.Fatal("cancelled lifecycle state should be removed before retry")
+	}
+	s.warmupMu.Unlock()
+}
+
+func TestWarmupSuppressionKeepsBlockedCancellation(t *testing.T) {
+	now := time.Now()
+	key := warmupKey("a", "weekly")
+	s := &schedulerRuntimeState{warmups: map[string]warmupEntry{
+		key: {
+			AuthID: "a", Window: "weekly", AttemptedAt: now.Add(-time.Second),
+			Error: "cancelled", Blocked: true,
+		},
+	}}
+	s.warmupMu.Lock()
+	if !s.warmupSuppressedLocked(key, now, 15*time.Minute) {
+		t.Fatal("blocked state must remain suppressed regardless of its error code")
+	}
+	if _, ok := s.warmups[key]; !ok {
+		t.Fatal("blocked state must not be removed")
+	}
+	s.warmupMu.Unlock()
+}
+
+func TestPriorGenerationWarmupRetryIsOneShot(t *testing.T) {
+	now := time.Now()
+	claimedAt := now.Add(-time.Minute)
+	key := warmupKey("acct", "5h")
+	candidate := warmupCandidate{Snapshot: quotaSnapshot{AuthID: "acct"}, Window: quotaWindow{Class: "5h"}}
+	state := &schedulerRuntimeState{warmups: map[string]warmupEntry{
+		key: {AuthID: "acct", Window: "5h", AttemptedAt: claimedAt.Add(-time.Second), Error: "warmup_failed"},
+	}}
+
+	state.warmupMu.Lock()
+	got, gotKey, ok := state.nextWarmupCandidateForGenerationLocked([]warmupCandidate{candidate}, now, 15*time.Minute, claimedAt)
+	state.warmupMu.Unlock()
+	if !ok || got.Snapshot.AuthID != "acct" || gotKey != key {
+		t.Fatalf("previous-generation retry candidate=%#v key=%q ok=%v", got, gotKey, ok)
+	}
+	if _, exists := state.warmups[key]; exists {
+		t.Fatal("previous-generation retryable state was not removed")
+	}
+
+	state.warmups[key] = warmupEntry{AuthID: "acct", Window: "5h", AttemptedAt: now, Error: "warmup_failed"}
+	state.warmupMu.Lock()
+	_, _, ok = state.nextWarmupCandidateForGenerationLocked([]warmupCandidate{candidate}, now.Add(time.Second), 15*time.Minute, claimedAt)
+	state.warmupMu.Unlock()
+	if ok {
+		t.Fatal("same generation retried the failed warmup more than once")
+	}
+
+	for name, entry := range map[string]warmupEntry{
+		"blocked": {AuthID: "acct", Window: "5h", AttemptedAt: claimedAt.Add(-time.Second), Error: "http_400", Blocked: true},
+		"429":     {AuthID: "acct", Window: "5h", AttemptedAt: claimedAt.Add(-time.Second), Error: "http_429", Status: statusTooManyRequests},
+		"success": {AuthID: "acct", Window: "5h", AttemptedAt: claimedAt.Add(-time.Second), Status: http.StatusOK},
+	} {
+		state.warmups[key] = entry
+		state.warmupMu.Lock()
+		_, _, ok = state.nextWarmupCandidateForGenerationLocked([]warmupCandidate{candidate}, now, 15*time.Minute, claimedAt)
+		state.warmupMu.Unlock()
+		if ok {
+			t.Fatalf("%s outcome was incorrectly retried across generations", name)
+		}
+	}
+}
+
+func TestRetryableWarmupFromPriorGenerationClassifiesHTTP200StreamErrors(t *testing.T) {
+	now := time.Now().UTC()
+	claimedAt := now.Add(-time.Minute)
+	priorAttempt := claimedAt.Add(-time.Second)
+
+	tests := []struct {
+		name  string
+		entry warmupEntry
+		want  bool
+	}{
+		{
+			name:  "http 200 with generic sse error retries",
+			entry: warmupEntry{AttemptedAt: priorAttempt, Status: http.StatusOK, Error: "error"},
+			want:  true,
+		},
+		{
+			name:  "clean http 200 does not retry",
+			entry: warmupEntry{AttemptedAt: priorAttempt, Status: http.StatusOK},
+			want:  false,
+		},
+		{
+			name:  "cyber policy never retries",
+			entry: warmupEntry{AttemptedAt: priorAttempt, Status: http.StatusOK, Error: "cyber_policy", Blocked: true},
+			want:  false,
+		},
+		{
+			name:  "auth unavailable never retries",
+			entry: warmupEntry{AttemptedAt: priorAttempt, Status: http.StatusServiceUnavailable, Error: "auth_unavailable", Blocked: true},
+			want:  false,
+		},
+		{
+			name:  "http 429 does not use generation retry",
+			entry: warmupEntry{AttemptedAt: priorAttempt, Status: statusTooManyRequests, Error: "http_429"},
+			want:  false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := retryableWarmupFromPriorGeneration(tt.entry, claimedAt); got != tt.want {
+				t.Fatalf("retryableWarmupFromPriorGeneration() = %v; want %v; entry=%#v", got, tt.want, tt.entry)
+			}
+		})
+	}
+}
+
 func TestNextWarmupCandidateSkipsSuppressedAccount(t *testing.T) {
 	now := time.Now()
 	s := &schedulerRuntimeState{warmups: map[string]warmupEntry{
@@ -378,6 +575,46 @@ func TestNextWarmupCandidateSkipsSuppressedAccount(t *testing.T) {
 	s.warmupMu.Unlock()
 	if !ok || candidate.Snapshot.AuthID != "second" || key != warmupKey("second", "weekly") {
 		t.Fatalf("next warmup candidate = %#v, key=%q, ok=%v; want second", candidate, key, ok)
+	}
+}
+
+func TestWarmupCandidateStatusExcludesConfirmedCurrentCycle(t *testing.T) {
+	now := time.Now().UTC()
+	state := schedulerRuntimeState{warmups: map[string]warmupEntry{
+		warmupKey("acct", "weekly"): {
+			AuthID: "acct", Window: "weekly", AttemptedAt: now.Add(-time.Minute),
+			CompletedAt: now.Add(-time.Minute), ActivatedAt: now.Add(-time.Minute),
+			ResetAt: now.Add(7 * 24 * time.Hour), SuppressUntil: now.Add(7 * 24 * time.Hour), Status: http.StatusOK,
+		},
+	}}
+	candidate := warmupCandidate{
+		Snapshot: quotaSnapshot{AuthID: "acct", AuthIndex: "idx-acct", RefreshedAt: now},
+		Window: quotaWindow{
+			Class: "weekly", WindowSeconds: int64((7 * 24 * time.Hour).Seconds()),
+			ResetAfterSeconds: int64((7 * 24 * time.Hour).Seconds()), ResetAfterSecondsKnown: true,
+			ResetAt: now.Add(7 * 24 * time.Hour), ObservedAt: now, Allowed: true,
+		},
+	}
+	if got := state.countActionableWarmupCandidates([]warmupCandidate{candidate}, now, 15*time.Minute); got != 0 {
+		t.Fatalf("actionable warmup candidates = %d; want 0 for confirmed current cycle", got)
+	}
+}
+
+func TestWarmupCandidateStatusCountsExpiredOrStaleSuppression(t *testing.T) {
+	now := time.Now().UTC()
+	candidate := warmupCandidate{
+		Snapshot: quotaSnapshot{AuthID: "acct", AuthIndex: "idx-acct", RefreshedAt: now},
+		Window:   quotaWindow{Class: "weekly", ResetAt: now.Add(7 * 24 * time.Hour), ObservedAt: now, Allowed: true},
+	}
+	tests := []warmupEntry{
+		{AuthID: "acct", Window: "weekly", AttemptedAt: now.Add(-time.Hour)},
+		{AuthID: "acct", Window: "weekly", ActivatedAt: now.Add(-8 * 24 * time.Hour), ResetAt: now.Add(-24 * time.Hour)},
+	}
+	for _, entry := range tests {
+		state := schedulerRuntimeState{warmups: map[string]warmupEntry{warmupKey("acct", "weekly"): entry}}
+		if got := state.countActionableWarmupCandidates([]warmupCandidate{candidate}, now, 15*time.Minute); got != 1 {
+			t.Fatalf("actionable warmup candidates = %d for entry %#v; want 1", got, entry)
+		}
 	}
 }
 
@@ -679,7 +916,7 @@ func TestWarmupHeaderless429EntersProbation(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		if r.URL.Path == "/auth-files" {
-			_, _ = w.Write([]byte(`{"files":[{"id":"acct","auth_index":"idx","provider":"codex","status":"active","note":"via sidecar"}]}`))
+			_, _ = w.Write([]byte(`{"files":[{"id":"acct","auth_index":"idx","provider":"codex","status":"active","note":"Agent Identity via sidecar"}]}`))
 			return
 		}
 		if err := json.NewEncoder(w).Encode(cpaAPICallResponse{StatusCode: statusTooManyRequests}); err != nil {

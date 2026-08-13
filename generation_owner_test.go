@@ -42,6 +42,11 @@ func claimManagedRuntimeForTest(t *testing.T, state *schedulerRuntimeState) {
 	if err != nil || !claimed || !active {
 		t.Fatalf("claim generation claimed=%v active=%v err=%v", claimed, active, err)
 	}
+	// Most tests exercise steady-state behavior. Backdate only the in-memory
+	// timestamp so the production startup grace does not add wall-clock waits.
+	state.generationMu.Lock()
+	state.generation.ClaimedAt = time.Now().UTC().Add(-warmupStartupGrace - time.Second)
+	state.generationMu.Unlock()
 }
 
 func TestGenerationClaimsOnlyAfterSuccessfulRefresh(t *testing.T) {

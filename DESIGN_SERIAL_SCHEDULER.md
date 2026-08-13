@@ -44,15 +44,13 @@ Stale Keeper data by itself does not cause a switch. This avoids account churn d
 
 The next auth is selected deterministically:
 
-1. weekly account class;
-2. monthly account class;
-3. five-hour-only class;
-4. unknown Keeper class;
-5. active cycle before dormant cycle, when enabled;
-6. reset-credit availability, when enabled;
-7. higher current used percentage;
-8. higher CPA priority;
-9. lexicographically stable auth ID.
+1. configured window class, normally five-hour, weekly, then monthly;
+2. known Keeper class before unknown class;
+3. reset-credit availability, when enabled;
+4. active cycle before dormant cycle, when enabled;
+5. higher current used percentage;
+6. higher CPA priority;
+7. lexicographically stable auth ID.
 
 The active auth is never preempted merely because another candidate later becomes more attractive.
 
@@ -62,14 +60,16 @@ Selection and active-auth mutation happen under one mutex. The first concurrent 
 
 ## Warmup
 
-Warmup follows the same active-auth state:
+Warmup is deliberately separate from normal serial routing:
 
-- if no auth has been selected, warmup may atomically claim one deterministic candidate;
-- if an active auth exists, only that auth can be warmed;
-- if the active auth already has a running cycle, no backup auth is warmed;
-- a warmup 429 uses the normal quarantine path and releases the active auth.
+- every fresh, fully available auth with credible not-yet-started window evidence may become a warmup candidate;
+- candidates execute strictly one at a time through a pinned auth request;
+- the committed normal-traffic auth is not changed by warmup selection or completion;
+- an HTTP success remains pending until a later Keeper snapshot confirms a stable reset anchor;
+- a warmup 429 uses the normal quarantine path without committing a different serial auth;
+- generation ownership and an OS-backed instance lease prevent duplicate work across hot reloads and processes.
 
-This prevents periodic Keeper refreshes from gradually starting every dormant account.
+This activates eligible dormant cycles without distributing ordinary client traffic across the pool.
 
 ## Failure behavior
 

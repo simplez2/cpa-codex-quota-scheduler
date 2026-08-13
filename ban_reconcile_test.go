@@ -71,6 +71,102 @@ func TestReconcileExternalResetClearsOnlyAfterTwoFreshSnapshots(t *testing.T) {
 	}
 }
 
+func TestReconcileExternalResetClearsObsoleteMonthlyBanAfterWeeklyOnlyPlanChange(t *testing.T) {
+	resetBanStoreForTest()
+	now := time.Date(2026, time.August, 12, 10, 0, 0, 0, time.UTC)
+	state := schedulerRuntimeState{
+		cfg: defaultPluginConfig(), warmups: make(map[string]warmupEntry),
+		warmupLeases: make(map[string]warmupLease), banResetConfirmations: make(map[string]banResetConfirmation),
+	}
+	state.cfg.StatePath = ""
+	state.cfg.StaleAfter = time.Hour
+	entry := banEntry{
+		Kind: banKindQuota, Phase: banPhaseCooldown, Window: "5h",
+		BannedAt: now.Add(-5 * 24 * time.Hour), ResetAt: now.Add(19 * 24 * time.Hour),
+	}
+	banStore.set("acct", entry)
+	weekly := func(observedAt time.Time) quotaSnapshot {
+		return quotaSnapshot{
+			AuthID: "acct", AuthIndex: "idx-acct", RefreshedAt: observedAt,
+			Windows: []quotaWindow{{
+				Class: "weekly", WindowSeconds: int64((7 * 24 * time.Hour).Seconds()),
+				ResetAfterSeconds: int64((7 * 24 * time.Hour).Seconds()), ResetAfterSecondsKnown: true,
+				UsedPercent: 0, Allowed: true, ResetAt: observedAt.Add(7 * 24 * time.Hour),
+				ObservedAt: observedAt, Source: quotaSourceKeeper, WindowUsageCreditsKnown: true,
+			}},
+		}
+	}
+	first := weekly(now.Add(-2 * time.Minute))
+	if cleared := state.reconcileExternallyResetQuotaBans(map[string]quotaSnapshot{"acct": first}, now); len(cleared) != 0 {
+		t.Fatalf("first plan-shape observation cleared = %#v; want confirmation only", cleared)
+	}
+	confirmation := state.banResetConfirmations["acct"]
+	if confirmation.Confirmations != 1 || confirmation.Reason != "monthly_window_set_replaced_by_weekly" {
+		t.Fatalf("plan-shape confirmation = %#v", confirmation)
+	}
+	second := weekly(now.Add(-time.Minute))
+	if cleared := state.reconcileExternallyResetQuotaBans(map[string]quotaSnapshot{"acct": second}, now); len(cleared) != 1 {
+		t.Fatalf("second plan-shape observation cleared = %#v; want acct", cleared)
+	}
+	if _, banned := banStore.lookup("acct"); banned {
+		t.Fatal("obsolete monthly cooldown survived two weekly-only Keeper snapshots")
+	}
+}
+
+func TestReconcileExternalResetWindowSetReplacementFailsClosed(t *testing.T) {
+	now := time.Date(2026, time.August, 12, 10, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name   string
+		mutate func(*quotaSnapshot)
+	}{
+		{name: "old class still present", mutate: func(snapshot *quotaSnapshot) {
+			snapshot.Windows = append(snapshot.Windows, quotaWindow{
+				Class: "monthly", WindowSeconds: int64((30 * 24 * time.Hour).Seconds()), UsedPercent: 0,
+				Allowed: true, ResetAt: now.Add(19 * 24 * time.Hour), ObservedAt: snapshot.RefreshedAt, Source: quotaSourceKeeper,
+			})
+		}},
+		{name: "unknown row", mutate: func(snapshot *quotaSnapshot) {
+			snapshot.Windows = append(snapshot.Windows, quotaWindow{Class: "unknown", Allowed: true, ObservedAt: snapshot.RefreshedAt, Source: quotaSourceKeeper})
+		}},
+		{name: "header overlay", mutate: func(snapshot *quotaSnapshot) { snapshot.Windows[0].Source = quotaSourceMixed }},
+		{name: "duration mismatch", mutate: func(snapshot *quotaSnapshot) {
+			snapshot.Windows[0].WindowSeconds = int64((30 * 24 * time.Hour).Seconds())
+		}},
+		{name: "stale row", mutate: func(snapshot *quotaSnapshot) { snapshot.Windows[0].ObservedAt = now.Add(-2 * time.Hour) }},
+		{name: "limited row", mutate: func(snapshot *quotaSnapshot) {
+			snapshot.Windows[0].UsedPercent = 100
+			snapshot.Windows[0].LimitReached = true
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			resetBanStoreForTest()
+			state := schedulerRuntimeState{
+				cfg: defaultPluginConfig(), warmups: make(map[string]warmupEntry),
+				warmupLeases: make(map[string]warmupLease), banResetConfirmations: make(map[string]banResetConfirmation),
+			}
+			state.cfg.StatePath = ""
+			state.cfg.StaleAfter = time.Hour
+			entry := banEntry{Kind: banKindQuota, Phase: banPhaseCooldown, Window: "5h", BannedAt: now.Add(-5 * 24 * time.Hour), ResetAt: now.Add(19 * 24 * time.Hour)}
+			banStore.set("acct", entry)
+			for _, observedAt := range []time.Time{now.Add(-2 * time.Minute), now.Add(-time.Minute)} {
+				snapshot := quotaSnapshot{
+					AuthID: "acct", AuthIndex: "idx-acct", RefreshedAt: observedAt,
+					Windows: []quotaWindow{{
+						Class: "weekly", WindowSeconds: int64((7 * 24 * time.Hour).Seconds()), UsedPercent: 0,
+						Allowed: true, ResetAt: observedAt.Add(7 * 24 * time.Hour), ObservedAt: observedAt, Source: quotaSourceKeeper,
+					}},
+				}
+				test.mutate(&snapshot)
+				state.reconcileExternallyResetQuotaBans(map[string]quotaSnapshot{"acct": snapshot}, now)
+			}
+			if _, banned := banStore.lookup("acct"); !banned {
+				t.Fatal("unsafe plan-shape evidence cleared quota cooldown")
+			}
+		})
+	}
+}
+
 func TestReconcileExternalResetNeverClearsProbation(t *testing.T) {
 	resetBanStoreForTest()
 	now := time.Now().UTC()

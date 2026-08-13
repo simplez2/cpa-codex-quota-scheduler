@@ -95,14 +95,42 @@ func (stats *warmupAuthEligibilityStats) reject(reason string) {
 	stats.Rejected[reason]++
 }
 
+// trustedWarmupCredentialNote accepts only the canonical notes emitted by
+// Codex Agent Identity. Exact matching keeps official/native credentials and
+// lookalike notes from being routed through the privileged sidecar gateway.
+func trustedWarmupCredentialNote(note string) bool {
+	switch strings.ToLower(strings.TrimSpace(note)) {
+	case "agent identity via sidecar",
+		"codex access token via sidecar",
+		"agent identity via gateway",
+		"codex access token via gateway":
+		return true
+	default:
+		return false
+	}
+}
+
 const (
 	warmupMinimumAvailablePercent = 0.000001
 	warmupMinimumUsageCredits     = 0.000001
 	warmupResetPlaceholderSkew    = 3 * time.Second
 	warmupStaleActivationGrace    = 30 * time.Minute
+	warmupStartupGrace            = 15 * time.Second
 	warmupMaxResponseBytes        = 2 << 20
 	warmupRequestTimeout          = 45 * time.Second
 )
+
+// warmupStartupReady keeps activation traffic away from CPA while a newly
+// claimed plugin generation is still starting. The next Keeper refresh will
+// retry after CPA's API server, auth registry, and Agent Identity proxy have
+// had time to settle.
+func (s *schedulerRuntimeState) warmupStartupReady(now time.Time) bool {
+	ownership := s.generationSnapshot()
+	if !ownership.Managed || ownership.ClaimedAt.IsZero() {
+		return true
+	}
+	return !now.Before(ownership.ClaimedAt.Add(warmupStartupGrace))
+}
 
 // scheduleWarmup is called after a fresh Keeper snapshot. It deliberately
 // schedules at most one request at a time so full accounts are activated
@@ -117,6 +145,11 @@ func (s *schedulerRuntimeState) scheduleWarmup(parent context.Context, skipAuthI
 	if !s.generationOwnerActive() {
 		return
 	}
+	now := time.Now()
+	if !s.warmupStartupReady(now) {
+		return
+	}
+	generationClaimedAt := s.generationSnapshot().ClaimedAt
 	if nativeWarmupRequested(cfg) {
 		if !hostAPIAvailable() {
 			slog.Warn("codex-quota-scheduler: native warmup skipped because CPA HostModel is unavailable")
@@ -126,7 +159,6 @@ func (s *schedulerRuntimeState) scheduleWarmup(parent context.Context, skipAuthI
 		strings.TrimSpace(cfg.CPAManagementKeyFile) == "" || strings.TrimSpace(cfg.WarmupSidecarURL) == "" {
 		return
 	}
-	now := time.Now()
 	if s.pruneExpiredWarmups(now) {
 		s.persistBanState()
 	}
@@ -198,7 +230,7 @@ func (s *schedulerRuntimeState) scheduleWarmup(parent context.Context, skipAuthI
 		releaseInstanceLease()
 		return
 	}
-	candidate, key, ok := s.nextWarmupCandidateLocked(candidates, now, cfg.WarmupRetryAfter)
+	candidate, key, ok := s.nextWarmupCandidateForGenerationLocked(candidates, now, cfg.WarmupRetryAfter, generationClaimedAt)
 	if !ok {
 		s.warmupMu.Unlock()
 		releaseInstanceLease()
@@ -331,14 +363,54 @@ func (s *schedulerRuntimeState) findWarmupCandidates(eligible map[string]warmupA
 		}
 		return candidates[i].Snapshot.AuthID < candidates[j].Snapshot.AuthID
 	})
+	actionableCandidates := s.countActionableWarmupCandidates(candidates, now, cfg.WarmupRetryAfter)
 	s.mu.Lock()
-	s.warmupCandidatesLast = len(candidates)
+	s.warmupCandidatesLast = actionableCandidates
 	s.warmupSkippedBannedLast = skippedBanned
 	s.warmupSkippedStaleLast = skippedStale
 	s.warmupSkippedIneligibleLast = skippedIneligible
 	s.warmupSkippedNotNeededLast = skippedNotNeeded
 	s.mu.Unlock()
 	return candidates
+}
+
+// countActionableWarmupCandidates reports candidates that can actually be
+// attempted now. The raw quota snapshot may continue to expose a moving 100%
+// placeholder briefly after a successful activation, but a confirmed warmup
+// entry suppresses another request until its fixed reset anchor. Management
+// status should reflect that execution state instead of displaying a false
+// pending candidate.
+func (s *schedulerRuntimeState) countActionableWarmupCandidates(candidates []warmupCandidate, now time.Time, retryAfter time.Duration) int {
+	s.warmupMu.Lock()
+	defer s.warmupMu.Unlock()
+	count := 0
+	for _, candidate := range candidates {
+		key := warmupKey(candidate.Snapshot.AuthID, candidate.Window.Class)
+		entry, ok := s.warmups[key]
+		if !ok || staleWarmupState(entry, candidate, now, retryAfter) || !warmupEntrySuppressesNow(entry, now, retryAfter) {
+			count++
+		}
+	}
+	return count
+}
+
+func warmupEntrySuppressesNow(entry warmupEntry, now time.Time, retryAfter time.Duration) bool {
+	if entry.Blocked {
+		return true
+	}
+	if !entry.ResetAt.IsZero() && !now.Before(entry.ResetAt) {
+		return false
+	}
+	if !entry.ActivatedAt.IsZero() && !entry.ResetAt.IsZero() && now.Before(entry.ResetAt) {
+		return true
+	}
+	if !entry.CompletedAt.IsZero() && !entry.SuppressUntil.IsZero() && now.Before(entry.SuppressUntil) {
+		return true
+	}
+	if retryAfter <= 0 {
+		retryAfter = 15 * time.Minute
+	}
+	return !entry.AttemptedAt.IsZero() && now.Sub(entry.AttemptedAt) < retryAfter
 }
 
 // warmupSnapshotFresh is intentionally stricter than the ordinary scheduling
@@ -522,6 +594,14 @@ func (s *schedulerRuntimeState) releaseWarmupLease(nonce string) {
 // attempted, allowing later full accounts to make progress on the next refresh.
 // The caller must hold warmupMu.
 func (s *schedulerRuntimeState) nextWarmupCandidateLocked(candidates []warmupCandidate, now time.Time, retryAfter time.Duration) (warmupCandidate, string, bool) {
+	return s.nextWarmupCandidateForGenerationLocked(candidates, now, retryAfter, time.Time{})
+}
+
+// nextWarmupCandidateForGenerationLocked additionally permits one retry of an
+// unfinished, retryable outcome inherited from a previous generation. Once the
+// new generation records its own attempt, ordinary retry_after suppression
+// applies again.
+func (s *schedulerRuntimeState) nextWarmupCandidateForGenerationLocked(candidates []warmupCandidate, now time.Time, retryAfter time.Duration, generationClaimedAt time.Time) (warmupCandidate, string, bool) {
 	for _, candidate := range candidates {
 		key := warmupKey(candidate.Snapshot.AuthID, candidate.Window.Class)
 		if entry, ok := s.warmups[key]; ok && staleWarmupState(entry, candidate, now, retryAfter) {
@@ -530,7 +610,7 @@ func (s *schedulerRuntimeState) nextWarmupCandidateLocked(candidates []warmupCan
 				"auth_id", candidate.Snapshot.AuthID,
 				"window", candidate.Window.Class)
 		}
-		if s.warmupSuppressedLocked(key, now, retryAfter) {
+		if s.warmupSuppressedForGenerationLocked(key, now, retryAfter, generationClaimedAt) {
 			continue
 		}
 		return candidate, key, true
@@ -627,12 +707,30 @@ func (s *schedulerRuntimeState) confirmPendingWarmups(quotas map[string]quotaSna
 }
 
 func (s *schedulerRuntimeState) warmupSuppressedLocked(key string, now time.Time, retryAfter time.Duration) bool {
+	return s.warmupSuppressedForGenerationLocked(key, now, retryAfter, time.Time{})
+}
+
+func (s *schedulerRuntimeState) warmupSuppressedForGenerationLocked(key string, now time.Time, retryAfter time.Duration, generationClaimedAt time.Time) bool {
 	entry, ok := s.warmups[key]
 	if !ok {
 		return false
 	}
 	if entry.Blocked {
 		return true
+	}
+	if retryableWarmupFromPriorGeneration(entry, generationClaimedAt) {
+		delete(s.warmups, key)
+		slog.Info("codex-quota-scheduler: retrying unfinished warmup from previous generation",
+			"auth_id", entry.AuthID,
+			"window", entry.Window)
+		return false
+	}
+	// A lifecycle reconfigure cancels the refresh-loop context while the old
+	// generation is retiring. That cancellation is not an upstream failure and
+	// must not suppress the same candidate in the newly active generation.
+	if entry.Error == "cancelled" && entry.CompletedAt.IsZero() && entry.ActivatedAt.IsZero() {
+		delete(s.warmups, key)
+		return false
 	}
 	if !entry.ResetAt.IsZero() && !now.Before(entry.ResetAt) {
 		delete(s.warmups, key)
@@ -648,6 +746,22 @@ func (s *schedulerRuntimeState) warmupSuppressedLocked(key string, now time.Time
 		retryAfter = 15 * time.Minute
 	}
 	return !entry.AttemptedAt.IsZero() && now.Sub(entry.AttemptedAt) < retryAfter
+}
+
+func retryableWarmupFromPriorGeneration(entry warmupEntry, generationClaimedAt time.Time) bool {
+	if generationClaimedAt.IsZero() || entry.Blocked || entry.AttemptedAt.IsZero() ||
+		!entry.AttemptedAt.Before(generationClaimedAt) {
+		return false
+	}
+	if !entry.CompletedAt.IsZero() || !entry.ActivatedAt.IsZero() || !entry.ResetAt.IsZero() {
+		return false
+	}
+	if entry.Status == statusTooManyRequests ||
+		(entry.Status >= 200 && entry.Status < 300 && strings.TrimSpace(entry.Error) == "") ||
+		strings.EqualFold(strings.TrimSpace(entry.Error), "http_429") || nonRetryableWarmupCode(entry.Error) {
+		return false
+	}
+	return true
 }
 
 func (s *schedulerRuntimeState) executeWarmup(parent context.Context, cfg pluginConfig, candidate warmupCandidate) {
@@ -763,12 +877,37 @@ func (s *schedulerRuntimeState) executeManagementWarmup(parent context.Context, 
 	candidate.Snapshot.AuthIndex = strings.TrimSpace(binding.AuthIndex)
 
 	payload, err := json.Marshal(map[string]any{
-		"model":             cfg.WarmupModel,
-		"input":             "Reply with OK.",
-		"reasoning":         map[string]any{"effort": "low"},
-		"stream":            false,
-		"store":             false,
-		"max_output_tokens": 16,
+		"model": cfg.WarmupModel,
+		"input": []map[string]any{
+			{
+				"type":  "additional_tools",
+				"role":  "developer",
+				"tools": []any{},
+			},
+			{
+				"type": "message",
+				"role": "developer",
+				"content": []map[string]any{{
+					"type": "input_text",
+					"text": "Reply briefly.",
+				}},
+			},
+			{
+				"type": "message",
+				"role": "user",
+				"content": []map[string]any{{
+					"type": "input_text",
+					"text": "hello",
+				}},
+			},
+		},
+		"tool_choice":         "auto",
+		"parallel_tool_calls": false,
+		"reasoning":           map[string]any{"effort": "low", "context": "all_turns"},
+		"store":               false,
+		"stream":              true,
+		"include":             []string{"reasoning.encrypted_content"},
+		"text":                map[string]any{"verbosity": "low"},
 	})
 	if err != nil {
 		s.recordWarmupError(candidate, 0, fmt.Errorf("encode warmup request: %w", err))
@@ -779,9 +918,13 @@ func (s *schedulerRuntimeState) executeManagementWarmup(parent context.Context, 
 		Method:    http.MethodPost,
 		URL:       strings.TrimRight(cfg.WarmupSidecarURL, "/") + "/responses",
 		Header: map[string]string{
-			"Authorization": "Bearer $TOKEN$",
-			"Content-Type":  "application/json",
-			"User-Agent":    "codex-cli",
+			"Authorization":                          "Bearer $TOKEN$",
+			"Accept":                                 "text/event-stream",
+			"Content-Type":                           "application/json",
+			"Originator":                             "codex_cli_rs",
+			"User-Agent":                             "codex_cli_rs/cpa-quota-scheduler",
+			"X-Codex-Routing-Hint":                   "model=" + cfg.WarmupModel,
+			"X-OpenAI-Internal-Codex-Responses-Lite": "true",
 		},
 		Data: string(payload),
 	})
@@ -1198,9 +1341,9 @@ func warmupEligibleAuthsWithStats(files []cpaAuthFileEntry) (map[string]warmupAu
 			stats.reject("inactive_status")
 			continue
 		}
-		// The pinned management request targets the Agent Identity sidecar.
-		// Requiring the sidecar marker prevents a future native OAuth credential
-		// from being sent to the wrong authentication endpoint.
+		// The pinned management request targets the Agent Identity gateway.
+		// Requiring an exact canonical Identity note prevents a future native
+		// OAuth credential from being sent to the wrong authentication endpoint.
 		authIndex := strings.TrimSpace(file.AuthIndex)
 		authID := strings.TrimSpace(file.ID)
 		if authID == "" {
@@ -1214,7 +1357,7 @@ func warmupEligibleAuthsWithStats(files []cpaAuthFileEntry) (map[string]warmupAu
 			stats.reject("missing_auth_index")
 			continue
 		}
-		if !strings.Contains(strings.ToLower(file.Note), "via sidecar") {
+		if !trustedWarmupCredentialNote(file.Note) {
 			stats.reject("missing_sidecar_marker")
 			continue
 		}
@@ -1273,7 +1416,7 @@ func warmupEligibleHostAuthsWithStats(files []pluginapi.HostAuthFileEntry, requi
 			stats.reject("missing_auth_index")
 			continue
 		}
-		if requireSidecarMarker && !strings.Contains(strings.ToLower(file.Note), "via sidecar") {
+		if requireSidecarMarker && !trustedWarmupCredentialNote(file.Note) {
 			stats.reject("missing_sidecar_marker")
 			continue
 		}

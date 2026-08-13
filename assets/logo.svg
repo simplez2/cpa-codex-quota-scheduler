@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" role="img" aria-labelledby="title desc">
+  <title id="title">Codex Quota Scheduler</title>
+  <desc id="desc">Three quota windows converging into one serial route</desc>
+  <defs>
+    <linearGradient id="surface" x1="12" y1="8" x2="84" y2="88" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#f7f7f5"/>
+      <stop offset="1" stop-color="#d9ddd8"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="25" y1="20" x2="73" y2="78" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#111827"/>
+      <stop offset="1" stop-color="#374151"/>
+    </linearGradient>
+  </defs>
+  <rect x="5" y="5" width="86" height="86" rx="24" fill="#101413"/>
+  <rect x="10" y="10" width="76" height="76" rx="20" fill="url(#surface)"/>
+  <path d="M27 25h42M27 40h32M27 55h22" fill="none" stroke="url(#accent)" stroke-width="7" stroke-linecap="round"/>
+  <path d="M49 55h14c7.7 0 14 6.3 14 14v1" fill="none" stroke="#101413" stroke-width="7" stroke-linecap="round"/>
+  <circle cx="27" cy="25" r="5" fill="#101413"/>
+  <circle cx="27" cy="40" r="5" fill="#101413"/>
+  <circle cx="27" cy="55" r="5" fill="#101413"/>
+  <path d="m69 63 8 7-8 7" fill="none" stroke="#101413" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

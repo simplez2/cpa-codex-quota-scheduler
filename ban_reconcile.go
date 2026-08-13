@@ -175,7 +175,64 @@ func quotaSnapshotProvesNewQuotaCycle(snapshot quotaSnapshot, entry banEntry, no
 		}
 		return "", time.Time{}, false
 	}
+	if reason, evidenceAt, ok := quotaSnapshotProvesWindowSetReplacement(snapshot, banClass, entry.BannedAt, now, staleAfter); ok {
+		return reason, evidenceAt, true
+	}
 	return "", time.Time{}, false
+}
+
+// quotaSnapshotProvesWindowSetReplacement handles a workspace or plan whose
+// authoritative quota shape changed after an older cooldown was recorded. For
+// example, historical releases could persist a monthly reset under a 5h label,
+// while the same imported identity later resolves to a weekly-only Team space.
+//
+// Absence alone is never sufficient evidence: every currently recognized row
+// must be a fresh Keeper observation, must identify its duration consistently,
+// and must be a strictly shorter class than the old effective ban. The caller's
+// existing two-snapshot confirmation then protects against one partial Keeper
+// response before the obsolete cooldown is cleared.
+func quotaSnapshotProvesWindowSetReplacement(snapshot quotaSnapshot, banClass string, bannedAt, now time.Time, staleAfter time.Duration) (string, time.Time, bool) {
+	banRank := windowClassRank(banClass)
+	if banRank <= 1 || len(snapshot.Windows) == 0 {
+		return "", time.Time{}, false
+	}
+	if staleAfter <= 0 {
+		staleAfter = 15 * time.Minute
+	}
+
+	classes := make([]string, 0, len(snapshot.Windows))
+	seen := make(map[string]struct{}, len(snapshot.Windows))
+	var evidenceAt time.Time
+	for _, window := range snapshot.Windows {
+		class := normalizeWindowClass(window.Class)
+		if class == "" || class == banClass || windowClassRank(class) >= banRank {
+			return "", time.Time{}, false
+		}
+		if window.Source != quotaSourceKeeper || window.WindowSeconds <= 0 || windowClassFromSeconds(window.WindowSeconds) != class {
+			return "", time.Time{}, false
+		}
+		observedAt := window.ObservedAt
+		if observedAt.IsZero() || !observedAt.After(bannedAt) || now.Before(observedAt) || now.Sub(observedAt) > staleAfter {
+			return "", time.Time{}, false
+		}
+		if !window.Allowed || window.LimitReached || window.UsedPercent >= usedPercentThreshold ||
+			window.ResetAt.IsZero() || !now.Before(window.ResetAt) {
+			return "", time.Time{}, false
+		}
+		if _, duplicate := seen[class]; duplicate {
+			return "", time.Time{}, false
+		}
+		seen[class] = struct{}{}
+		classes = append(classes, class)
+		if evidenceAt.IsZero() || observedAt.Before(evidenceAt) {
+			evidenceAt = observedAt
+		}
+	}
+	if len(classes) == 0 || evidenceAt.IsZero() {
+		return "", time.Time{}, false
+	}
+	sort.Slice(classes, func(i, j int) bool { return windowClassRank(classes[i]) < windowClassRank(classes[j]) })
+	return banClass + "_window_set_replaced_by_" + strings.Join(classes, "+"), evidenceAt, true
 }
 
 // effectiveBanWindowClass repairs only provable historical under-classification.

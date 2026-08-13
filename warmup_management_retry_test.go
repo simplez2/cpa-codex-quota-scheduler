@@ -79,6 +79,35 @@ func TestManagementWarmupNonRetryableFailuresStayBlocked(t *testing.T) {
 	}
 }
 
+func TestManagementWarmupWaitsForStartupGrace(t *testing.T) {
+	resetBanStoreForTest()
+	t.Cleanup(resetBanStoreForTest)
+	keyPath := filepath.Join(t.TempDir(), "management-key")
+	if err := os.WriteFile(keyPath, []byte("test-key\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		http.Error(w, "startup request should not occur", http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+
+	state := newManagementWarmupRuntimeForRetryTest(t, server.URL, keyPath)
+	defer state.stop()
+	state.generationMu.Lock()
+	state.generation.ClaimedAt = time.Now().UTC()
+	state.generationMu.Unlock()
+	state.scheduleWarmup(context.Background(), nil)
+	state.wg.Wait()
+	if got := requests.Load(); got != 0 {
+		t.Fatalf("startup grace allowed %d CPA management requests; want 0", got)
+	}
+	if len(state.warmups) != 0 {
+		t.Fatalf("startup grace recorded a warmup attempt: %#v", state.warmups)
+	}
+}
+
 func TestManagementWarmupHTTPAuthFailuresStayBlocked(t *testing.T) {
 	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden} {
 		t.Run(http.StatusText(status), func(t *testing.T) {

@@ -169,8 +169,15 @@ func TestManagementWarmupTakeoverMergesRetiredOutcomeWithoutDuplicate(t *testing
 			var upstream map[string]any
 			if err := json.Unmarshal([]byte(request.Data), &upstream); err != nil {
 				t.Errorf("decode upstream request: %v", err)
-			} else if got := upstream["max_output_tokens"]; got != float64(16) {
-				t.Errorf("max_output_tokens = %#v; want 16", got)
+			} else {
+				input, _ := upstream["input"].([]any)
+				_, hasTopLevelTools := upstream["tools"]
+				additionalTools, _ := input[0].(map[string]any)
+				if _, hasMaxOutputTokens := upstream["max_output_tokens"]; hasMaxOutputTokens ||
+					upstream["stream"] != true || len(input) != 3 || hasTopLevelTools ||
+					additionalTools["type"] != "additional_tools" {
+					t.Errorf("unexpected Codex warmup request: %#v", upstream)
+				}
 			}
 			if apiCalls.Add(1) == 1 {
 				close(requestStarted)
