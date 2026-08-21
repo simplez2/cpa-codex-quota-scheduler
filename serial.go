@@ -28,8 +28,29 @@ type serialCandidate struct {
 	Reason       string
 	WindowClass  string
 	CycleActive  bool
+	DrainActive  bool
 	MaxUsed      float64
 	ResetCredits int
+}
+
+// serialWindowDrains reports whether the window is close enough to its reset
+// that the scheduler should let it run past the soft threshold instead of
+// switching early. The official courtesy keeps an in-flight session alive to
+// completion without extra charge after the limit is hit, and new requests are
+// only blocked once Keeper marks the window as fully consumed, so burning the
+// final percent near a reset is free value that would otherwise expire.
+func serialWindowDrains(window quotaWindow, cfg pluginConfig, now time.Time) bool {
+	if cfg.DrainWindowHours <= 0 {
+		return false
+	}
+	class := normalizeWindowClass(window.Class)
+	if class == "" || !window.Allowed || window.LimitReached {
+		return false
+	}
+	if window.ResetAt.IsZero() || !now.Before(window.ResetAt) {
+		return false
+	}
+	return window.ResetAt.Sub(now) <= time.Duration(cfg.DrainWindowHours*float64(time.Hour))
 }
 
 func serialWindowClass(snapshot quotaSnapshot, order []string) string {
@@ -88,16 +109,22 @@ func inspectSerialCandidate(candidate pluginapi.SchedulerAuthCandidate, snapshot
 		if quotaWindowCycleStarted(window, snapshot.RefreshedAt, now) {
 			choice.CycleActive = true
 		}
-		if window.UsedPercent >= threshold {
+		if window.UsedPercent >= threshold && !serialWindowDrains(window, cfg, now) {
 			choice.Eligible = false
 			choice.Reason = "serial_threshold"
 			return choice
+		}
+		if serialWindowDrains(window, cfg, now) {
+			choice.DrainActive = true
 		}
 	}
 	return choice
 }
 
 func serialCandidateLess(a, b serialCandidate, cfg pluginConfig) bool {
+	if a.DrainActive != b.DrainActive {
+		return a.DrainActive
+	}
 	if rankA, rankB := windowRankInOrder(a.WindowClass, cfg.WindowOrder), windowRankInOrder(b.WindowClass, cfg.WindowOrder); rankA != rankB {
 		return rankA < rankB
 	}

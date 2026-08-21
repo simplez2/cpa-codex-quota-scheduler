@@ -56,6 +56,10 @@ When no active auth is committed, or a real switch is required, healthy candidat
 
 Once selected, a more attractive backup does **not** preempt the active auth. A switch occurs only when an active window reaches `serial_switch_percent`, becomes disallowed/exhausted, receives a qualifying 429, is quarantined, or remains absent from CPA candidates for at least 90 seconds and three confirmations.
 
+### End-of-cycle drain
+
+When a usable window is within `drain_window_hours` (default 6h, 0 disables) of its reset, that account enters drain mode: it may run past `serial_switch_percent` until Keeper reports the window as fully consumed, and drain accounts are preferred over fresh backups so expiring quota is used before it resets. This mirrors the official courtesy behavior where an in-flight session continues to completion after the usage limit is hit without extra charge; new requests are only blocked once the window is truly exhausted.
+
 ## Warmup in one paragraph
 
 A warmup candidate must have a fresh Keeper row, all recognized active windows at 0% used and allowed, a credible “not started” reset signal, a valid CPA auth binding, no quarantine, no active/pending/blocked warmup record, and no competing generation or instance lease. The plugin then sends a pinned non-streaming `hello` request with `store=false` and `max_output_tokens=16`. Success is not assumed from HTTP 2xx alone: later Keeper data must confirm a stable reset anchor. Cyber-policy, abuse, auth, deactivated-workspace, and similar terminal failures are stored only as redacted blocked codes and are never retried automatically.

@@ -6,7 +6,7 @@
       "name": "Codex Quota Scheduler",
       "description": "CPA-native serial fill-first Codex quota scheduler with strict window-priority preemption, transient 5xx failover, persistent 429 quarantine, half-open recovery, Keeper quota refresh, and sequential full-quota warmup.",
       "author": "simplez2",
-      "version": "0.1.13",
+      "version": "0.1.14",
       "repository": "https://github.com/simplez2/cpa-codex-quota-scheduler",
       "homepage": "https://github.com/simplez2/cpa-codex-quota-scheduler",
       "license": "MIT",

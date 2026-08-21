@@ -17,6 +17,7 @@ type pluginConfig struct {
 	SchedulerMode           string
 	SerialSwitchPercent     float64
 	SerialPreferActiveCycle bool
+	DrainWindowHours        float64
 	KeeperURL               string
 	KeeperPasswordFile      string
 	CPAManagementURL        string
@@ -58,6 +59,7 @@ type yamlPluginConfig struct {
 	SchedulerMode           string   `yaml:"scheduler_mode"`
 	SerialSwitchPercent     *float64 `yaml:"serial_switch_percent"`
 	SerialPreferActiveCycle *bool    `yaml:"serial_prefer_active_cycle"`
+	DrainWindowHours         *float64 `yaml:"drain_window_hours"`
 	KeeperURL               string   `yaml:"keeper_url"`
 	KeeperPasswordFile      string   `yaml:"keeper_password_file"`
 	CPAManagementURL        string   `yaml:"cpa_management_url"`
@@ -99,6 +101,7 @@ func defaultPluginConfig() pluginConfig {
 		SchedulerMode:           "serial",
 		SerialSwitchPercent:     98,
 		SerialPreferActiveCycle: true,
+		DrainWindowHours:        6,
 		KeeperPasswordFile:      "/run/secrets/keeper_login_password",
 		CPAManagementURL:        "http://127.0.0.1:8317/v0/management/api-call",
 		CPAManagementKeyFile:    "/run/secrets/management_key",
@@ -156,6 +159,9 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 	}
 	if in.SerialPreferActiveCycle != nil {
 		cfg.SerialPreferActiveCycle = *in.SerialPreferActiveCycle
+	}
+	if in.DrainWindowHours != nil {
+		cfg.DrainWindowHours = *in.DrainWindowHours
 	}
 	if strings.TrimSpace(in.KeeperURL) != "" {
 		cfg.KeeperURL = strings.TrimSpace(in.KeeperURL)
@@ -297,6 +303,9 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 	}
 	if cfg.SerialSwitchPercent <= 0 || cfg.SerialSwitchPercent > 100 {
 		cfg.SerialSwitchPercent = 98
+	}
+	if cfg.DrainWindowHours <= 0 || cfg.DrainWindowHours > 168 {
+		cfg.DrainWindowHours = 6
 	}
 	if cfg.Reserve5hPercent < 0 || cfg.Reserve5hPercent >= 100 {
 		cfg.Reserve5hPercent = 15
