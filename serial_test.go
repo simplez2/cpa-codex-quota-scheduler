@@ -499,6 +499,76 @@ func TestSerialSchedulerKeepsCurrentWhenEveryBackupReachedSoftThreshold(t *testi
 	}
 }
 
+func TestSerialSchedulerDrainAllowsActivePastThresholdNearReset(t *testing.T) {
+	resetBanStoreForTest()
+	now := time.Now()
+	state := newSerialTestState(now)
+	req := serialTestRequest()
+	if got, _ := state.schedulerPick(req); got.AuthID != "primary" {
+		t.Fatalf("initial pick = %#v", got)
+	}
+
+	state.mu.Lock()
+	primary := state.quotas["primary"]
+	// 99% used, reset in 4h: inside the default 6h drain window, so crossing
+	// the 98% soft threshold must not switch away.
+	primary.Windows[0].UsedPercent = 99
+	primary.Windows[0].ResetAt = now.Add(4 * time.Hour)
+	state.quotas["primary"] = primary
+	state.mu.Unlock()
+	got, err := state.schedulerPick(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Handled || got.AuthID != "primary" {
+		t.Fatalf("drain mode did not keep active auth: %#v", got)
+	}
+}
+
+func TestSerialSchedulerDrainPrefersExpiringAccountOverFreshBackup(t *testing.T) {
+	resetBanStoreForTest()
+	now := time.Now()
+	state := newSerialTestState(now)
+	state.mu.Lock()
+	backup := state.quotas["backup"]
+	backup.Windows[0].UsedPercent = 5
+	backup.Windows[0].ResetAt = now.Add(6 * 24 * time.Hour)
+	state.quotas["backup"] = backup
+	primary := state.quotas["primary"]
+	primary.Windows[0].UsedPercent = 90
+	primary.Windows[0].ResetAt = now.Add(3 * time.Hour)
+	state.quotas["primary"] = primary
+	state.mu.Unlock()
+
+	got, err := state.schedulerPick(serialTestRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Handled || got.AuthID != "primary" {
+		t.Fatalf("drain account should be preferred over fresh backup: %#v", got)
+	}
+}
+
+func TestSerialSchedulerDrainStopsAtFullWindow(t *testing.T) {
+	resetBanStoreForTest()
+	now := time.Now()
+	state := newSerialTestState(now)
+	state.mu.Lock()
+	primary := state.quotas["primary"]
+	primary.Windows[0].UsedPercent = 100
+	primary.Windows[0].ResetAt = now.Add(2 * time.Hour)
+	state.quotas["primary"] = primary
+	state.mu.Unlock()
+
+	got, err := state.schedulerPick(serialTestRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Handled || got.AuthID != "backup" {
+		t.Fatalf("below drain floor should switch to backup: %#v", got)
+	}
+}
+
 func TestSerialStatePersistenceIncludesActiveAuth(t *testing.T) {
 	resetBanStoreForTest()
 	path := filepath.Join(t.TempDir(), "state.json")

@@ -14,6 +14,13 @@ plugins:
       serial_switch_percent: 98
       serial_prefer_active_cycle: true
 
+      # End-of-cycle drain: when a usable window is within this many hours of
+      # its reset, the account may run past the soft threshold until Keeper
+      # reports the window as fully consumed. This mirrors the official
+      # courtesy that lets an in-flight session finish without extra charge
+      # after the limit is hit.
+      drain_window_hours: 6
+
       keeper_url: http://cpa-usage-keeper:8080/keeper
       keeper_password_file: /run/secrets/keeper_login_password
       refresh_interval: 30s

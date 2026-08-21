@@ -1614,6 +1614,7 @@ type runtimeStatus struct {
 	Enabled                  bool                     `json:"enabled"`
 	SchedulerMode            string                   `json:"scheduler_mode"`
 	SerialSwitchPercent      float64                  `json:"serial_switch_percent"`
+	DrainWindowHours         float64                  `json:"drain_window_hours"`
 	SerialActiveAuthID       string                   `json:"serial_active_auth_id,omitempty"`
 	SerialSelectedAt         string                   `json:"serial_selected_at,omitempty"`
 	SerialSwitches           uint64                   `json:"serial_switches"`
@@ -2087,6 +2088,7 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 		Enabled:                 cfg.Enabled,
 		SchedulerMode:           cfg.SchedulerMode,
 		SerialSwitchPercent:     cfg.SerialSwitchPercent,
+		DrainWindowHours:        cfg.DrainWindowHours,
 		SerialActiveAuthID:      serialActiveAuthID,
 		SerialSwitches:          serialSwitches,
 		SerialFallbacks:         serialFallbacks,
