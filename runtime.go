@@ -140,6 +140,17 @@ type schedulerRuntimeState struct {
 	serialFallbackAuthID   string
 	serialMissingSince     time.Time
 	serialMissingCount     int
+	serialOverdraft        map[string]serialOverdraftBinding
+}
+
+// serialOverdraftBinding pins an in-flight session to the auth it started on
+// after that auth crossed the serial threshold. The official courtesy lets a
+// running conversation continue to completion without extra charge once the
+// usage limit is hit, so those requests must keep using the exhausted account
+// instead of being silently moved to the fresh one.
+type serialOverdraftBinding struct {
+	AuthID     string    `json:"auth_id"`
+	LastUsedAt time.Time `json:"last_used_at"`
 }
 
 var schedulerRuntime schedulerRuntimeState
@@ -1418,6 +1429,7 @@ type persistedBanState struct {
 	SerialFallbacks        uint64                          `json:"serial_provisional_fallbacks,omitempty"`
 	SerialLastSwitchAt     time.Time                       `json:"serial_last_switch_at,omitempty"`
 	SerialLastSwitchReason string                          `json:"serial_last_switch_reason,omitempty"`
+	SerialOverdraft        map[string]serialOverdraftBinding `json:"serial_overdraft,omitempty"`
 	SavedAt                time.Time                       `json:"saved_at"`
 }
 
@@ -1499,6 +1511,19 @@ func (s *schedulerRuntimeState) loadBanStateWithConfirmationMode(path string, re
 	s.banResetMu.Unlock()
 	s.mu.Lock()
 	s.serialActiveAuthID = strings.TrimSpace(state.SerialActiveAuthID)
+	if state.SerialOverdraft != nil {
+		s.serialOverdraft = make(map[string]serialOverdraftBinding, len(state.SerialOverdraft))
+		now := time.Now()
+		for session, binding := range state.SerialOverdraft {
+			if strings.TrimSpace(session) == "" || strings.TrimSpace(binding.AuthID) == "" {
+				continue
+			}
+			if now.Sub(binding.LastUsedAt) > serialOverdraftTTL {
+				continue
+			}
+			s.serialOverdraft[session] = binding
+		}
+	}
 	s.serialSelectedAt = state.SerialSelectedAt
 	s.serialSwitches = state.SerialSwitches
 	s.serialFallbacks = state.SerialFallbacks
@@ -1537,6 +1562,17 @@ func (s *schedulerRuntimeState) persistBanState() bool {
 	serialFallbacks := s.serialFallbacks
 	serialLastSwitchAt := s.serialLastSwitchAt
 	serialLastSwitchReason := strings.TrimSpace(s.serialLastSwitchReason)
+	serialOverdraft := make(map[string]serialOverdraftBinding, len(s.serialOverdraft))
+	now := time.Now()
+	for session, binding := range s.serialOverdraft {
+		if strings.TrimSpace(session) == "" || strings.TrimSpace(binding.AuthID) == "" {
+			continue
+		}
+		if now.Sub(binding.LastUsedAt) > serialOverdraftTTL {
+			continue
+		}
+		serialOverdraft[session] = binding
+	}
 	s.mu.RUnlock()
 	if path == "" {
 		return false
@@ -1564,6 +1600,7 @@ func (s *schedulerRuntimeState) persistBanState() bool {
 		SerialFallbacks:        serialFallbacks,
 		SerialLastSwitchAt:     serialLastSwitchAt,
 		SerialLastSwitchReason: serialLastSwitchReason,
+		SerialOverdraft:        serialOverdraft,
 		SavedAt:                time.Now(),
 	}
 	raw, err := json.MarshalIndent(state, "", "  ")
@@ -1624,6 +1661,7 @@ type runtimeStatus struct {
 	SerialMissingCount       int                      `json:"serial_candidate_missing_confirmations,omitempty"`
 	SerialLastSwitchAt       string                   `json:"serial_last_switch_at,omitempty"`
 	SerialSwitchReason       string                   `json:"serial_last_switch_reason,omitempty"`
+	SerialOverdraftSessions  int                      `json:"serial_overdraft_sessions"`
 	ConfigGeneration         uint64                   `json:"config_generation"`
 	RuntimeGeneration        uint64                   `json:"runtime_generation"`
 	GenerationManaged        bool                     `json:"generation_managed"`
@@ -1850,6 +1888,7 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 	serialMissingCount := s.serialMissingCount
 	serialLastSwitchAt := s.serialLastSwitchAt
 	serialLastSwitchReason := s.serialLastSwitchReason
+	serialOverdraftSessions := len(s.serialOverdraft)
 	warmupCandidates := s.warmupCandidatesLast
 	warmupSkippedBanned := s.warmupSkippedBannedLast
 	warmupSkippedStale := s.warmupSkippedStaleLast
@@ -2095,6 +2134,7 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 		SerialFallbackAuth:      serialFallbackAuthID,
 		SerialMissingCount:      serialMissingCount,
 		SerialSwitchReason:      serialLastSwitchReason,
+		SerialOverdraftSessions: serialOverdraftSessions,
 		ConfigGeneration:        configGeneration,
 		RuntimeGeneration:       generation.Ticket,
 		GenerationManaged:       generation.Managed,

@@ -569,6 +569,54 @@ func TestSerialSchedulerDrainStopsAtFullWindow(t *testing.T) {
 	}
 }
 
+func TestSerialOverdraftPinsSessionToExhaustedAuth(t *testing.T) {
+	resetBanStoreForTest()
+	now := time.Now()
+	state := newSerialTestState(now)
+	req := serialTestRequest()
+	req.Options.Headers = map[string][]string{"X-Session-ID": {"in-flight"}}
+	if got, _ := state.schedulerPick(req); got.AuthID != "primary" {
+		t.Fatalf("initial pick = %#v", got)
+	}
+
+	state.mu.Lock()
+	primary := state.quotas["primary"]
+	// Outside the drain window (reset in 2 days) so the only reason to stay is
+	// the in-flight session overdraft pin.
+	primary.Windows[0].UsedPercent = 99
+	state.quotas["primary"] = primary
+	state.mu.Unlock()
+
+	// The in-flight session keeps using the exhausted auth.
+	got, err := state.schedulerPick(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Handled || got.AuthID != "primary" {
+		t.Fatalf("overdraft session was moved off exhausted auth: %#v", got)
+	}
+
+	// A different session routes to the fresh backup.
+	other := serialTestRequest()
+	other.Options.Headers = map[string][]string{"X-Session-ID": {"new-session"}}
+	fresh, err := state.schedulerPick(other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fresh.Handled || fresh.AuthID != "backup" {
+		t.Fatalf("new session did not move to backup: %#v", fresh)
+	}
+
+	// The in-flight session stays pinned on subsequent requests.
+	again, err := state.schedulerPick(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !again.Handled || again.AuthID != "primary" {
+		t.Fatalf("overdraft pin did not persist: %#v", again)
+	}
+}
+
 func TestSerialStatePersistenceIncludesActiveAuth(t *testing.T) {
 	resetBanStoreForTest()
 	path := filepath.Join(t.TempDir(), "state.json")

@@ -17,6 +17,11 @@ const (
 	serialCandidateMissingConfirmations = 3
 )
 
+// serialOverdraftTTL bounds how long an exhausted account keeps serving an
+// in-flight session after the global switch. It is intentionally short: the
+// courtesy window exists to finish the current task, not to run indefinitely.
+const serialOverdraftTTL = 30 * time.Minute
+
 // serialCandidate is the fill-first view of one CPA auth candidate. Serial
 // mode deliberately ignores session identity: every request uses one global
 // active auth until it becomes unsafe or unavailable.
@@ -156,6 +161,35 @@ func (s *schedulerRuntimeState) resetSerialMissingLocked() {
 	s.serialMissingCount = 0
 }
 
+// serialOverdraftAuthLocked returns the auth a session was pinned to for
+// overdraft continuation, if that pin is still valid. The caller must hold s.mu.
+func (s *schedulerRuntimeState) serialOverdraftAuthLocked(session string, now time.Time) string {
+	if session == "" || s.serialOverdraft == nil {
+		return ""
+	}
+	binding, ok := s.serialOverdraft[session]
+	if !ok || now.Sub(binding.LastUsedAt) > serialOverdraftTTL {
+		delete(s.serialOverdraft, session)
+		return ""
+	}
+	return binding.AuthID
+}
+
+func (s *schedulerRuntimeState) setSerialOverdraftLocked(session, authID string, now time.Time) {
+	if session == "" || authID == "" {
+		return
+	}
+	if s.serialOverdraft == nil {
+		s.serialOverdraft = make(map[string]serialOverdraftBinding)
+	}
+	for key, binding := range s.serialOverdraft {
+		if now.Sub(binding.LastUsedAt) > serialOverdraftTTL {
+			delete(s.serialOverdraft, key)
+		}
+	}
+	s.serialOverdraft[session] = serialOverdraftBinding{AuthID: authID, LastUsedAt: now}
+}
+
 // serialRequestLocalPickLocked selects one candidate without changing the
 // committed global serial auth. It is used for explicit pinned requests and
 // transient candidate subsets. The caller must hold s.mu.
@@ -194,6 +228,35 @@ func (s *schedulerRuntimeState) serialRequestLocalPickLocked(
 	return pluginapi.SchedulerPickResponse{AuthID: choices[0].Candidate.ID, Handled: true}
 }
 
+// serialOverdraftPickLocked serves one request from the session's pinned
+// overdraft auth. The candidate must still be present in CPA's list; the
+// quota check is skipped on purpose because the whole point of the pin is to
+// keep using the exhausted account while the official courtesy allows it.
+func (s *schedulerRuntimeState) serialOverdraftPickLocked(
+	candidates []pluginapi.SchedulerAuthCandidate,
+	session, overdraftAuthID string,
+	blocked map[string]banDisposition,
+	now time.Time,
+) (pluginapi.SchedulerPickResponse, bool) {
+	if overdraftAuthID == "" {
+		return pluginapi.SchedulerPickResponse{}, false
+	}
+	for _, candidate := range candidates {
+		candidate.ID = strings.TrimSpace(candidate.ID)
+		if candidate.ID != overdraftAuthID {
+			continue
+		}
+		if _, unavailable := blocked[candidate.ID]; unavailable {
+			delete(s.serialOverdraft, session)
+			return pluginapi.SchedulerPickResponse{}, false
+		}
+		s.setSerialOverdraftLocked(session, candidate.ID, now)
+		return pluginapi.SchedulerPickResponse{AuthID: candidate.ID, Handled: true}, true
+	}
+	delete(s.serialOverdraft, session)
+	return pluginapi.SchedulerPickResponse{}, false
+}
+
 func (s *schedulerRuntimeState) serialPick(req pluginapi.SchedulerPickRequest, now time.Time) pluginapi.SchedulerPickResponse {
 	blocked := make(map[string]banDisposition, len(req.Candidates))
 	for _, candidate := range req.Candidates {
@@ -211,12 +274,37 @@ func (s *schedulerRuntimeState) serialPick(req pluginapi.SchedulerPickRequest, n
 
 	s.mu.Lock()
 	cfg := s.cfg
+	session := schedulerSessionHash(req)
+	previous := strings.TrimSpace(s.serialActiveAuthID)
+	overdraftOverride := ""
+	sessionPinned := ""
+	if previous != "" && session != "" {
+		// Sticky binding: record which auth this session is being served by
+		// on every pick. When that auth later becomes ineligible (threshold
+		// crossed or limit reached), this existing binding lets the
+		// overdraft route below keep serving the same conversation on the
+		// exhausted account via the official courtesy window, without ever
+		// having depended on catching the exact switch-over request. Never
+		// overwrite an existing binding that points at a different auth:
+		// that would destroy an active overdraft pin.
+		sessionPinned = s.serialOverdraftAuthLocked(session, now)
+		if sessionPinned == "" || sessionPinned == previous {
+			s.setSerialOverdraftLocked(session, previous, now)
+			sessionPinned = previous
+		}
+	}
 	if pinnedAuthID := serialPinnedAuthID(req); pinnedAuthID != "" {
 		response := s.serialRequestLocalPickLocked(req.Candidates, pinnedAuthID, blocked, cfg, now)
 		s.mu.Unlock()
 		return response
 	}
-	previous := strings.TrimSpace(s.serialActiveAuthID)
+	if overdraftAuthID := s.serialOverdraftAuthLocked(session, now); overdraftAuthID != "" && overdraftAuthID != previous {
+		if response, ok := s.serialOverdraftPickLocked(req.Candidates, session, overdraftAuthID, blocked, now); ok {
+			s.mu.Unlock()
+			return response
+		}
+		previous = strings.TrimSpace(s.serialActiveAuthID)
+	}
 	currentSeen := false
 	currentEligible := false
 	currentChoice := serialCandidate{}
@@ -251,6 +339,23 @@ func (s *schedulerRuntimeState) serialPick(req pluginapi.SchedulerPickRequest, n
 				currentEligible = true
 				currentChoice = choice
 				continue
+			}
+			if session != "" && sessionPinned == candidate.ID &&
+				(choice.Reason == "serial_threshold" || choice.Reason == "limit_reached") &&
+				overdraftOverride == "" {
+				// In-flight overdraft: this exact conversation was already
+				// being served by the now-exhausted auth, so remember to keep
+				// serving it there (official courtesy). Do not short-circuit:
+				// the global switch below must still move every other session
+				// onto a fresh backup.
+				overdraftOverride = candidate.ID
+				s.setSerialOverdraftLocked(session, candidate.ID, now)
+			}
+			if session != "" && (choice.Reason == "serial_threshold" || choice.Reason == "limit_reached") {
+				// The active auth just crossed the threshold: pin this in-flight
+				// session to it so the official courtesy can finish the task,
+				// while every other session moves to the fresh backup below.
+				s.setSerialOverdraftLocked(session, candidate.ID, now)
 			}
 			currentReason = choice.Reason
 			continue
@@ -386,6 +491,9 @@ func (s *schedulerRuntimeState) serialPick(req pluginapi.SchedulerPickRequest, n
 	s.mu.Unlock()
 	if changed {
 		s.persistBanState()
+	}
+	if overdraftOverride != "" {
+		return pluginapi.SchedulerPickResponse{AuthID: overdraftOverride, Handled: true}
 	}
 	return pluginapi.SchedulerPickResponse{AuthID: selected, Handled: true}
 }
