@@ -11,7 +11,7 @@
   </p>
 </div>
 
-> **Version note:** the source and registry declare plugin version **v0.1.17**. A build is a published release only after the matching `v0.1.17` tag and release assets are available.
+> **Version note:** the source and registry declare plugin version **v0.1.18**. A build is a published release only after the matching `v0.1.18` tag and release assets are available.
 
 The plugin keeps normal Codex traffic on one globally committed credential. It switches only when quota policy, an authoritative 429, quarantine, or confirmed candidate loss requires it. Fully available accounts can be activated separately, one at a time, without turning normal traffic into round-robin usage.
 
@@ -27,6 +27,7 @@ The plugin keeps normal Codex traffic on one globally committed credential. It s
 | Start dormant full-quota cycles | Strictly sequential, pinned, minimal Responses requests; normal routing remains serial. |
 | Handle platform-wide early resets | Two independent fresh Keeper observations are required before a stale quota ban is cleared. |
 | Hot-reload safely | Generation ownership and cross-process warmup leases stop superseded plugin instances from continuing work. |
+| Operate from CPA Management | Change mode, threshold, warmup model, or the serial primary through authenticated hot configuration. |
 
 ## Architecture
 
@@ -132,12 +133,14 @@ All routes live below `/v0/management/plugins/codex-quota-scheduler`:
 | Method | Route | Purpose |
 |---|---|---|
 | `GET` | `/quota` | Serial, Keeper, generation, warmup, reconciliation, and redacted decision status. |
+| `PUT` | `/serial-active` | Manually select one active, fresh, eligible serial primary with `{"auth_id":"..."}`. |
+| `DELETE` | `/serial-active` | Clear the manual primary and return to automatic selection. |
 | `GET` | `/bans` | Current cooldown, probation, and half-open entries. |
 | `POST` | `/unban` | Explicitly clear one quarantine entry. |
 | `POST` | `/unban-all` | Explicitly clear all quarantine entries. |
 | `POST` | `/warmup-retry` | Clear a repaired blocked warmup by auth ID, or explicitly with `all=true`. |
 
-Manual unban and warmup retry are privileged recovery actions. The plugin intentionally registers no dynamic or privileged `/v0/resource/plugins/...` route.
+Manual primary selection, unban, and warmup retry are privileged actions. The selected primary remains protected by automatic 429, hard-limit, higher-priority-window, and candidate-loss failover. The plugin intentionally registers no dynamic or privileged `/v0/resource/plugins/...` route.
 
 ## Security boundary
 

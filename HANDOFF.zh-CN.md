@@ -20,7 +20,7 @@
 | Git tag / GitHub Release | 对外正式发布版本。 |
 | Draft PR | 尚未发布、供审查的功能分支。 |
 
-当前源码与 registry 为 v0.1.17。正式发布时必须同时校验 pluginVersion、registry、tag、资产名和 Release 说明；未生成匹配 Release 资产前，只能称为测试构建。
+当前源码与 registry 为 v0.1.18。正式发布时必须同时校验 pluginVersion、registry、tag、资产名和 Release 说明；未生成匹配 Release 资产前，只能称为测试构建。
 
 ## 3. 推荐生产挂载
 
@@ -175,12 +175,14 @@ git diff --check
 
 ### Keeper 周期性 service_unavailable
 
-先核对错误时间是否与 `keeper_refresh_requested_at` 对齐。Keeper 会保留 disabled 历史身份；v0.1.17 会在读取阶段排除其缓存，并在真正请求 `/quota/refresh` 前再与 CPA 当前 active Codex 清单求交集。若 `keeper_refresh_error=auth_inventory_unavailable`，只读快照仍会保留，但有副作用的刷新会 fail closed；应修复 Management key/Host API，不要反复启用历史账号。
+先核对错误时间是否与 `keeper_refresh_requested_at` 对齐。Keeper 会保留 disabled 历史身份；v0.1.18 会在读取阶段排除其缓存，并在真正请求 `/quota/refresh` 前再与 CPA 当前 active Codex 清单求交集。若 `keeper_refresh_error=auth_inventory_unavailable`，只读快照仍会保留，但有副作用的刷新会 fail closed；应修复 Management key/Host API，不要反复启用历史账号。
 
 ## 9. 手工恢复操作
 
 | 操作 | 何时使用 | 风险 |
 |---|---|---|
+| PUT /serial-active | 需要手动指定后续新会话使用的串行主账号 | 只接受 fresh、eligible、未隔离账号；429、硬限额或失效仍会自动切走。 |
+| DELETE /serial-active | 取消手动主账号并恢复自动选择 | 不触发预热、模型调用或 reset credit。 |
 | POST /warmup-retry | 修复了 blocked 凭据/配置后 | 可能再次发起最低成本激活请求。 |
 | POST /unban | 已确认单账号上游额度恢复但自动对账无法观察 | 会允许该账号重新参与 half-open/调度。 |
 | POST /unban-all | 已由管理员确认整个池的隔离均失效 | 高风险，不应作为常规刷新按钮。 |

@@ -131,6 +131,7 @@ type schedulerRuntimeState struct {
 	configGeneration    uint64
 
 	serialActiveAuthID     string
+	serialSelectionSource  string
 	serialSelectedAt       time.Time
 	serialSwitches         uint64
 	serialFallbacks        uint64
@@ -207,6 +208,7 @@ func configureSchedulerRuntime(raw []byte) {
 	schedulerRuntime.sessionToken = ""
 	schedulerRuntime.sessionExpiry = time.Time{}
 	schedulerRuntime.serialActiveAuthID = ""
+	schedulerRuntime.serialSelectionSource = "auto"
 	schedulerRuntime.serialSelectedAt = time.Time{}
 	schedulerRuntime.serialSwitches = 0
 	schedulerRuntime.serialFallbacks = 0
@@ -1438,6 +1440,7 @@ type persistedBanState struct {
 	Warmups                map[string]warmupEntry            `json:"warmups,omitempty"`
 	BanResetConfirmations  map[string]banResetConfirmation   `json:"ban_reset_confirmations,omitempty"`
 	SerialActiveAuthID     string                            `json:"serial_active_auth_id,omitempty"`
+	SerialSelectionSource  string                            `json:"serial_selection_source,omitempty"`
 	SerialSelectedAt       time.Time                         `json:"serial_selected_at,omitempty"`
 	SerialSwitches         uint64                            `json:"serial_switches,omitempty"`
 	SerialFallbacks        uint64                            `json:"serial_provisional_fallbacks,omitempty"`
@@ -1525,6 +1528,10 @@ func (s *schedulerRuntimeState) loadBanStateWithConfirmationMode(path string, re
 	s.banResetMu.Unlock()
 	s.mu.Lock()
 	s.serialActiveAuthID = strings.TrimSpace(state.SerialActiveAuthID)
+	s.serialSelectionSource = normalizeSerialSelectionSource(state.SerialSelectionSource)
+	if s.serialActiveAuthID == "" {
+		s.serialSelectionSource = "auto"
+	}
 	if state.SerialOverdraft != nil {
 		s.serialOverdraft = make(map[string]serialOverdraftBinding, len(state.SerialOverdraft))
 		now := time.Now()
@@ -1571,6 +1578,7 @@ func (s *schedulerRuntimeState) persistBanState() bool {
 	s.mu.RLock()
 	path := strings.TrimSpace(s.cfg.StatePath)
 	serialActiveAuthID := strings.TrimSpace(s.serialActiveAuthID)
+	serialSelectionSource := normalizeSerialSelectionSource(s.serialSelectionSource)
 	serialSelectedAt := s.serialSelectedAt
 	serialSwitches := s.serialSwitches
 	serialFallbacks := s.serialFallbacks
@@ -1609,6 +1617,7 @@ func (s *schedulerRuntimeState) persistBanState() bool {
 		Warmups:                warmups,
 		BanResetConfirmations:  confirmations,
 		SerialActiveAuthID:     serialActiveAuthID,
+		SerialSelectionSource:  serialSelectionSource,
 		SerialSelectedAt:       serialSelectedAt,
 		SerialSwitches:         serialSwitches,
 		SerialFallbacks:        serialFallbacks,
@@ -1666,6 +1675,10 @@ type runtimeStatus struct {
 	SchedulerMode            string                   `json:"scheduler_mode"`
 	SerialSwitchPercent      float64                  `json:"serial_switch_percent"`
 	DrainWindowHours         float64                  `json:"drain_window_hours"`
+	WarmupModel              string                   `json:"warmup_model"`
+	SerialSelectionSource    string                   `json:"serial_selection_source"`
+	SerialManualSelection    bool                     `json:"serial_manual_selection"`
+	SerialManualActiveAuthID string                   `json:"serial_manual_active_auth_id,omitempty"`
 	SerialActiveAuthID       string                   `json:"serial_active_auth_id,omitempty"`
 	SerialSelectedAt         string                   `json:"serial_selected_at,omitempty"`
 	SerialSwitches           uint64                   `json:"serial_switches"`
@@ -1894,6 +1907,7 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 	sessionSwitches := s.sessionSwitches
 	shadowDisagreements := s.shadowDisagreements
 	serialActiveAuthID := s.serialActiveAuthID
+	serialSelectionSource := normalizeSerialSelectionSource(s.serialSelectionSource)
 	serialSelectedAt := s.serialSelectedAt
 	serialSwitches := s.serialSwitches
 	serialFallbacks := s.serialFallbacks
@@ -2138,64 +2152,68 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 	}
 
 	out := runtimeStatus{
-		Enabled:                 cfg.Enabled,
-		SchedulerMode:           cfg.SchedulerMode,
-		SerialSwitchPercent:     cfg.SerialSwitchPercent,
-		DrainWindowHours:        cfg.DrainWindowHours,
-		SerialActiveAuthID:      serialActiveAuthID,
-		SerialSwitches:          serialSwitches,
-		SerialFallbacks:         serialFallbacks,
-		SerialFallbackAuth:      serialFallbackAuthID,
-		SerialMissingCount:      serialMissingCount,
-		SerialSwitchReason:      serialLastSwitchReason,
-		SerialOverdraftSessions: serialOverdraftSessions,
-		ConfigGeneration:        configGeneration,
-		RuntimeGeneration:       generation.Ticket,
-		GenerationManaged:       generation.Managed,
-		GenerationClaimed:       generation.Claimed,
-		GenerationActive:        generation.Active,
-		GenerationReleased:      generation.Released,
-		GenerationSuperseded:    generation.Superseded,
-		GenerationObserved:      generation.ObservedGeneration,
-		GenerationOwner:         generation.OwnerFingerprint,
-		GenerationReason:        generation.SupersedeReason,
-		KeeperConfigured:        strings.TrimSpace(cfg.KeeperURL) != "",
-		WarmupEnabled:           cfg.WarmupEnabled,
-		WarmupExecutionMode:     normalizeWarmupExecutionMode(cfg.WarmupExecutionMode),
-		Refreshes:               refreshes,
-		FreshSnapshots:          count,
-		WindowOrder:             append([]string(nil), cfg.WindowOrder...),
-		PricingModels:           pricingModels,
-		CostProfiles:            costProfiles,
-		Pacing:                  pacing,
-		StickyBindings:          stickyBindings,
-		SessionSwitches:         sessionSwitches,
-		ShadowDisagreements:     shadowDisagreements,
-		WarmupCandidates:        warmupCandidates,
-		WarmupSkippedBanned:     warmupSkippedBanned,
-		WarmupSkippedStale:      warmupSkippedStale,
-		WarmupSkippedIneligible: warmupSkippedIneligible,
-		WarmupSkippedNotNeeded:  warmupSkippedNotNeeded,
-		WarmupAuthSource:        warmupAuthSource,
-		WarmupAuthFilesSeen:     warmupAuthFilesSeen,
-		WarmupAuthEligible:      warmupAuthEligible,
-		WarmupAuthRejected:      warmupAuthRejected,
-		WarmupAuthLastError:     warmupAuthLastError,
-		KeeperRefreshTargets:    keeperRefreshTargets,
-		KeeperRefreshRequests:   keeperRefreshRequests,
-		KeeperRefreshAttempt:    keeperRefreshAttempt,
-		KeeperRefreshAccepted:   keeperRefreshAccepted,
-		KeeperRefreshSkipped:    keeperRefreshSkipped,
-		KeeperRefreshRejected:   keeperRefreshRejected,
-		KeeperRefreshError:      keeperRefreshLastError,
-		KeeperRefreshRecoveries: keeperRefreshRecoveries,
-		BanResetPending:         banResetPending,
-		BanResetEvents:          banResetEvents,
-		BanExternalClears:       banExternalClears,
-		LastBanClearReason:      lastBanClearReason,
-		Quarantine:              quarantine,
-		LastError:               lastError,
-		Snapshots:               snapshots,
+		Enabled:                  cfg.Enabled,
+		SchedulerMode:            cfg.SchedulerMode,
+		SerialSwitchPercent:      cfg.SerialSwitchPercent,
+		DrainWindowHours:         cfg.DrainWindowHours,
+		WarmupModel:              cfg.WarmupModel,
+		SerialActiveAuthID:       serialActiveAuthID,
+		SerialSelectionSource:    serialSelectionSource,
+		SerialManualSelection:    serialSelectionSource == "manual" && strings.TrimSpace(serialActiveAuthID) != "",
+		SerialManualActiveAuthID: "",
+		SerialSwitches:           serialSwitches,
+		SerialFallbacks:          serialFallbacks,
+		SerialFallbackAuth:       serialFallbackAuthID,
+		SerialMissingCount:       serialMissingCount,
+		SerialSwitchReason:       serialLastSwitchReason,
+		SerialOverdraftSessions:  serialOverdraftSessions,
+		ConfigGeneration:         configGeneration,
+		RuntimeGeneration:        generation.Ticket,
+		GenerationManaged:        generation.Managed,
+		GenerationClaimed:        generation.Claimed,
+		GenerationActive:         generation.Active,
+		GenerationReleased:       generation.Released,
+		GenerationSuperseded:     generation.Superseded,
+		GenerationObserved:       generation.ObservedGeneration,
+		GenerationOwner:          generation.OwnerFingerprint,
+		GenerationReason:         generation.SupersedeReason,
+		KeeperConfigured:         strings.TrimSpace(cfg.KeeperURL) != "",
+		WarmupEnabled:            cfg.WarmupEnabled,
+		WarmupExecutionMode:      normalizeWarmupExecutionMode(cfg.WarmupExecutionMode),
+		Refreshes:                refreshes,
+		FreshSnapshots:           count,
+		WindowOrder:              append([]string(nil), cfg.WindowOrder...),
+		PricingModels:            pricingModels,
+		CostProfiles:             costProfiles,
+		Pacing:                   pacing,
+		StickyBindings:           stickyBindings,
+		SessionSwitches:          sessionSwitches,
+		ShadowDisagreements:      shadowDisagreements,
+		WarmupCandidates:         warmupCandidates,
+		WarmupSkippedBanned:      warmupSkippedBanned,
+		WarmupSkippedStale:       warmupSkippedStale,
+		WarmupSkippedIneligible:  warmupSkippedIneligible,
+		WarmupSkippedNotNeeded:   warmupSkippedNotNeeded,
+		WarmupAuthSource:         warmupAuthSource,
+		WarmupAuthFilesSeen:      warmupAuthFilesSeen,
+		WarmupAuthEligible:       warmupAuthEligible,
+		WarmupAuthRejected:       warmupAuthRejected,
+		WarmupAuthLastError:      warmupAuthLastError,
+		KeeperRefreshTargets:     keeperRefreshTargets,
+		KeeperRefreshRequests:    keeperRefreshRequests,
+		KeeperRefreshAttempt:     keeperRefreshAttempt,
+		KeeperRefreshAccepted:    keeperRefreshAccepted,
+		KeeperRefreshSkipped:     keeperRefreshSkipped,
+		KeeperRefreshRejected:    keeperRefreshRejected,
+		KeeperRefreshError:       keeperRefreshLastError,
+		KeeperRefreshRecoveries:  keeperRefreshRecoveries,
+		BanResetPending:          banResetPending,
+		BanResetEvents:           banResetEvents,
+		BanExternalClears:        banExternalClears,
+		LastBanClearReason:       lastBanClearReason,
+		Quarantine:               quarantine,
+		LastError:                lastError,
+		Snapshots:                snapshots,
 	}
 	if !generation.ClaimedAt.IsZero() {
 		out.GenerationClaimedAt = generation.ClaimedAt.Format(time.RFC3339)
@@ -2210,6 +2228,9 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 		out.KeeperRefreshNextAt = keeperRefreshNextAt.Format(time.RFC3339)
 	}
 	if !serialSelectedAt.IsZero() {
+		if out.SerialManualSelection {
+			out.SerialManualActiveAuthID = strings.TrimSpace(serialActiveAuthID)
+		}
 		out.SerialSelectedAt = serialSelectedAt.Format(time.RFC3339)
 	}
 	if !serialMissingSince.IsZero() {

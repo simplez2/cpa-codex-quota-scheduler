@@ -105,7 +105,7 @@ import (
 
 const (
 	pluginName    = "codex-quota-scheduler"
-	pluginVersion = "0.1.17"
+	pluginVersion = "0.1.18"
 
 	// providerCodex is the CPA provider key for OpenAI Codex (ChatGPT backend).
 	providerCodex = "codex"
@@ -876,6 +876,16 @@ func managementRegistration() pluginapi.ManagementRegistrationResponse {
 				Description: "Show the active serial auth, Keeper freshness, pacing diagnostics, and redacted decisions.",
 			},
 			{
+				Method:      http.MethodPut,
+				Path:        managementRoutePrefix + "/serial-active",
+				Description: `Select one currently active, fresh, eligible Codex credential as the serial primary. Body: {"auth_id":"..."}.`,
+			},
+			{
+				Method:      http.MethodDelete,
+				Path:        managementRoutePrefix + "/serial-active",
+				Description: "Clear the manual serial primary and return account selection to automatic mode.",
+			},
+			{
 				Method:      http.MethodPost,
 				Path:        managementRoutePrefix + "/warmup-retry",
 				Description: `Explicitly clear a blocked warmup result after the credential or configuration was repaired. Body: {"auth_id":"..."} or {"all":true}.`,
@@ -907,6 +917,10 @@ func dispatchManagement(req pluginapi.ManagementRequest) pluginapi.ManagementRes
 		return handleManagementUnbanAll()
 	case method == http.MethodGet && matchesManagementPath(req.Path, "/quota"):
 		return jsonManagementResponse(http.StatusOK, schedulerRuntime.status())
+	case method == http.MethodPut && matchesManagementPath(req.Path, "/serial-active"):
+		return handleManagementSerialActivePut(req)
+	case method == http.MethodDelete && matchesManagementPath(req.Path, "/serial-active"):
+		return handleManagementSerialActiveDelete(req)
 	case method == http.MethodPost && matchesManagementPath(req.Path, "/warmup-retry"):
 		return handleManagementWarmupRetry(req)
 	default:

@@ -384,6 +384,7 @@ func (s *schedulerRuntimeState) serialPick(req pluginapi.SchedulerPickRequest, n
 			windowRankInOrder(choices[0].WindowClass, cfg.WindowOrder) < currentRank {
 			selected := choices[0].Candidate.ID
 			s.serialActiveAuthID = selected
+			s.serialSelectionSource = "auto"
 			s.serialSelectedAt = now
 			s.serialSwitches++
 			s.serialLastSwitchAt = now
@@ -442,6 +443,7 @@ func (s *schedulerRuntimeState) serialPick(req pluginapi.SchedulerPickRequest, n
 			return pluginapi.SchedulerPickResponse{AuthID: selected, Handled: true}
 		}
 		s.serialActiveAuthID = selected
+		s.serialSelectionSource = "auto"
 		s.serialSelectedAt = now
 		s.serialSwitches++
 		s.serialLastSwitchAt = now
@@ -457,6 +459,7 @@ func (s *schedulerRuntimeState) serialPick(req pluginapi.SchedulerPickRequest, n
 	if len(choices) == 0 {
 		if previous != "" {
 			s.serialActiveAuthID = ""
+			s.serialSelectionSource = "auto"
 			s.serialSelectedAt = time.Time{}
 			s.serialSwitches++
 			s.serialLastSwitchAt = now
@@ -483,6 +486,7 @@ func (s *schedulerRuntimeState) serialPick(req pluginapi.SchedulerPickRequest, n
 		reason = "threshold_fallback"
 	}
 	s.serialActiveAuthID = selected
+	s.serialSelectionSource = "auto"
 	s.serialSelectedAt = now
 	s.serialLastSwitchAt = now
 	s.serialLastSwitchReason = reason
@@ -512,10 +516,18 @@ func (s *schedulerRuntimeState) markSerialUnavailable(authID, reason string, now
 		return false
 	}
 	s.serialActiveAuthID = ""
+	s.serialSelectionSource = "auto"
 	s.serialSelectedAt = time.Time{}
 	s.serialSwitches++
 	s.serialLastSwitchAt = now
 	s.serialLastSwitchReason = strings.TrimSpace(reason)
 	s.resetSerialMissingLocked()
 	return true
+}
+
+func normalizeSerialSelectionSource(source string) string {
+	if strings.EqualFold(strings.TrimSpace(source), "manual") {
+		return "manual"
+	}
+	return "auto"
 }

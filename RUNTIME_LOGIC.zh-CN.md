@@ -1,6 +1,6 @@
 # Codex Quota Scheduler 运行逻辑与状态机
 
-本文描述 v0.1.17 源码的真实运行逻辑，供代码审查、生产验收和故障定位使用。只有匹配 tag 与 Release 资产均存在时，才视为正式发布。
+本文描述 v0.1.18 源码的真实运行逻辑，供代码审查、生产验收和故障定位使用。只有匹配 tag 与 Release 资产均存在时，才视为正式发布。
 
 ## 1. 数据来源与可信度
 
@@ -139,7 +139,7 @@ warmup_candidates=0 只说明当前轮没有可执行候选，不等于功能关
 
 ## 7. 平台批量重置与新周期识别
 
-Keeper 的 usage identity 清单会保留 disabled 历史行。v0.1.17 首先按 Keeper 同步的 `disabled/is_deleted` 排除这些行，并拒绝提交未请求的历史 cache item；真正发起 `/quota/refresh` 前，还必须与 CPA 当前 active、非 unavailable 的 Codex auth index 求交集。Host/Management 身份清单不可用时，仅跳过有副作用的 refresh 并记录 `auth_inventory_unavailable`，已读取的配额快照仍可提交。该规则同时覆盖常规 stale/missing 刷新与 ban reset 二次确认，不区分 OAuth 或 PAT，也不会调用 reset-credit 消费接口。
+Keeper 的 usage identity 清单会保留 disabled 历史行。v0.1.18 首先按 Keeper 同步的 `disabled/is_deleted` 排除这些行，并拒绝提交未请求的历史 cache item；真正发起 `/quota/refresh` 前，还必须与 CPA 当前 active、非 unavailable 的 Codex auth index 求交集。Host/Management 身份清单不可用时，仅跳过有副作用的 refresh 并记录 `auth_inventory_unavailable`，已读取的配额快照仍可提交。该规则同时覆盖常规 stale/missing 刷新与 ban reset 二次确认，不区分 OAuth 或 PAT，也不会调用 reset-credit 消费接口。
 
 当平台提前把多个账号恢复为 0% 时，旧 quota ban 不能立即相信，也不能永久保留。对账必须满足：
 
@@ -156,7 +156,7 @@ Keeper 的 usage identity 清单会保留 disabled 历史行。v0.1.17 首先按
 
 ## 8. 热加载与 generation ownership
 
-CPA 热重载可能让新旧动态库 generation 短时间同时存在。v0.1.17 使用两层互斥：
+CPA 热重载可能让新旧动态库 generation 短时间同时存在。v0.1.18 使用两层互斥：
 
 - Generation record：state_path.generation 记录当前 owner。新 generation 原子认领后，旧 generation 发现被替代便停止刷新、调度副作用和完整状态写入。
 - Warmup instance lease：state_path.warmup.lock 使用 OS 文件锁，保证跨进程同时只有一个预热执行者。
