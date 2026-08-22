@@ -1012,8 +1012,27 @@ func TestWarmupSnapshotFreshRequiresOwnObservationForEveryRecognizedWindow(t *te
 	}
 }
 
+func TestExecuteWarmupRejectsUnsafeModelBeforeTransport(t *testing.T) {
+	cfg := defaultPluginConfig()
+	cfg.StatePath = ""
+	cfg.CPAManagementURL = "http://127.0.0.1:1/transport-must-not-run"
+	cfg.WarmupModel = "gpt-safe\r\nX-Injected: true"
+	state := schedulerRuntimeState{cfg: cfg, warmups: make(map[string]warmupEntry)}
+	candidate := warmupCandidate{
+		Snapshot: quotaSnapshot{AuthID: "acct", AuthIndex: "idx"},
+		Window:   quotaWindow{Class: "weekly", Allowed: true},
+	}
+
+	state.executeWarmup(context.Background(), cfg, candidate)
+	entry := state.warmups[warmupKey("acct", "weekly")]
+	if entry.Error == "" {
+		t.Fatalf("unsafe model did not produce a warmup error: %#v", entry)
+	}
+}
+
 func TestWarmupHeaderless429EntersProbation(t *testing.T) {
 	resetBanStoreForTest()
+	const futureModel = "openai/gpt-6.preview:2027"
 	keyPath := filepath.Join(t.TempDir(), "management-key")
 	if err := os.WriteFile(keyPath, []byte("secret\n"), 0600); err != nil {
 		t.Fatal(err)
@@ -1027,6 +1046,20 @@ func TestWarmupHeaderless429EntersProbation(t *testing.T) {
 			_, _ = w.Write([]byte(`{"files":[{"id":"acct","auth_index":"idx","provider":"codex","status":"active","note":"Agent Identity via sidecar"}]}`))
 			return
 		}
+		var request cpaAPICallRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode api-call request: %v", err)
+		} else {
+			if request.Header["X-Codex-Routing-Hint"] != "model="+futureModel {
+				t.Errorf("routing hint = %q", request.Header["X-Codex-Routing-Hint"])
+			}
+			var payload map[string]any
+			if err := json.Unmarshal([]byte(request.Data), &payload); err != nil {
+				t.Errorf("decode warmup payload: %v", err)
+			} else if payload["model"] != futureModel {
+				t.Errorf("warmup payload model = %#v", payload["model"])
+			}
+		}
 		if err := json.NewEncoder(w).Encode(cpaAPICallResponse{StatusCode: statusTooManyRequests}); err != nil {
 			t.Errorf("encode response: %v", err)
 		}
@@ -1037,6 +1070,7 @@ func TestWarmupHeaderless429EntersProbation(t *testing.T) {
 	cfg.CPAManagementURL = server.URL
 	cfg.CPAManagementKeyFile = keyPath
 	cfg.StatePath = ""
+	cfg.WarmupModel = futureModel
 	state := schedulerRuntimeState{cfg: cfg, warmups: make(map[string]warmupEntry)}
 	candidate := warmupCandidate{
 		Snapshot: quotaSnapshot{AuthID: "acct", AuthIndex: "idx"},

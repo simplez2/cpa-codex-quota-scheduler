@@ -1,11 +1,14 @@
 package main
 
 import (
+	"fmt"
 	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
 )
+
+const maxWarmupModelLength = 256
 
 // pluginConfig is deliberately made up of ordinary scalar values.  CPA sends
 // the plugin configuration as YAML on every register/reconfigure call, while
@@ -182,7 +185,11 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 		cfg.WarmupExecutionMode = strings.TrimSpace(in.WarmupExecutionMode)
 	}
 	if strings.TrimSpace(in.WarmupModel) != "" {
-		cfg.WarmupModel = strings.TrimSpace(in.WarmupModel)
+		model, err := validateWarmupModel(in.WarmupModel)
+		if err != nil {
+			return cfg, err
+		}
+		cfg.WarmupModel = model
 	}
 	if strings.TrimSpace(in.WarmupSidecarURL) != "" {
 		cfg.WarmupSidecarURL = strings.TrimRight(strings.TrimSpace(in.WarmupSidecarURL), "/")
@@ -358,6 +365,28 @@ func normalizeWarmupExecutionMode(raw string) string {
 	default:
 		return "management"
 	}
+}
+
+func validateWarmupModel(raw string) (string, error) {
+	model := strings.TrimSpace(raw)
+	if model == "" {
+		return "", fmt.Errorf("warmup_model must not be empty")
+	}
+	if len(model) > maxWarmupModelLength {
+		return "", fmt.Errorf("warmup_model exceeds %d bytes", maxWarmupModelLength)
+	}
+	for _, char := range model {
+		if char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' || char >= '0' && char <= '9' {
+			continue
+		}
+		switch char {
+		case '-', '_', '.', '/', ':':
+			continue
+		default:
+			return "", fmt.Errorf("warmup_model contains a character that is unsafe for an HTTP header")
+		}
+	}
+	return model, nil
 }
 
 func parseDuration(raw string) (time.Duration, bool) {

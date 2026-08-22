@@ -313,6 +313,36 @@ func TestSchedulerConfigDefaultsToSerialAndValidatesThreshold(t *testing.T) {
 	}
 }
 
+func TestWarmupModelAcceptsFutureIDsAndRejectsHeaderUnsafeValues(t *testing.T) {
+	const futureModel = "openai/gpt-6.preview:2027"
+	cfg, err := parsePluginConfig([]byte("warmup_model: " + futureModel + "\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.WarmupModel != futureModel {
+		t.Fatalf("future warmup model = %q; want %q", cfg.WarmupModel, futureModel)
+	}
+
+	invalid := map[string]string{
+		"crlf":        "gpt-safe\r\nX-Injected: true",
+		"space":       "gpt future",
+		"unicode":     "gpt-未来",
+		"too_long":    strings.Repeat("a", maxWarmupModelLength+1),
+		"header_meta": "gpt-safe;unsafe",
+	}
+	for name, model := range invalid {
+		t.Run(name, func(t *testing.T) {
+			raw, err := yaml.Marshal(yamlPluginConfig{WarmupModel: model})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := parsePluginConfig(raw); err == nil {
+				t.Fatalf("unsafe warmup model %q was accepted", model)
+			}
+		})
+	}
+}
+
 func TestPluginRegistrationExposesKeeperRefreshCooldown(t *testing.T) {
 	registration := pluginRegistration()
 	matched := 0

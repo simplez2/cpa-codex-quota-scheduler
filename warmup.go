@@ -776,6 +776,12 @@ func retryableWarmupFromPriorGeneration(entry warmupEntry, generationClaimedAt t
 }
 
 func (s *schedulerRuntimeState) executeWarmup(parent context.Context, cfg pluginConfig, candidate warmupCandidate) {
+	model, err := validateWarmupModel(cfg.WarmupModel)
+	if err != nil {
+		s.recordWarmupError(candidate, 0, err)
+		return
+	}
+	cfg.WarmupModel = model
 	if nativeWarmupRequested(cfg) {
 		s.executeNativeWarmup(parent, cfg, candidate)
 		return

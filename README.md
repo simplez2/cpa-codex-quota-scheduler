@@ -11,7 +11,7 @@
   </p>
 </div>
 
-> **Version note:** the source and registry declare plugin version **v0.1.18**. A build is a published release only after the matching `v0.1.18` tag and release assets are available.
+> **Version note:** the source and registry declare plugin version **v0.1.19**. A build is a published release only after the matching `v0.1.19` tag and release assets are available.
 
 The plugin keeps normal Codex traffic on one globally committed credential. It switches only when quota policy, an authoritative 429, quarantine, or confirmed candidate loss requires it. Fully available accounts can be activated separately, one at a time, without turning normal traffic into round-robin usage.
 

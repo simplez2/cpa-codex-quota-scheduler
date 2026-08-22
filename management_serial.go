@@ -123,6 +123,12 @@ func (s *schedulerRuntimeState) setManualSerialActive(requestedAuthID string, no
 			Status: http.StatusConflict, Code: "serial_mode_required", Message: "manual primary selection requires scheduler_mode=serial",
 		}
 	}
+	s.mu.RLock()
+	alreadySelected := strings.TrimSpace(s.serialActiveAuthID) == requestedAuthID && normalizeSerialSelectionSource(s.serialSelectionSource) == "manual"
+	s.mu.RUnlock()
+	if alreadySelected {
+		return manualSerialActiveResult{changed: false}, nil
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	files, err := cpaManagementAuthFiles(ctx, cfg)
@@ -172,13 +178,24 @@ func (s *schedulerRuntimeState) setManualSerialActive(requestedAuthID string, no
 	s.mu.Lock()
 	previousAuthID := s.serialActiveAuthID
 	previousSource := s.serialSelectionSource
+	if strings.TrimSpace(previousAuthID) == canonicalAuthID && normalizeSerialSelectionSource(previousSource) == "manual" {
+		s.mu.Unlock()
+		return manualSerialActiveResult{changed: false}, nil
+	}
 	previousSelectedAt := s.serialSelectedAt
+	previousSwitches := s.serialSwitches
 	previousLastSwitchAt := s.serialLastSwitchAt
 	previousLastSwitchReason := s.serialLastSwitchReason
-	changed := strings.TrimSpace(previousAuthID) != canonicalAuthID || normalizeSerialSelectionSource(previousSource) != "manual"
+	previousMissingAuthID := s.serialMissingAuthID
+	previousFallbackAuthID := s.serialFallbackAuthID
+	previousMissingSince := s.serialMissingSince
+	previousMissingCount := s.serialMissingCount
 	s.serialActiveAuthID = canonicalAuthID
 	s.serialSelectionSource = "manual"
 	s.serialSelectedAt = now
+	if strings.TrimSpace(previousAuthID) != canonicalAuthID {
+		s.serialSwitches++
+	}
 	s.serialLastSwitchAt = now
 	s.serialLastSwitchReason = "manual_selection"
 	s.resetSerialMissingLocked()
@@ -190,15 +207,20 @@ func (s *schedulerRuntimeState) setManualSerialActive(requestedAuthID string, no
 			s.serialActiveAuthID = previousAuthID
 			s.serialSelectionSource = previousSource
 			s.serialSelectedAt = previousSelectedAt
+			s.serialSwitches = previousSwitches
 			s.serialLastSwitchAt = previousLastSwitchAt
 			s.serialLastSwitchReason = previousLastSwitchReason
+			s.serialMissingAuthID = previousMissingAuthID
+			s.serialFallbackAuthID = previousFallbackAuthID
+			s.serialMissingSince = previousMissingSince
+			s.serialMissingCount = previousMissingCount
 		}
 		s.mu.Unlock()
 		return manualSerialActiveResult{}, &managementSerialActiveError{
 			Status: http.StatusServiceUnavailable, Code: "state_persistence_failed", Message: "manual selection was not persisted",
 		}
 	}
-	return manualSerialActiveResult{changed: changed}, nil
+	return manualSerialActiveResult{changed: true}, nil
 }
 
 func (s *schedulerRuntimeState) clearManualSerialActive(now time.Time) (manualSerialActiveResult, error) {
@@ -217,11 +239,19 @@ func (s *schedulerRuntimeState) clearManualSerialActive(now time.Time) (manualSe
 	previousAuthID := s.serialActiveAuthID
 	previousSource := s.serialSelectionSource
 	previousSelectedAt := s.serialSelectedAt
+	previousSwitches := s.serialSwitches
 	previousLastSwitchAt := s.serialLastSwitchAt
 	previousLastSwitchReason := s.serialLastSwitchReason
+	previousMissingAuthID := s.serialMissingAuthID
+	previousFallbackAuthID := s.serialFallbackAuthID
+	previousMissingSince := s.serialMissingSince
+	previousMissingCount := s.serialMissingCount
 	s.serialActiveAuthID = ""
 	s.serialSelectionSource = "auto"
 	s.serialSelectedAt = time.Time{}
+	if strings.TrimSpace(previousAuthID) != "" {
+		s.serialSwitches++
+	}
 	s.serialLastSwitchAt = now
 	s.serialLastSwitchReason = "manual_clear"
 	s.resetSerialMissingLocked()
@@ -232,8 +262,13 @@ func (s *schedulerRuntimeState) clearManualSerialActive(now time.Time) (manualSe
 			s.serialActiveAuthID = previousAuthID
 			s.serialSelectionSource = previousSource
 			s.serialSelectedAt = previousSelectedAt
+			s.serialSwitches = previousSwitches
 			s.serialLastSwitchAt = previousLastSwitchAt
 			s.serialLastSwitchReason = previousLastSwitchReason
+			s.serialMissingAuthID = previousMissingAuthID
+			s.serialFallbackAuthID = previousFallbackAuthID
+			s.serialMissingSince = previousMissingSince
+			s.serialMissingCount = previousMissingCount
 		}
 		s.mu.Unlock()
 		return manualSerialActiveResult{}, &managementSerialActiveError{

@@ -1,4 +1,4 @@
-# Recommended configuration for Codex Quota Scheduler v0.1.18.
+# Recommended configuration for Codex Quota Scheduler v0.1.19.
 # Secrets stay in mounted files. This plugin does not change model names,
 # provider routes, OAuth/PAT state, or third-party APIs.
 plugins:

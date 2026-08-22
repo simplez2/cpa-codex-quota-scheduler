@@ -94,6 +94,9 @@ func TestManualSerialSelectionSupportsOAuthAndPATAndPersists(t *testing.T) {
 	if _, err := state.setManualSerialActive("pat.json", now.Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
+	if state.serialSwitches != 2 {
+		t.Fatalf("manual account transitions = %d; want 2", state.serialSwitches)
+	}
 	raw, err := os.ReadFile(state.cfg.StatePath)
 	if err != nil {
 		t.Fatal(err)
@@ -110,6 +113,37 @@ func TestManualSerialSelectionSupportsOAuthAndPATAndPersists(t *testing.T) {
 	t.Cleanup(newOwner.stop)
 	if newOwner.serialActiveAuthID != "pat-auth" || normalizeSerialSelectionSource(newOwner.serialSelectionSource) != "manual" {
 		t.Fatalf("hot reload lost manual state auth=%q source=%q", newOwner.serialActiveAuthID, newOwner.serialSelectionSource)
+	}
+}
+
+func TestManualSerialSelectionRepeatedPutIsNoOp(t *testing.T) {
+	resetBanStoreForTest()
+	t.Cleanup(resetBanStoreForTest)
+	now := time.Now().UTC().Truncate(time.Second)
+	state := newManualSelectionRuntime(t, []cpaAuthFileEntry{{ID: "active", AuthIndex: "active-index", Provider: providerCodex, Status: "active"}}, map[string]quotaSnapshot{
+		"active": freshManualQuota("active", "active-index", 5, now),
+	})
+	if result, err := state.setManualSerialActive("active", now); err != nil || !result.changed {
+		t.Fatalf("initial manual selection result=%#v err=%v", result, err)
+	}
+	selectedAt := state.serialSelectedAt
+	lastSwitchAt := state.serialLastSwitchAt
+	lastSwitchReason := state.serialLastSwitchReason
+	switches := state.serialSwitches
+	state.serialMissingAuthID = "missing"
+	state.serialFallbackAuthID = "fallback"
+	state.serialMissingSince = now.Add(-time.Minute)
+	state.serialMissingCount = 2
+
+	state.cfg.CPAManagementURL = "http://127.0.0.1:1/true-no-op-must-not-read-inventory"
+	if result, err := state.setManualSerialActive("active", now.Add(time.Minute)); err != nil || result.changed {
+		t.Fatalf("repeated manual selection result=%#v err=%v", result, err)
+	}
+	if !state.serialSelectedAt.Equal(selectedAt) || !state.serialLastSwitchAt.Equal(lastSwitchAt) || state.serialLastSwitchReason != lastSwitchReason || state.serialSwitches != switches {
+		t.Fatalf("no-op changed switch metadata: selected=%v last=%v reason=%q switches=%d", state.serialSelectedAt, state.serialLastSwitchAt, state.serialLastSwitchReason, state.serialSwitches)
+	}
+	if state.serialMissingAuthID != "missing" || state.serialFallbackAuthID != "fallback" || !state.serialMissingSince.Equal(now.Add(-time.Minute)) || state.serialMissingCount != 2 {
+		t.Fatalf("no-op changed missing state: auth=%q fallback=%q since=%v count=%d", state.serialMissingAuthID, state.serialFallbackAuthID, state.serialMissingSince, state.serialMissingCount)
 	}
 }
 
@@ -177,12 +211,60 @@ func TestClearManualSerialSelectionPersistsAutoMode(t *testing.T) {
 	if result, err := state.clearManualSerialActive(now.Add(time.Second)); err != nil || !result.changed {
 		t.Fatalf("clear result=%#v err=%v", result, err)
 	}
+	if state.serialSwitches != 2 {
+		t.Fatalf("manual select plus clear transitions = %d; want 2", state.serialSwitches)
+	}
 	status := state.status()
 	if result, err := state.clearManualSerialActive(now.Add(2 * time.Second)); err != nil || result.changed {
 		t.Fatalf("automatic clear should be a no-op result=%#v err=%v", result, err)
 	}
 	if status.SerialActiveAuthID != "" || status.SerialSelectionSource != "auto" || status.SerialManualSelection || status.SerialManualActiveAuthID != "" {
 		t.Fatalf("auto status=%#v", status)
+	}
+}
+
+func TestManualSerialPersistenceFailureRestoresAllRuntimeState(t *testing.T) {
+	resetBanStoreForTest()
+	t.Cleanup(resetBanStoreForTest)
+	now := time.Now().UTC().Truncate(time.Second)
+	files := []cpaAuthFileEntry{
+		{ID: "existing", AuthIndex: "existing-index", Provider: providerCodex, Status: "active"},
+		{ID: "replacement", AuthIndex: "replacement-index", Provider: providerCodex, Status: "active"},
+	}
+	state := newManualSelectionRuntime(t, files, map[string]quotaSnapshot{
+		"existing":    freshManualQuota("existing", "existing-index", 5, now),
+		"replacement": freshManualQuota("replacement", "replacement-index", 10, now),
+	})
+	state.serialActiveAuthID = "existing"
+	state.serialSelectionSource = "manual"
+	state.serialSelectedAt = now.Add(-2 * time.Hour)
+	state.serialSwitches = 7
+	state.serialLastSwitchAt = now.Add(-time.Hour)
+	state.serialLastSwitchReason = "prior"
+	state.serialMissingAuthID = "missing"
+	state.serialFallbackAuthID = "fallback"
+	state.serialMissingSince = now.Add(-time.Minute)
+	state.serialMissingCount = 2
+	state.cfg.StatePath = t.TempDir()
+
+	if _, err := state.setManualSerialActive("replacement", now); err == nil {
+		t.Fatal("manual selection unexpectedly persisted to a directory")
+	}
+	assertManualRuntimeRestored(t, state, "existing", "manual", now.Add(-2*time.Hour), 7, now.Add(-time.Hour), "prior", "missing", "fallback", now.Add(-time.Minute), 2)
+
+	if _, err := state.clearManualSerialActive(now); err == nil {
+		t.Fatal("manual clear unexpectedly persisted to a directory")
+	}
+	assertManualRuntimeRestored(t, state, "existing", "manual", now.Add(-2*time.Hour), 7, now.Add(-time.Hour), "prior", "missing", "fallback", now.Add(-time.Minute), 2)
+}
+
+func assertManualRuntimeRestored(t *testing.T, state *schedulerRuntimeState, authID, source string, selectedAt time.Time, switches uint64, lastSwitchAt time.Time, reason, missingAuthID, fallbackAuthID string, missingSince time.Time, missingCount int) {
+	t.Helper()
+	if state.serialActiveAuthID != authID || state.serialSelectionSource != source || !state.serialSelectedAt.Equal(selectedAt) || state.serialSwitches != switches || !state.serialLastSwitchAt.Equal(lastSwitchAt) || state.serialLastSwitchReason != reason {
+		t.Fatalf("switch state was not restored: auth=%q source=%q selected=%v switches=%d last=%v reason=%q", state.serialActiveAuthID, state.serialSelectionSource, state.serialSelectedAt, state.serialSwitches, state.serialLastSwitchAt, state.serialLastSwitchReason)
+	}
+	if state.serialMissingAuthID != missingAuthID || state.serialFallbackAuthID != fallbackAuthID || !state.serialMissingSince.Equal(missingSince) || state.serialMissingCount != missingCount {
+		t.Fatalf("missing state was not restored: auth=%q fallback=%q since=%v count=%d", state.serialMissingAuthID, state.serialFallbackAuthID, state.serialMissingSince, state.serialMissingCount)
 	}
 }
 
