@@ -448,6 +448,25 @@ func TestWarmupSuppressionDiscardsLifecycleCancellation(t *testing.T) {
 	s.warmupMu.Unlock()
 }
 
+func TestWarmupSuppressionKeepsReturnedHTTPStatusDuringBackoff(t *testing.T) {
+	now := time.Now()
+	key := warmupKey("a", "weekly")
+	s := &schedulerRuntimeState{warmups: map[string]warmupEntry{
+		key: {
+			AuthID: "a", Window: "weekly", AttemptedAt: now.Add(-time.Second),
+			Status: http.StatusOK, Error: "cancelled",
+		},
+	}}
+	s.warmupMu.Lock()
+	if !s.warmupSuppressedLocked(key, now, 15*time.Minute) {
+		t.Fatal("an attempt with a returned HTTP status must obey retry_after")
+	}
+	if _, ok := s.warmups[key]; !ok {
+		t.Fatal("returned HTTP outcome must not be discarded as lifecycle cancellation")
+	}
+	s.warmupMu.Unlock()
+}
+
 func TestWarmupSuppressionKeepsBlockedCancellation(t *testing.T) {
 	now := time.Now()
 	key := warmupKey("a", "weekly")
@@ -473,7 +492,7 @@ func TestPriorGenerationWarmupRetryIsOneShot(t *testing.T) {
 	key := warmupKey("acct", "5h")
 	candidate := warmupCandidate{Snapshot: quotaSnapshot{AuthID: "acct"}, Window: quotaWindow{Class: "5h"}}
 	state := &schedulerRuntimeState{warmups: map[string]warmupEntry{
-		key: {AuthID: "acct", Window: "5h", AttemptedAt: claimedAt.Add(-time.Second), Error: "warmup_failed"},
+		key: {AuthID: "acct", Window: "5h", AttemptedAt: claimedAt.Add(-time.Second)},
 	}}
 
 	state.warmupMu.Lock()
@@ -486,7 +505,7 @@ func TestPriorGenerationWarmupRetryIsOneShot(t *testing.T) {
 		t.Fatal("previous-generation retryable state was not removed")
 	}
 
-	state.warmups[key] = warmupEntry{AuthID: "acct", Window: "5h", AttemptedAt: now, Error: "warmup_failed"}
+	state.warmups[key] = warmupEntry{AuthID: "acct", Window: "5h", AttemptedAt: now}
 	state.warmupMu.Lock()
 	_, _, ok = state.nextWarmupCandidateForGenerationLocked([]warmupCandidate{candidate}, now.Add(time.Second), 15*time.Minute, claimedAt)
 	state.warmupMu.Unlock()
@@ -509,7 +528,7 @@ func TestPriorGenerationWarmupRetryIsOneShot(t *testing.T) {
 	}
 }
 
-func TestRetryableWarmupFromPriorGenerationClassifiesHTTP200StreamErrors(t *testing.T) {
+func TestRetryableWarmupFromPriorGenerationOnlyRetriesUnfinishedAttempts(t *testing.T) {
 	now := time.Now().UTC()
 	claimedAt := now.Add(-time.Minute)
 	priorAttempt := claimedAt.Add(-time.Second)
@@ -520,13 +539,33 @@ func TestRetryableWarmupFromPriorGenerationClassifiesHTTP200StreamErrors(t *test
 		want  bool
 	}{
 		{
-			name:  "http 200 with generic sse error retries",
-			entry: warmupEntry{AttemptedAt: priorAttempt, Status: http.StatusOK, Error: "error"},
+			name:  "admitted attempt without outcome retries",
+			entry: warmupEntry{AttemptedAt: priorAttempt},
 			want:  true,
+		},
+		{
+			name:  "lifecycle cancellation without status retries",
+			entry: warmupEntry{AttemptedAt: priorAttempt, Error: "cancelled"},
+			want:  true,
+		},
+		{
+			name:  "status free transport failure waits for backoff",
+			entry: warmupEntry{AttemptedAt: priorAttempt, Error: "warmup_failed"},
+			want:  false,
+		},
+		{
+			name:  "http 200 with generic sse error waits for backoff",
+			entry: warmupEntry{AttemptedAt: priorAttempt, Status: http.StatusOK, Error: "error"},
+			want:  false,
 		},
 		{
 			name:  "clean http 200 does not retry",
 			entry: warmupEntry{AttemptedAt: priorAttempt, Status: http.StatusOK},
+			want:  false,
+		},
+		{
+			name:  "http 502 waits for backoff",
+			entry: warmupEntry{AttemptedAt: priorAttempt, Status: http.StatusBadGateway, Error: "http_502"},
 			want:  false,
 		},
 		{
@@ -552,6 +591,39 @@ func TestRetryableWarmupFromPriorGenerationClassifiesHTTP200StreamErrors(t *test
 				t.Fatalf("retryableWarmupFromPriorGeneration() = %v; want %v; entry=%#v", got, tt.want, tt.entry)
 			}
 		})
+	}
+}
+
+func TestPriorGenerationHTTPFailureKeepsRetryBackoff(t *testing.T) {
+	now := time.Now().UTC()
+	claimedAt := now.Add(-time.Minute)
+	retryAfter := 15 * time.Minute
+	key := warmupKey("acct", "weekly")
+	candidate := warmupCandidate{Snapshot: quotaSnapshot{AuthID: "acct"}, Window: quotaWindow{Class: "weekly"}}
+	state := &schedulerRuntimeState{warmups: map[string]warmupEntry{
+		key: {
+			AuthID: "acct", Window: "weekly", AttemptedAt: claimedAt.Add(-time.Second),
+			Status: http.StatusBadGateway, Error: "http_502",
+		},
+	}}
+
+	state.warmupMu.Lock()
+	_, _, ok := state.nextWarmupCandidateForGenerationLocked([]warmupCandidate{candidate}, now, retryAfter, claimedAt)
+	_, preserved := state.warmups[key]
+	state.warmupMu.Unlock()
+	if ok {
+		t.Fatal("prior-generation HTTP 502 bypassed retry_after")
+	}
+	if !preserved {
+		t.Fatal("prior-generation HTTP 502 outcome was discarded during backoff")
+	}
+
+	afterBackoff := now.Add(retryAfter)
+	state.warmupMu.Lock()
+	_, _, ok = state.nextWarmupCandidateForGenerationLocked([]warmupCandidate{candidate}, afterBackoff, retryAfter, claimedAt)
+	state.warmupMu.Unlock()
+	if !ok {
+		t.Fatal("prior-generation HTTP 502 did not become retryable after retry_after")
 	}
 }
 

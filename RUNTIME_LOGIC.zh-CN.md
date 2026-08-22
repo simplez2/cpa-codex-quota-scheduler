@@ -1,6 +1,6 @@
 # Codex Quota Scheduler 运行逻辑与状态机
 
-本文描述当前功能分支 v0.1.13 的真实运行逻辑，供代码审查、生产验收和故障定位使用。它不表示该版本已经成为 GitHub 正式 Release。
+本文描述 v0.1.16 源码的真实运行逻辑，供代码审查、生产验收和故障定位使用。只有匹配 tag 与 Release 资产均存在时，才视为正式发布。
 
 ## 1. 数据来源与可信度
 
@@ -154,7 +154,7 @@ warmup_candidates=0 只说明当前轮没有可执行候选，不等于功能关
 
 ## 8. 热加载与 generation ownership
 
-CPA 热重载可能让新旧动态库 generation 短时间同时存在。v0.1.13 使用两层互斥：
+CPA 热重载可能让新旧动态库 generation 短时间同时存在。v0.1.16 使用两层互斥：
 
 - Generation record：state_path.generation 记录当前 owner。新 generation 原子认领后，旧 generation 发现被替代便停止刷新、调度副作用和完整状态写入。
 - Warmup instance lease：state_path.warmup.lock 使用 OS 文件锁，保证跨进程同时只有一个预热执行者。

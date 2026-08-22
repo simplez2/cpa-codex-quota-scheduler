@@ -727,8 +727,11 @@ func (s *schedulerRuntimeState) warmupSuppressedForGenerationLocked(key string, 
 	}
 	// A lifecycle reconfigure cancels the refresh-loop context while the old
 	// generation is retiring. That cancellation is not an upstream failure and
-	// must not suppress the same candidate in the newly active generation.
-	if entry.Error == "cancelled" && entry.CompletedAt.IsZero() && entry.ActivatedAt.IsZero() {
+	// must not suppress the same candidate in the newly active generation. A
+	// non-zero status proves that an upstream HTTP response was received, so it
+	// must still obey the ordinary retry interval even if its error was reported
+	// as a cancellation.
+	if entry.Status == 0 && entry.Error == "cancelled" && entry.CompletedAt.IsZero() && entry.ActivatedAt.IsZero() {
 		delete(s.warmups, key)
 		return false
 	}
@@ -756,12 +759,19 @@ func retryableWarmupFromPriorGeneration(entry warmupEntry, generationClaimedAt t
 	if !entry.CompletedAt.IsZero() || !entry.ActivatedAt.IsZero() || !entry.ResetAt.IsZero() {
 		return false
 	}
-	if entry.Status == statusTooManyRequests ||
-		(entry.Status >= 200 && entry.Status < 300 && strings.TrimSpace(entry.Error) == "") ||
-		strings.EqualFold(strings.TrimSpace(entry.Error), "http_429") || nonRetryableWarmupCode(entry.Error) {
+	// Any HTTP status, including 5xx or a 2xx response followed by an SSE
+	// terminal error, proves the request produced a completed upstream outcome.
+	// Generation churn must not turn that outcome into an immediate retry; the
+	// normal AttemptedAt/retry_after backoff remains authoritative.
+	if entry.Status != 0 {
 		return false
 	}
-	return true
+	// Status-free transport/encoding failures are also completed attempts and
+	// must respect backoff. Only an admitted attempt with no recorded outcome,
+	// or a lifecycle cancellation, is genuinely unfinished/interrupted and safe
+	// to resume immediately in the next generation.
+	errorCode := strings.ToLower(strings.TrimSpace(entry.Error))
+	return errorCode == "" || errorCode == "cancelled"
 }
 
 func (s *schedulerRuntimeState) executeWarmup(parent context.Context, cfg pluginConfig, candidate warmupCandidate) {

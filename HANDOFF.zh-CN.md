@@ -20,7 +20,7 @@
 | Git tag / GitHub Release | 对外正式发布版本。 |
 | Draft PR | 尚未发布、供审查的功能分支。 |
 
-当前功能分支为 v0.1.13，但正式 Release 可能仍是 v0.1.0。合并前可以测试 branch build，但不能把它称为正式 release。正式发布时必须同时校验 pluginVersion、registry、tag、资产名和 Release 说明。
+当前源码与 registry 为 v0.1.16。正式发布时必须同时校验 pluginVersion、registry、tag、资产名和 Release 说明；未生成匹配 Release 资产前，只能称为测试构建。
 
 ## 3. 推荐生产挂载
 
