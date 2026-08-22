@@ -1419,18 +1419,18 @@ func (s *schedulerRuntimeState) nextPick(n int) int {
 }
 
 type persistedBanState struct {
-	Version                int                             `json:"version"`
-	Bans                   map[string]banEntry             `json:"bans"`
-	Warmups                map[string]warmupEntry          `json:"warmups,omitempty"`
-	BanResetConfirmations  map[string]banResetConfirmation `json:"ban_reset_confirmations,omitempty"`
-	SerialActiveAuthID     string                          `json:"serial_active_auth_id,omitempty"`
-	SerialSelectedAt       time.Time                       `json:"serial_selected_at,omitempty"`
-	SerialSwitches         uint64                          `json:"serial_switches,omitempty"`
-	SerialFallbacks        uint64                          `json:"serial_provisional_fallbacks,omitempty"`
-	SerialLastSwitchAt     time.Time                       `json:"serial_last_switch_at,omitempty"`
-	SerialLastSwitchReason string                          `json:"serial_last_switch_reason,omitempty"`
+	Version                int                               `json:"version"`
+	Bans                   map[string]banEntry               `json:"bans"`
+	Warmups                map[string]warmupEntry            `json:"warmups,omitempty"`
+	BanResetConfirmations  map[string]banResetConfirmation   `json:"ban_reset_confirmations,omitempty"`
+	SerialActiveAuthID     string                            `json:"serial_active_auth_id,omitempty"`
+	SerialSelectedAt       time.Time                         `json:"serial_selected_at,omitempty"`
+	SerialSwitches         uint64                            `json:"serial_switches,omitempty"`
+	SerialFallbacks        uint64                            `json:"serial_provisional_fallbacks,omitempty"`
+	SerialLastSwitchAt     time.Time                         `json:"serial_last_switch_at,omitempty"`
+	SerialLastSwitchReason string                            `json:"serial_last_switch_reason,omitempty"`
 	SerialOverdraft        map[string]serialOverdraftBinding `json:"serial_overdraft,omitempty"`
-	SavedAt                time.Time                       `json:"saved_at"`
+	SavedAt                time.Time                         `json:"saved_at"`
 }
 
 func loadBanState(path string) {

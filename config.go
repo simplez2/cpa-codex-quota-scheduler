@@ -59,7 +59,7 @@ type yamlPluginConfig struct {
 	SchedulerMode           string   `yaml:"scheduler_mode"`
 	SerialSwitchPercent     *float64 `yaml:"serial_switch_percent"`
 	SerialPreferActiveCycle *bool    `yaml:"serial_prefer_active_cycle"`
-	DrainWindowHours         *float64 `yaml:"drain_window_hours"`
+	DrainWindowHours        *float64 `yaml:"drain_window_hours"`
 	KeeperURL               string   `yaml:"keeper_url"`
 	KeeperPasswordFile      string   `yaml:"keeper_password_file"`
 	CPAManagementURL        string   `yaml:"cpa_management_url"`
