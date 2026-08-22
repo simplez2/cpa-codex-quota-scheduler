@@ -11,7 +11,7 @@
   </p>
 </div>
 
-> **Version note:** the source and registry declare plugin version **v0.1.16**. A build is a published release only after the matching `v0.1.16` tag and release assets are available.
+> **Version note:** the source and registry declare plugin version **v0.1.17**. A build is a published release only after the matching `v0.1.17` tag and release assets are available.
 
 The plugin keeps normal Codex traffic on one globally committed credential. It switches only when quota policy, an authoritative 429, quarantine, or confirmed candidate loss requires it. Fully available accounts can be activated separately, one at a time, without turning normal traffic into round-robin usage.
 
@@ -69,6 +69,8 @@ Serial mode pins every active conversation to the auth serving it (`serial_overd
 A warmup candidate must have a fresh Keeper row, all recognized active windows at 0% used and allowed, a credible “not started” reset signal, a valid CPA auth binding, no quarantine, no active/pending/blocked warmup record, and no competing generation or instance lease. The plugin then sends a pinned non-streaming `hello` request with `store=false` and `max_output_tokens=16`. Success is not assumed from HTTP 2xx alone: later Keeper data must confirm a stable reset anchor. Cyber-policy, abuse, auth, deactivated-workspace, and similar terminal failures are stored only as redacted blocked codes and are never retried automatically.
 
 Completed HTTP failures, including 502/503 and HTTP 200 streams that end in an error event, keep their original `AttemptedAt` backoff across plugin generations. Only a genuinely unfinished attempt with no upstream status, or a lifecycle cancellation before any result, may resume immediately after hot reload.
+
+Keeper keeps disabled credentials in its usage history. The scheduler excludes those rows from cache requests and snapshots, then intersects every side-effecting `/quota/refresh` target with CPA's current active Codex auth inventory. If that authenticated inventory is unavailable, cached quota data remains readable but the refresh request fails closed. The filter accepts both official OAuth and Agent Identity/PAT credentials and never consumes a reset credit.
 
 Platform-wide resets are reconciled without trusting one transient quota row. Two strictly newer Keeper observations must independently prove the new cycle before an obsolete quota cooldown is removed. This also repairs historical cooldowns whose persisted `5h` label conflicts with their recorded weekly or monthly span, including a later weekly-only Team plan shape. Once confirmed, the stale warmup record is cleared and that same fresh snapshot may become a warmup candidate in the current refresh cycle.
 

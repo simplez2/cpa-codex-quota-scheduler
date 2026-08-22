@@ -72,6 +72,7 @@ type cpaAuthFileEntry struct {
 	AuthIndex   string `json:"auth_index"`
 	Name        string `json:"name"`
 	Provider    string `json:"provider"`
+	Type        string `json:"type"`
 	Status      string `json:"status"`
 	Disabled    bool   `json:"disabled"`
 	Unavailable bool   `json:"unavailable"`
@@ -1256,54 +1257,121 @@ func (s *schedulerRuntimeState) cpaWarmupEligibleAuths(ctx context.Context, cfg 
 		return nil, err
 	}
 
-	keyRaw, err := os.ReadFile(cfg.CPAManagementKeyFile)
+	files, err := cpaManagementAuthFiles(ctx, cfg)
 	if err != nil {
 		s.recordWarmupAuthDiagnostics("management.auth-files", newWarmupAuthEligibilityStats(), err)
+		return nil, err
+	}
+	eligible, stats := warmupEligibleAuthsWithStats(files)
+	s.recordWarmupAuthDiagnostics("management.auth-files", stats, nil)
+	return eligible, nil
+}
+
+// cpaManagementAuthFiles reads the authenticated CPA auth inventory without
+// applying warmup-specific transport rules. Quota refresh uses the same raw
+// inventory to fail closed before asking Keeper to touch a credential.
+func cpaManagementAuthFiles(ctx context.Context, cfg pluginConfig) ([]cpaAuthFileEntry, error) {
+	keyRaw, err := os.ReadFile(cfg.CPAManagementKeyFile)
+	if err != nil {
 		return nil, err
 	}
 	managementKey := strings.TrimSpace(string(keyRaw))
 	if managementKey == "" {
-		err = errors.New("CPA management key is empty")
-		s.recordWarmupAuthDiagnostics("management.auth-files", newWarmupAuthEligibilityStats(), err)
-		return nil, err
+		return nil, errors.New("CPA management key is empty")
 	}
 	endpoint, err := cpaAuthFilesEndpoint(cfg.CPAManagementURL)
 	if err != nil {
-		s.recordWarmupAuthDiagnostics("management.auth-files", newWarmupAuthEligibilityStats(), err)
 		return nil, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		s.recordWarmupAuthDiagnostics("management.auth-files", newWarmupAuthEligibilityStats(), err)
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+managementKey)
 	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
 	if err != nil {
-		s.recordWarmupAuthDiagnostics("management.auth-files", newWarmupAuthEligibilityStats(), err)
 		return nil, err
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if err != nil {
-		s.recordWarmupAuthDiagnostics("management.auth-files", newWarmupAuthEligibilityStats(), err)
 		return nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		err = fmt.Errorf("CPA auth-files returned HTTP %d", resp.StatusCode)
-		s.recordWarmupAuthDiagnostics("management.auth-files", newWarmupAuthEligibilityStats(), err)
-		return nil, err
+		return nil, fmt.Errorf("CPA auth-files returned HTTP %d", resp.StatusCode)
 	}
 	var result struct {
 		Files []cpaAuthFileEntry `json:"files"`
 	}
 	if err := json.Unmarshal(raw, &result); err != nil {
-		s.recordWarmupAuthDiagnostics("management.auth-files", newWarmupAuthEligibilityStats(), err)
 		return nil, err
 	}
-	eligible, stats := warmupEligibleAuthsWithStats(result.Files)
-	s.recordWarmupAuthDiagnostics("management.auth-files", stats, nil)
-	return eligible, nil
+	return result.Files, nil
+}
+
+// cpaActiveCodexAuthIndexes returns the host's current routing inventory. It
+// deliberately does not require an Agent Identity note: official OAuth and
+// sidecar-backed PAT credentials are equally valid quota-refresh subjects.
+func cpaActiveCodexAuthIndexes(ctx context.Context, cfg pluginConfig) (map[string]struct{}, error) {
+	if hostAPIAvailable() {
+		result, err := callHost(pluginabi.MethodHostAuthList, map[string]any{})
+		if err == nil {
+			var response struct {
+				Files []pluginapi.HostAuthFileEntry `json:"files"`
+			}
+			if decodeErr := json.Unmarshal(result, &response); decodeErr == nil {
+				// A valid empty inventory is authoritative: all Codex auths may
+				// have been disabled. Do not fall back to a potentially stale view.
+				return activeCodexHostAuthIndexes(response.Files), nil
+			}
+		}
+	}
+
+	files, err := cpaManagementAuthFiles(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return activeCodexManagementAuthIndexes(files), nil
+}
+
+func activeCodexManagementAuthIndexes(files []cpaAuthFileEntry) map[string]struct{} {
+	indexes := make(map[string]struct{})
+	for _, file := range files {
+		provider := strings.TrimSpace(file.Provider)
+		if provider == "" {
+			provider = strings.TrimSpace(file.Type)
+		}
+		if !strings.EqualFold(provider, providerCodex) || file.Disabled || file.Unavailable {
+			continue
+		}
+		if status := strings.TrimSpace(file.Status); status != "" && !strings.EqualFold(status, "active") {
+			continue
+		}
+		if index := strings.TrimSpace(file.AuthIndex); index != "" {
+			indexes[index] = struct{}{}
+		}
+	}
+	return indexes
+}
+
+func activeCodexHostAuthIndexes(files []pluginapi.HostAuthFileEntry) map[string]struct{} {
+	indexes := make(map[string]struct{})
+	for _, file := range files {
+		provider := strings.TrimSpace(file.Provider)
+		if provider == "" {
+			provider = strings.TrimSpace(file.Type)
+		}
+		if !strings.EqualFold(provider, providerCodex) || file.Disabled || file.Unavailable {
+			continue
+		}
+		if status := strings.TrimSpace(file.Status); status != "" && !strings.EqualFold(status, "active") {
+			continue
+		}
+		if index := strings.TrimSpace(file.AuthIndex); index != "" {
+			indexes[index] = struct{}{}
+		}
+	}
+	return indexes
 }
 
 func nativeWarmupRequested(cfg pluginConfig) bool {
@@ -1331,11 +1399,19 @@ func warmupEligibleAuths(files []cpaAuthFileEntry) map[string]warmupAuthBinding 
 }
 
 func warmupEligibleAuthsWithStats(files []cpaAuthFileEntry) (map[string]warmupAuthBinding, warmupAuthEligibilityStats) {
+	return eligibleCPACodexAuthsWithStats(files, true)
+}
+
+func eligibleCPACodexAuthsWithStats(files []cpaAuthFileEntry, requireSidecarMarker bool) (map[string]warmupAuthBinding, warmupAuthEligibilityStats) {
 	eligible := make(map[string]warmupAuthBinding)
 	stats := newWarmupAuthEligibilityStats()
 	for _, file := range files {
 		stats.Seen++
-		if !strings.EqualFold(strings.TrimSpace(file.Provider), providerCodex) {
+		provider := strings.TrimSpace(file.Provider)
+		if provider == "" {
+			provider = strings.TrimSpace(file.Type)
+		}
+		if !strings.EqualFold(provider, providerCodex) {
 			stats.reject("provider_mismatch")
 			continue
 		}
@@ -1367,7 +1443,7 @@ func warmupEligibleAuthsWithStats(files []cpaAuthFileEntry) (map[string]warmupAu
 			stats.reject("missing_auth_index")
 			continue
 		}
-		if !trustedWarmupCredentialNote(file.Note) {
+		if requireSidecarMarker && !trustedWarmupCredentialNote(file.Note) {
 			stats.reject("missing_sidecar_marker")
 			continue
 		}

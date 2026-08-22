@@ -20,7 +20,7 @@
 | Git tag / GitHub Release | 对外正式发布版本。 |
 | Draft PR | 尚未发布、供审查的功能分支。 |
 
-当前源码与 registry 为 v0.1.16。正式发布时必须同时校验 pluginVersion、registry、tag、资产名和 Release 说明；未生成匹配 Release 资产前，只能称为测试构建。
+当前源码与 registry 为 v0.1.17。正式发布时必须同时校验 pluginVersion、registry、tag、资产名和 Release 说明；未生成匹配 Release 资产前，只能称为测试构建。
 
 ## 3. 推荐生产挂载
 
@@ -172,6 +172,10 @@ git diff --check
 ### 平台批量提前重置
 
 观察 ban_reset_pending_confirmations。第一次全 0% 快照不会立刻清 ban；系统应触发一次定向 Keeper refresh，第二个独立快照满足 reset anchor/class 变化后才清 quota cooldown。probation 与 cyber/auth 不参与。
+
+### Keeper 周期性 service_unavailable
+
+先核对错误时间是否与 `keeper_refresh_requested_at` 对齐。Keeper 会保留 disabled 历史身份；v0.1.17 会在读取阶段排除其缓存，并在真正请求 `/quota/refresh` 前再与 CPA 当前 active Codex 清单求交集。若 `keeper_refresh_error=auth_inventory_unavailable`，只读快照仍会保留，但有副作用的刷新会 fail closed；应修复 Management key/Host API，不要反复启用历史账号。
 
 ## 9. 手工恢复操作
 

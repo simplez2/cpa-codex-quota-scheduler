@@ -205,6 +205,42 @@ func TestHostAuthDiscoveryRequiresSidecarMarkerOnlyForManagement(t *testing.T) {
 	}
 }
 
+func TestQuotaRefreshAuthIndexFiltersSupportPATAndOAuth(t *testing.T) {
+	management := activeCodexManagementAuthIndexes([]cpaAuthFileEntry{
+		{AuthIndex: "idx-pat", Provider: "codex", Status: "active", Note: "Agent Identity via sidecar"},
+		{AuthIndex: "idx-oauth", Type: "codex", Status: "active", Note: "Official OAuth"},
+		{AuthIndex: "idx-disabled", Provider: "codex", Disabled: true},
+		{AuthIndex: "idx-unavailable", Provider: "codex", Unavailable: true},
+		{AuthIndex: "idx-error", Provider: "codex", Status: "error"},
+		{AuthIndex: "idx-other", Provider: "anthropic", Status: "active"},
+		{Provider: "codex", Status: "active"},
+	})
+	for _, index := range []string{"idx-pat", "idx-oauth"} {
+		if _, ok := management[index]; !ok {
+			t.Fatalf("management active index %q was excluded: %#v", index, management)
+		}
+	}
+	if len(management) != 2 {
+		t.Fatalf("management active indexes = %#v; want PAT and OAuth only", management)
+	}
+
+	host := activeCodexHostAuthIndexes([]pluginapi.HostAuthFileEntry{
+		{AuthIndex: "idx-pat", Provider: "codex", Status: "active", Note: "Agent Identity via sidecar"},
+		{AuthIndex: "idx-oauth", Type: "codex", Status: "active", Note: "Official OAuth"},
+		{AuthIndex: "idx-disabled", Provider: "codex", Disabled: true},
+		{AuthIndex: "idx-unavailable", Provider: "codex", Unavailable: true},
+		{AuthIndex: "idx-error", Provider: "codex", Status: "error"},
+	})
+	if len(host) != 2 {
+		t.Fatalf("host active indexes = %#v; want PAT and OAuth only", host)
+	}
+	for _, index := range []string{"idx-pat", "idx-oauth"} {
+		if _, ok := host[index]; !ok {
+			t.Fatalf("host active index %q was excluded: %#v", index, host)
+		}
+	}
+}
+
 func TestNativeWarmupDoesNotFallBackToManagementAuthDiscovery(t *testing.T) {
 	hits := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

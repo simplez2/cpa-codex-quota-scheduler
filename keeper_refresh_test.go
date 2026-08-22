@@ -14,6 +14,27 @@ import (
 	"time"
 )
 
+func newTestCPAAuthInventory(t *testing.T, entries []map[string]any, status int) (string, string) {
+	t.Helper()
+	keyPath := filepath.Join(t.TempDir(), "management-key")
+	if err := os.WriteFile(keyPath, []byte("management-secret\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v0/management/auth-files" {
+			http.NotFound(w, r)
+			return
+		}
+		if status < 200 || status >= 300 {
+			w.WriteHeader(status)
+			return
+		}
+		writeTestJSON(t, w, map[string]any{"files": entries})
+	}))
+	t.Cleanup(server.Close)
+	return server.URL + "/v0/management/api-call", keyPath
+}
+
 func TestKeeperRefreshGateSerializesAcrossInstancesAndBacksOff(t *testing.T) {
 	statePath := filepath.Join(t.TempDir(), "state.json")
 	targets := []keeperRefreshTarget{{AuthIndex: "idx-acct", Reason: "missing"}}
@@ -80,6 +101,33 @@ func TestBanResetConfirmationRefreshRunsWhileWarmupDisabled(t *testing.T) {
 	}
 }
 
+func TestBanResetConfirmationRefreshFiltersDisabledCPAIdentity(t *testing.T) {
+	var calls atomic.Int32
+	keeper := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		writeTestJSON(t, w, map[string]any{"accepted": 1})
+	}))
+	defer keeper.Close()
+
+	state := newRefreshTestState(t, keeper.URL)
+	state.cfg.Enabled = true
+	state.cfg.CPAManagementURL, state.cfg.CPAManagementKeyFile = newTestCPAAuthInventory(t, []map[string]any{{
+		"id": "disabled", "auth_index": "idx-disabled", "provider": providerCodex,
+		"status": "disabled", "disabled": true,
+	}}, http.StatusOK)
+	targets := []keeperRefreshTarget{{
+		AuthIndex: "idx-disabled", Reason: "ban_reset_confirmation", ObservedAt: time.Now().UTC(),
+	}}
+	if err := state.requestActiveCPAKeeperQuotaRefreshTargets(
+		context.Background(), state.cfg, "", "session-token", targets, time.Now().UTC(),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("disabled ban-confirmation target triggered %d Keeper refresh calls; want 0", got)
+	}
+}
+
 func TestStaleKeeperCacheRefreshRunsWhileWarmupDisabled(t *testing.T) {
 	var calls atomic.Int32
 	keeper := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -100,6 +148,9 @@ func TestStaleKeeperCacheRefreshRunsWhileWarmupDisabled(t *testing.T) {
 	state.cfg.StatePath = filepath.Join(t.TempDir(), "state.json")
 	state.cfg.Enabled = true
 	state.cfg.WarmupEnabled = false
+	state.cfg.CPAManagementURL, state.cfg.CPAManagementKeyFile = newTestCPAAuthInventory(t, []map[string]any{{
+		"id": "acct", "auth_index": "idx-acct", "provider": providerCodex, "status": "active",
+	}}, http.StatusOK)
 	defer state.stop()
 
 	cache := keeperCacheResponse{Items: []keeperCacheItem{{
@@ -120,6 +171,74 @@ func TestStaleKeeperCacheRefreshRunsWhileWarmupDisabled(t *testing.T) {
 	status := state.status()
 	if status.WarmupEnabled || status.KeeperRefreshRequests != 1 || status.KeeperRefreshAccepted != 1 {
 		t.Fatalf("warmup-disabled cache refresh status = %#v", status)
+	}
+}
+
+func TestKeeperRefreshFiltersCredentialDisabledBeforeKeeperSync(t *testing.T) {
+	var calls atomic.Int32
+	keeper := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		writeTestJSON(t, w, map[string]any{"accepted": 1})
+	}))
+	defer keeper.Close()
+
+	state := newRefreshTestState(t, keeper.URL)
+	state.cfg.Enabled = true
+	state.cfg.CPAManagementURL, state.cfg.CPAManagementKeyFile = newTestCPAAuthInventory(t, []map[string]any{
+		{"id": "disabled", "auth_index": "idx-disabled", "provider": providerCodex, "status": "disabled", "disabled": true},
+	}, http.StatusOK)
+
+	cache := keeperCacheResponse{Items: []keeperCacheItem{{
+		AuthIndex: "idx-disabled", FileName: "disabled.json", Status: "pending",
+	}}}
+	if err := state.maybeRequestKeeperQuotaRefresh(
+		context.Background(), state.cfg, "", "session-token",
+		[]string{"idx-disabled"}, cache, nil, time.Now().UTC(),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("disabled credential triggered %d Keeper refresh calls; want 0", got)
+	}
+	status := state.status()
+	if status.KeeperRefreshTargets != 0 || status.KeeperRefreshError != "" {
+		t.Fatalf("filtered refresh status = %#v", status)
+	}
+}
+
+func TestKeeperRefreshSendsOnlyCurrentlyActiveTargets(t *testing.T) {
+	var requested []string
+	keeper := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload struct {
+			AuthIndexes []string `json:"auth_indexes"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("decode refresh payload: %v", err)
+		}
+		requested = append([]string(nil), payload.AuthIndexes...)
+		writeTestJSON(t, w, map[string]any{"accepted": 1, "tasks": []map[string]any{{"authIndex": "idx-active"}}})
+	}))
+	defer keeper.Close()
+
+	state := newRefreshTestState(t, keeper.URL)
+	state.cfg.Enabled = true
+	state.cfg.CPAManagementURL, state.cfg.CPAManagementKeyFile = newTestCPAAuthInventory(t, []map[string]any{
+		{"id": "active", "auth_index": "idx-active", "provider": providerCodex, "status": "active"},
+		{"id": "disabled", "auth_index": "idx-disabled", "provider": providerCodex, "status": "disabled", "disabled": true},
+	}, http.StatusOK)
+
+	cache := keeperCacheResponse{Items: []keeperCacheItem{
+		{AuthIndex: "idx-active", FileName: "active.json", Status: "pending"},
+		{AuthIndex: "idx-disabled", FileName: "disabled.json", Status: "pending"},
+	}}
+	if err := state.maybeRequestKeeperQuotaRefresh(
+		context.Background(), state.cfg, "", "session-token",
+		[]string{"idx-active", "idx-disabled"}, cache, nil, time.Now().UTC(),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if len(requested) != 1 || requested[0] != "idx-active" {
+		t.Fatalf("Keeper refresh auth_indexes = %#v; want active target only", requested)
 	}
 }
 
@@ -332,13 +451,17 @@ func TestHotReloadGenerationsQueueOnlyOneKeeperRefresh(t *testing.T) {
 	old := newManagedRuntimeForTest(t, statePath)
 	claimManagedRuntimeForTest(t, old)
 	incoming := newManagedRuntimeForTest(t, statePath)
+	managementURL, managementKeyPath := newTestCPAAuthInventory(t, []map[string]any{{
+		"id": "acct", "auth_index": "idx", "provider": providerCodex, "status": "active",
+	}}, http.StatusOK)
 	for _, state := range []*schedulerRuntimeState{old, incoming} {
 		state.cfg.KeeperURL = keeper.URL
 		state.cfg.KeeperPasswordFile = passwordPath
 		state.cfg.WarmupEnabled = true
 		state.cfg.KeeperRefreshCooldown = 2 * time.Minute
 		state.cfg.StaleAfter = 15 * time.Minute
-		state.cfg.CPAManagementURL = ""
+		state.cfg.CPAManagementURL = managementURL
+		state.cfg.CPAManagementKeyFile = managementKeyPath
 	}
 	t.Cleanup(func() {
 		old.stop()

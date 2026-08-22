@@ -382,25 +382,7 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 		s.recordRefreshError(fmt.Errorf("decode Keeper identities: %w", err))
 		return
 	}
-	indexToFile := make(map[string]string)
-	indexes := make([]string, 0, len(identitiesResp.Identities))
-	seen := make(map[string]struct{})
-	for _, identity := range identitiesResp.Identities {
-		if !strings.EqualFold(strings.TrimSpace(identity.Provider), providerCodex) &&
-			!strings.EqualFold(strings.TrimSpace(identity.Type), providerCodex) {
-			continue
-		}
-		index := strings.TrimSpace(identity.Identity)
-		fileName := strings.TrimSpace(identity.FileName)
-		if index == "" || fileName == "" || identity.IsDeleted {
-			continue
-		}
-		indexToFile[index] = fileName
-		if _, ok := seen[index]; !ok {
-			seen[index] = struct{}{}
-			indexes = append(indexes, index)
-		}
-	}
+	indexToFile, indexes := enabledKeeperCodexIdentities(identitiesResp.Identities)
 	if len(indexes) == 0 {
 		s.recordRefreshError(errors.New("Keeper returned no active Codex identities"))
 		return
@@ -433,13 +415,15 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 			continue
 		}
 		index := strings.TrimSpace(item.AuthIndex)
-		fileName := strings.TrimSpace(item.FileName)
-		if fileName == "" {
-			fileName = indexToFile[index]
-		}
-		if index == "" && fileName == "" {
+		activeFileName, requested := indexToFile[index]
+		if index == "" || !requested {
+			// Keeper may retain and return historical cache rows. Only commit
+			// snapshots for indexes requested from its enabled identity inventory.
 			continue
 		}
+		// The requested inventory is authoritative for the current filename;
+		// do not let an old Keeper cache alias change scheduler identity keys.
+		fileName := activeFileName
 		refreshedAt := parseKeeperTime(item.RefreshedAt)
 		snapshot := normalizeQuotaSnapshot(index, fileName, *item.Quota, refreshedAt, now)
 		if len(snapshot.Windows) == 0 {
@@ -493,7 +477,7 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 	}
 	s.reconcileExternallyResetQuotaBans(quotas, now)
 	if confirmationTargets := s.pendingBanResetKeeperRefreshTargets(quotas); len(confirmationTargets) > 0 {
-		if err := s.requestKeeperQuotaRefreshTargets(ctx, cfg, password, token, confirmationTargets, now); err != nil {
+		if err := s.requestActiveCPAKeeperQuotaRefreshTargets(ctx, cfg, password, token, confirmationTargets, now); err != nil {
 			s.recordRefreshError(err)
 		}
 	}
@@ -550,7 +534,37 @@ type keeperIdentity struct {
 	FileName  string `json:"file_name"`
 	Provider  string `json:"provider"`
 	Type      string `json:"type"`
+	Disabled  bool   `json:"disabled"`
 	IsDeleted bool   `json:"is_deleted"`
+}
+
+// enabledKeeperCodexIdentities returns only identities that Keeper's synced
+// inventory reports as enabled. Keeper retains disabled auth-file rows for
+// historical usage reporting, so is_deleted alone is not a sufficient filter.
+// Sending those historical indexes to /quota/refresh makes Keeper invoke a
+// credential that CPA has intentionally taken out of service.
+func enabledKeeperCodexIdentities(identities []keeperIdentity) (map[string]string, []string) {
+	indexToFile := make(map[string]string)
+	indexes := make([]string, 0, len(identities))
+	seen := make(map[string]struct{}, len(identities))
+	for _, identity := range identities {
+		if !strings.EqualFold(strings.TrimSpace(identity.Provider), providerCodex) &&
+			!strings.EqualFold(strings.TrimSpace(identity.Type), providerCodex) {
+			continue
+		}
+		index := strings.TrimSpace(identity.Identity)
+		fileName := strings.TrimSpace(identity.FileName)
+		if index == "" || fileName == "" || identity.Disabled || identity.IsDeleted {
+			continue
+		}
+		indexToFile[index] = fileName
+		if _, ok := seen[index]; ok {
+			continue
+		}
+		seen[index] = struct{}{}
+		indexes = append(indexes, index)
+	}
+	return indexToFile, indexes
 }
 
 type keeperCacheResponse struct {

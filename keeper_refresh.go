@@ -440,6 +440,54 @@ func (s *schedulerRuntimeState) clearKeeperRefreshTargets() {
 	s.mu.Unlock()
 }
 
+func (s *schedulerRuntimeState) recordKeeperRefreshInventoryFailure() {
+	s.mu.Lock()
+	s.keeperRefreshTargetsLast = 0
+	s.keeperRefreshAcceptedLast = 0
+	s.keeperRefreshSkippedLast = 0
+	s.keeperRefreshRejectedLast = make(map[string]int)
+	s.keeperRefreshLastError = "auth_inventory_unavailable"
+	s.mu.Unlock()
+}
+
+func filterKeeperRefreshTargets(targets []keeperRefreshTarget, activeIndexes map[string]struct{}) []keeperRefreshTarget {
+	filtered := make([]keeperRefreshTarget, 0, len(targets))
+	for _, target := range targets {
+		if _, ok := activeIndexes[strings.TrimSpace(target.AuthIndex)]; ok {
+			filtered = append(filtered, target)
+		}
+	}
+	return filtered
+}
+
+// activeCPARefreshTargets closes the short synchronization window between CPA
+// disabling a credential and Keeper observing that state. If the authenticated
+// host inventory is unavailable, quota cache reads remain usable but the
+// side-effecting Keeper refresh is skipped.
+func (s *schedulerRuntimeState) activeCPARefreshTargets(ctx context.Context, cfg pluginConfig, targets []keeperRefreshTarget) ([]keeperRefreshTarget, error) {
+	if len(targets) == 0 {
+		return nil, nil
+	}
+	activeIndexes, err := cpaActiveCodexAuthIndexes(ctx, cfg)
+	if err != nil {
+		s.recordKeeperRefreshInventoryFailure()
+		return nil, fmt.Errorf("load active CPA Codex auth inventory: %w", err)
+	}
+	filtered := filterKeeperRefreshTargets(targets, activeIndexes)
+	if len(filtered) == 0 {
+		s.clearKeeperRefreshTargets()
+	}
+	return filtered, nil
+}
+
+func (s *schedulerRuntimeState) requestActiveCPAKeeperQuotaRefreshTargets(ctx context.Context, cfg pluginConfig, password, token string, targets []keeperRefreshTarget, now time.Time) error {
+	targets, err := s.activeCPARefreshTargets(ctx, cfg, targets)
+	if err != nil || len(targets) == 0 {
+		return err
+	}
+	return s.requestKeeperQuotaRefreshTargets(ctx, cfg, password, token, targets, now)
+}
+
 func (s *schedulerRuntimeState) maybeRequestKeeperQuotaRefresh(ctx context.Context, cfg pluginConfig, password, token string, indexes []string, cache keeperCacheResponse, quotas map[string]quotaSnapshot, now time.Time) error {
 	// Keeper cache recovery is scheduler safety work, not model warmup. It must
 	// remain available while warmup is drained so a newly loaded scheduler can
@@ -453,7 +501,7 @@ func (s *schedulerRuntimeState) maybeRequestKeeperQuotaRefresh(ctx context.Conte
 		s.clearKeeperRefreshTargets()
 		return nil
 	}
-	return s.requestKeeperQuotaRefreshTargets(ctx, cfg, password, token, targets, now)
+	return s.requestActiveCPAKeeperQuotaRefreshTargets(ctx, cfg, password, token, targets, now)
 }
 
 // requestKeeperQuotaRefreshTargets is shared by scheduler cache recovery and

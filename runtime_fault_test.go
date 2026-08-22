@@ -60,6 +60,133 @@ func writeTestJSON(t *testing.T, w http.ResponseWriter, value any) {
 	}
 }
 
+func TestEnabledKeeperCodexIdentitiesExcludesDisabledHistory(t *testing.T) {
+	files, indexes := enabledKeeperCodexIdentities([]keeperIdentity{
+		{Identity: "idx-active", FileName: "active.json", Provider: "codex"},
+		{Identity: "idx-disabled", FileName: "disabled.json", Provider: "codex", Disabled: true},
+		{Identity: "idx-deleted", FileName: "deleted.json", Provider: "codex", IsDeleted: true},
+		{Identity: "idx-other", FileName: "other.json", Provider: "anthropic", Type: "claude"},
+	})
+	if len(indexes) != 1 || indexes[0] != "idx-active" {
+		t.Fatalf("enabled indexes = %#v; want only idx-active", indexes)
+	}
+	if len(files) != 1 || files["idx-active"] != "active.json" {
+		t.Fatalf("enabled identity map = %#v; want only active credential", files)
+	}
+}
+
+func TestRefreshOnceNeverRequestsDisabledKeeperIdentity(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	var requested []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/auth/login":
+			writeTestJSON(t, w, map[string]any{"session_token": "token"})
+		case "/api/v1/usage/identities":
+			writeTestJSON(t, w, map[string]any{"identities": []map[string]any{
+				{"identity": "idx-active", "file_name": "active.json", "provider": providerCodex, "disabled": false},
+				{"identity": "idx-disabled", "file_name": "disabled.json", "provider": providerCodex, "disabled": true},
+			}})
+		case "/api/v1/quota/cache":
+			var request struct {
+				AuthIndexes []string `json:"auth_indexes"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Errorf("decode quota cache request: %v", err)
+			}
+			requested = append([]string(nil), request.AuthIndexes...)
+			used, allowed, reached, seconds := 1.0, true, false, int64(7*24*time.Hour/time.Second)
+			quota := &keeperCheckResponse{Quota: []keeperQuotaRow{{
+				Label: "weekly", UsedPercent: &used, Allowed: &allowed, LimitReached: &reached,
+				Window: &keeperQuotaWindow{Seconds: &seconds},
+			}}}
+			writeTestJSON(t, w, keeperCacheResponse{Items: []keeperCacheItem{
+				{
+					AuthIndex: "idx-active", FileName: "active.json", Status: "completed",
+					RefreshedAt: json.RawMessage(fmt.Sprintf("%q", now.Format(time.RFC3339))), Quota: quota,
+				},
+				// A defensive server-side regression fixture: even if Keeper returns
+				// an unrequested historical row, it must not enter scheduler state.
+				{
+					AuthIndex: "idx-disabled", FileName: "disabled.json", Status: "completed",
+					RefreshedAt: json.RawMessage(fmt.Sprintf("%q", now.Format(time.RFC3339))), Quota: quota,
+				},
+			}})
+		case "/api/v1/pricing":
+			w.WriteHeader(http.StatusServiceUnavailable)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	state := newRefreshTestState(t, server.URL)
+	state.refreshOnce(context.Background())
+	if len(requested) != 1 || requested[0] != "idx-active" {
+		t.Fatalf("quota cache auth_indexes = %#v; disabled history must not be requested", requested)
+	}
+	if state.refreshes != 1 || state.lastError != "" {
+		t.Fatalf("filtered refresh failed: refreshes=%d error=%q", state.refreshes, state.lastError)
+	}
+	if _, ok := state.quotas["idx-disabled"]; ok {
+		t.Fatal("unrequested disabled Keeper cache row entered scheduler quota state")
+	}
+	if _, ok := state.quotas["disabled.json"]; ok {
+		t.Fatal("unrequested disabled Keeper cache filename entered scheduler quota state")
+	}
+}
+
+func TestRefreshOnceKeepsCacheButFailsClosedWhenCPAInventoryUnavailable(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	var refreshCalls int
+	keeper := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/auth/login":
+			writeTestJSON(t, w, map[string]any{"session_token": "token"})
+		case "/api/v1/usage/identities":
+			writeTestJSON(t, w, map[string]any{"identities": []map[string]any{{
+				"identity": "idx-active", "file_name": "active.json", "provider": providerCodex,
+			}}})
+		case "/api/v1/quota/cache":
+			used, allowed, reached, seconds := 10.0, true, false, int64(7*24*time.Hour/time.Second)
+			observedAt := now.Add(-time.Hour)
+			writeTestJSON(t, w, keeperCacheResponse{Items: []keeperCacheItem{{
+				AuthIndex: "idx-active", FileName: "active.json", Status: "completed",
+				RefreshedAt: json.RawMessage(fmt.Sprintf("%q", observedAt.Format(time.RFC3339))),
+				Quota: &keeperCheckResponse{Quota: []keeperQuotaRow{{
+					Label: "weekly", UsedPercent: &used, Allowed: &allowed, LimitReached: &reached,
+					Window: &keeperQuotaWindow{Seconds: &seconds},
+				}}},
+			}}})
+		case "/api/v1/quota/refresh":
+			refreshCalls++
+			writeTestJSON(t, w, map[string]any{"accepted": 1})
+		case "/api/v1/pricing":
+			w.WriteHeader(http.StatusServiceUnavailable)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer keeper.Close()
+
+	state := newRefreshTestState(t, keeper.URL)
+	state.cfg.CPAManagementURL, state.cfg.CPAManagementKeyFile = newTestCPAAuthInventory(t, nil, http.StatusServiceUnavailable)
+	state.cfg.StaleAfter = 15 * time.Minute
+	state.refreshOnce(context.Background())
+	if refreshCalls != 0 {
+		t.Fatalf("Keeper refresh calls = %d; want 0 when CPA inventory is unavailable", refreshCalls)
+	}
+	if state.refreshes != 1 {
+		t.Fatalf("usable read-only cache was not committed: refreshes=%d", state.refreshes)
+	}
+	if _, ok := state.quotas["idx-active"]; !ok {
+		t.Fatal("last readable quota snapshot was discarded")
+	}
+	if got := state.status().KeeperRefreshError; got != "auth_inventory_unavailable" {
+		t.Fatalf("keeper refresh error = %q; want auth_inventory_unavailable", got)
+	}
+}
+
 func TestKeeperTimeoutPreservesLastKnownQuota(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(100 * time.Millisecond)
