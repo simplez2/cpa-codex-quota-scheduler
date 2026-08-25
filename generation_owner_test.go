@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -106,6 +107,127 @@ func TestGenerationClaimsOnlyAfterSuccessfulRefresh(t *testing.T) {
 	status := state.generationStatus()
 	if !status.Claimed || !status.Active || state.refreshes != 1 {
 		t.Fatalf("successful refresh did not claim generation: status=%#v refreshes=%d error=%q", status, state.refreshes, state.lastError)
+	}
+}
+
+func TestGenerationJournalCompactsLegacyOversize(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	record := schedulerGenerationRecord{
+		Version:          schedulerGenerationRecordVersion,
+		HighestReserved:  7,
+		ActiveGeneration: 7,
+		ActiveOwner:      "owner",
+		Active:           true,
+		ClaimedAt:        time.Now().UTC().Truncate(time.Second),
+	}
+	line, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	line = append(line, '\n')
+	repeat := generationRecordMaxBytes/len(line) + 2
+	raw := bytes.Repeat(line, repeat)
+	if len(raw) <= generationRecordMaxBytes || len(raw) > generationRecordRecoveryMaxBytes {
+		t.Fatalf("invalid legacy journal fixture size %d", len(raw))
+	}
+	path := schedulerGenerationPath(statePath)
+	if err := os.WriteFile(path, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := readSchedulerGenerationRecord(statePath)
+	if err != nil {
+		t.Fatalf("recover legacy oversized journal: %v", err)
+	}
+	if got.HighestReserved != record.HighestReserved || got.ActiveGeneration != record.ActiveGeneration || got.ActiveOwner != record.ActiveOwner {
+		t.Fatalf("compaction changed generation record: %#v", got)
+	}
+	stat, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stat.Size() >= generationRecordCompactAt {
+		t.Fatalf("journal was not compacted: %d bytes", stat.Size())
+	}
+	if _, err := os.Stat(schedulerGenerationLockPath(statePath)); err != nil {
+		t.Fatalf("stable generation lock was not created: %v", err)
+	}
+}
+
+func TestGenerationJournalAllowsTruncatedFinalAppend(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	record := schedulerGenerationRecord{Version: schedulerGenerationRecordVersion, HighestReserved: 3}
+	line, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := append(append(line, '\n'), []byte("{\"version\":1,\"highest_reserved\":")...)
+	if err := os.WriteFile(schedulerGenerationPath(statePath), raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := readSchedulerGenerationRecord(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.HighestReserved != 3 {
+		t.Fatalf("truncated append hid last complete record: %#v", got)
+	}
+	updated, err := updateSchedulerGenerationRecord(statePath, func(record *schedulerGenerationRecord) (bool, error) {
+		record.HighestReserved++
+		return true, nil
+	})
+	if err != nil {
+		t.Fatalf("write after truncated-tail recovery: %v", err)
+	}
+	if updated.HighestReserved != 4 {
+		t.Fatalf("unexpected generation after recovery write: %#v", updated)
+	}
+	got, err = readSchedulerGenerationRecord(statePath)
+	if err != nil || got.HighestReserved != 4 {
+		t.Fatalf("journal was not durably healed: record=%#v err=%v", got, err)
+	}
+}
+
+func TestGenerationJournalRejectsCompleteCorruptFinalRecordWithoutNewline(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	raw := []byte("{\"version\":1,\"highest_reserved\":3}\n{\"version\":1,broken}")
+	if err := os.WriteFile(schedulerGenerationPath(statePath), raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readSchedulerGenerationRecord(statePath); err == nil {
+		t.Fatal("complete corrupt final generation record was accepted")
+	}
+}
+
+func TestGenerationJournalRejectsNonTruncationGarbageAtEOF(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	raw := []byte("{\"version\":1,\"highest_reserved\":3}\nx")
+	if err := os.WriteFile(schedulerGenerationPath(statePath), raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readSchedulerGenerationRecord(statePath); err == nil {
+		t.Fatal("non-truncation garbage at EOF was accepted")
+	}
+}
+
+func TestGenerationJournalRejectsUnsupportedVersion(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	if err := os.WriteFile(schedulerGenerationPath(statePath), []byte("{\"version\":2}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readSchedulerGenerationRecord(statePath); err == nil {
+		t.Fatal("unsupported generation version was accepted")
+	}
+}
+
+func TestGenerationJournalRejectsNonMonotonicHistory(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	raw := []byte("{\"version\":1,\"highest_reserved\":5,\"active_generation\":4}\n{\"version\":1,\"highest_reserved\":4,\"active_generation\":4}\n")
+	if err := os.WriteFile(schedulerGenerationPath(statePath), raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readSchedulerGenerationRecord(statePath); err == nil {
+		t.Fatal("non-monotonic generation history was accepted")
 	}
 }
 

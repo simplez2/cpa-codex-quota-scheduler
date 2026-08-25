@@ -142,6 +142,11 @@ type schedulerRuntimeState struct {
 	serialMissingSince     time.Time
 	serialMissingCount     int
 	serialOverdraft        map[string]serialOverdraftBinding
+	// serialLastSelected records the last committed selection for each auth.
+	// It is only a stable round-robin tie breaker; hard quota and quarantine
+	// decisions always take precedence.
+	serialLastSelected  map[string]time.Time
+	serialFiveHourCycle map[string]time.Time
 }
 
 // serialOverdraftBinding pins an in-flight session to the auth it started on
@@ -218,6 +223,9 @@ func configureSchedulerRuntime(raw []byte) {
 	schedulerRuntime.serialFallbackAuthID = ""
 	schedulerRuntime.serialMissingSince = time.Time{}
 	schedulerRuntime.serialMissingCount = 0
+	schedulerRuntime.serialOverdraft = make(map[string]serialOverdraftBinding)
+	schedulerRuntime.serialLastSelected = make(map[string]time.Time)
+	schedulerRuntime.serialFiveHourCycle = make(map[string]time.Time)
 	if schedulerRuntime.pricing == nil {
 		schedulerRuntime.pricing = make(map[string]modelPricing)
 	}
@@ -1447,6 +1455,8 @@ type persistedBanState struct {
 	SerialLastSwitchAt     time.Time                         `json:"serial_last_switch_at,omitempty"`
 	SerialLastSwitchReason string                            `json:"serial_last_switch_reason,omitempty"`
 	SerialOverdraft        map[string]serialOverdraftBinding `json:"serial_overdraft,omitempty"`
+	SerialLastSelected     map[string]time.Time              `json:"serial_last_selected,omitempty"`
+	SerialFiveHourCycle    map[string]time.Time              `json:"serial_five_hour_cycle,omitempty"`
 	SavedAt                time.Time                         `json:"saved_at"`
 }
 
@@ -1532,8 +1542,8 @@ func (s *schedulerRuntimeState) loadBanStateWithConfirmationMode(path string, re
 	if s.serialActiveAuthID == "" {
 		s.serialSelectionSource = "auto"
 	}
+	s.serialOverdraft = make(map[string]serialOverdraftBinding, len(state.SerialOverdraft))
 	if state.SerialOverdraft != nil {
-		s.serialOverdraft = make(map[string]serialOverdraftBinding, len(state.SerialOverdraft))
 		now := time.Now()
 		for session, binding := range state.SerialOverdraft {
 			if strings.TrimSpace(session) == "" || strings.TrimSpace(binding.AuthID) == "" {
@@ -1550,6 +1560,28 @@ func (s *schedulerRuntimeState) loadBanStateWithConfirmationMode(path string, re
 	s.serialFallbacks = state.SerialFallbacks
 	s.serialLastSwitchAt = state.SerialLastSwitchAt
 	s.serialLastSwitchReason = strings.TrimSpace(state.SerialLastSwitchReason)
+	if state.SerialLastSelected != nil {
+		s.serialLastSelected = make(map[string]time.Time, len(state.SerialLastSelected))
+		for authID, selectedAt := range state.SerialLastSelected {
+			if strings.TrimSpace(authID) == "" || selectedAt.IsZero() {
+				continue
+			}
+			s.serialLastSelected[strings.TrimSpace(authID)] = selectedAt
+		}
+	} else if s.serialLastSelected == nil {
+		s.serialLastSelected = make(map[string]time.Time)
+	}
+	if state.SerialFiveHourCycle != nil {
+		s.serialFiveHourCycle = make(map[string]time.Time, len(state.SerialFiveHourCycle))
+		for authID, resetAt := range state.SerialFiveHourCycle {
+			if strings.TrimSpace(authID) == "" || resetAt.IsZero() {
+				continue
+			}
+			s.serialFiveHourCycle[strings.TrimSpace(authID)] = resetAt
+		}
+	} else if s.serialFiveHourCycle == nil {
+		s.serialFiveHourCycle = make(map[string]time.Time)
+	}
 	s.mu.Unlock()
 }
 
@@ -1584,6 +1616,20 @@ func (s *schedulerRuntimeState) persistBanState() bool {
 	serialFallbacks := s.serialFallbacks
 	serialLastSwitchAt := s.serialLastSwitchAt
 	serialLastSwitchReason := strings.TrimSpace(s.serialLastSwitchReason)
+	serialLastSelected := make(map[string]time.Time, len(s.serialLastSelected))
+	for authID, selectedAt := range s.serialLastSelected {
+		if strings.TrimSpace(authID) == "" || selectedAt.IsZero() {
+			continue
+		}
+		serialLastSelected[strings.TrimSpace(authID)] = selectedAt
+	}
+	serialFiveHourCycle := make(map[string]time.Time, len(s.serialFiveHourCycle))
+	for authID, resetAt := range s.serialFiveHourCycle {
+		if strings.TrimSpace(authID) == "" || resetAt.IsZero() {
+			continue
+		}
+		serialFiveHourCycle[strings.TrimSpace(authID)] = resetAt
+	}
 	serialOverdraft := make(map[string]serialOverdraftBinding, len(s.serialOverdraft))
 	now := time.Now()
 	for session, binding := range s.serialOverdraft {
@@ -1624,6 +1670,8 @@ func (s *schedulerRuntimeState) persistBanState() bool {
 		SerialLastSwitchAt:     serialLastSwitchAt,
 		SerialLastSwitchReason: serialLastSwitchReason,
 		SerialOverdraft:        serialOverdraft,
+		SerialLastSelected:     serialLastSelected,
+		SerialFiveHourCycle:    serialFiveHourCycle,
 		SavedAt:                time.Now(),
 	}
 	raw, err := json.MarshalIndent(state, "", "  ")

@@ -1,88 +1,123 @@
-# Serial Fill-First Scheduler Design
+# Serial Quota-Balanced Scheduler Design
 
 ## Goal
 
-Keep exactly one globally active Codex credential for normal traffic. Do not distribute different sessions across different accounts. Switch only when the active credential is no longer safe or available.
+Keep exactly one globally committed Codex credential for normal traffic. Do not distribute new requests randomly or concurrently across the pool. At committed switch boundaries, preserve weekly capacity and use available 5h cycles efficiently.
 
-## State
+## Persisted state
 
-The scheduler keeps these persisted fields:
+The scheduler persists:
 
-- `serial_active_auth_id`
-- `serial_selected_at`
-- `serial_switches`
-- `serial_last_switch_at`
-- `serial_last_switch_reason`
+- `serial_active_auth_id` and `serial_selection_source`;
+- `serial_selected_at`, switch/fallback counters, and the last switch reason;
+- `serial_overdraft` hashed-session bindings;
+- `serial_last_selected` per-auth timestamps for deterministic rotation;
+- `serial_five_hour_cycle` reset anchors for detecting a real new 5h cycle;
+- the existing 429 quarantine, reset-confirmation, and warmup records.
 
-The state file also contains the existing 429 quarantine and warmup records. Writes are serialized, fsynced, and atomically renamed with owner-only permissions.
+The state contains operational auth identifiers and hashed session identifiers, but no PAT, OAuth token, Cookie, Keeper password, or CPA Management key. Treat the state and Management output as private operational data.
 
 ## Request path
 
 For a pure Codex candidate set:
 
-1. Read the current active auth under the scheduler mutex.
-2. If that auth is still a CPA candidate, is not quarantined, and no fresh quota window has reached `serial_switch_percent`, return it immediately.
-3. Otherwise exclude it and rank the remaining eligible candidates.
-4. Select one candidate, persist it as the new global active auth, and return it for every subsequent request.
-5. If the selected auth is in probe-ready state, the existing atomic half-open lease permits only one concurrent probe.
+1. Read the committed primary and any existing hashed-session binding.
+2. An existing session may keep its previous auth during a bounded overdraft continuation, provided that auth is still present and not quarantined.
+3. A new session is bound only after the current primary is confirmed eligible; it cannot acquire a new binding to an already exhausted auth.
+4. Keep an eligible primary unless a defined preemption boundary is reached.
+5. On a required switch, rank eligible candidates deterministically and commit exactly one replacement.
+6. If the primary is hard-limited and every backup has crossed only the soft threshold, select the best soft-threshold backup.
+7. If no safe or soft-threshold backup exists, return `Handled=false`; CPA host behavior then applies.
 
-No session header or conversation identifier participates in serial selection.
+## Window evaluation
 
-## Switch triggers
+All active Keeper windows are scanned before assigning a reason. Row order cannot change the outcome. Severity is:
 
-The active auth is released or replaced when any of these is observed:
+~~~text
+not_allowed / limit_reached > serial_threshold > eligible
+~~~
 
-- authoritative or headerless 429;
-- a fresh Keeper window reaches the serial threshold;
-- an active window is not allowed or limit-reached;
-- CPA no longer includes the auth in the candidate list;
-- quarantine prevents scheduling.
+The drain duration is:
 
-Stale Keeper data by itself does not cause a switch. This avoids account churn during a Keeper outage. A real 429 remains an authoritative failover signal.
+~~~text
+min(drain_window_hours, complete_window_duration * 10%)
+~~~
+
+With the default six-hour configuration, 5h drains only in its final 30 minutes. Weekly and monthly windows retain a six-hour drain. Drain may cross the soft threshold, but not a hard limit, disallowed state, quarantine, or 429.
 
 ## Candidate ordering
 
-The next auth is selected deterministically:
+Candidate ordering is a strict, deterministic total ordering:
 
-1. configured window class, normally five-hour, weekly, then monthly;
-2. known Keeper class before unknown class;
-3. reset-credit availability, when enabled;
-4. active cycle before dormant cycle, when enabled;
-5. higher current used percentage;
-6. higher CPA priority;
-7. lexicographically stable auth ID.
+1. unprotected weekly capacity before accounts at or below `reserve_weekly_percent`;
+2. drain state;
+3. configured `window_order`;
+4. reset-credit availability when enabled;
+5. on the first pool cold start only, CPA priority and historical fill-first compatibility;
+6. a pool-relative weekly balance tier derived from `switch_hysteresis_percent`;
+7. lower 5h used percentage inside the best weekly tier;
+8. remaining weekly capacity, active-cycle preference, and lower maximum use as tie-breakers;
+9. the longest-idle `serial_last_selected` timestamp;
+10. CPA priority and stable auth ID.
 
-The active auth is never preempted merely because another candidate later becomes more attractive.
+The weekly tier is computed from the whole candidate pool before sorting. It is not a pairwise hysteresis comparison, because pairwise bands are non-transitive and can make a sort depend on input order.
 
-## Concurrent requests
+## Committed switch triggers
 
-Selection and active-auth mutation happen under one mutex. The first concurrent request claims the auth; every other request observes the same claim. Requests may execute concurrently, but they all use the same account until a switch trigger occurs.
+The global primary changes for:
 
-## Warmup
+- a soft `serial_switch_percent` crossing outside drain, when a replacement exists;
+- `allowed=false` or `limit_reached=true`;
+- authoritative 429, quarantine, or failed half-open state;
+- candidate absence confirmed for at least 90 seconds and three observations;
+- a higher-priority window class becoming available;
+- weekly reserve protection when an unprotected replacement exists;
+- one constrained rotation after a verified 5h reset boundary advances by more than five minutes.
 
-Warmup is deliberately separate from normal serial routing:
+Manual selection disables only automatic 5h cycle rotation. Existing hard-limit, 429, quarantine, candidate-loss, higher-priority-window, and weekly-reserve protections remain active.
 
-- every fresh, fully available auth with credible not-yet-started window evidence may become a warmup candidate;
-- candidates execute strictly one at a time through a pinned auth request;
-- the committed normal-traffic auth is not changed by warmup selection or completion;
-- an HTTP success remains pending until a later Keeper snapshot confirms a stable reset anchor;
-- a warmup 429 uses the normal quarantine path without committing a different serial auth;
-- generation ownership and an OS-backed instance lease prevent duplicate work across hot reloads and processes.
+## Five-hour cycle rotation
 
-This activates eligible dormant cycles without distributing ordinary client traffic across the pool.
+The scheduler records the selected auth's 5h reset anchor. A new cycle is recognized only when:
+
+- the previous recorded reset boundary has elapsed; and
+- the fresh Keeper reset anchor advances by more than five minutes.
+
+This prevents moving full-duration placeholder resets from looking like a new cycle on every refresh. A detected boundary is consumed once even if rotation is blocked by weekly reserve or the absence of a peer, preventing a delayed mid-cycle switch.
+
+## Existing-session overdraft
+
+When CPA supplies a stable session identifier, the plugin hashes it and records the auth that already served it. After a global threshold or hard-limit switch, that existing session may continue on the old auth while new sessions use the replacement. Bindings have a 30-minute sliding inactivity TTL and are removed on candidate disappearance or quarantine. This mechanism preserves observed in-flight continuation behavior without claiming that upstream quota or billing behavior is guaranteed.
+
+## Concurrency and hot reload
+
+Selection and primary mutation happen under one process mutex. Cross-generation state commits use a durable generation fence.
+
+Version 0.1.20 stores the generation lock in the stable `state_path.generation.lock` file. Once the append-only `state_path.generation` journal reaches 768 KiB, the next generation I/O compacts it before running its callback; legacy journals up to 16 MiB are recovered and atomically reduced to their last valid monotonic record. The first migration from the older journal-inode lock protocol must use a controlled CPA restart; subsequent same-protocol reloads can use generation ownership normally.
+
+## Warmup boundary
+
+Warmup remains separate from normal scheduling:
+
+- candidates execute one at a time through a pinned auth request;
+- warmup never changes the committed normal-traffic primary;
+- HTTP success remains pending until Keeper confirms a stable reset anchor;
+- 429 uses normal quarantine;
+- cyber-policy, abuse, auth, and workspace failures are terminal blocked outcomes and are not automatically retried.
 
 ## Failure behavior
 
 | Failure | Behavior |
 |---|---|
-| Keeper unavailable | keep current auth; deterministic single-auth selection if none exists |
-| Partial/stale quota | do not infer a threshold crossing |
-| 429 with quota headers | quarantine until reset, then one half-open probe |
+| Keeper unavailable or stale | keep the current eligible primary; do not infer a quota transition |
+| 429 with quota headers | quarantine until reset, then admit one half-open probe |
 | 429 without quota headers | bounded probation, then one half-open probe |
-| Current auth removed by CPA | choose the next eligible auth |
-| All candidates quarantined/exhausted | return `Handled=false`; CPA host behavior applies |
-| Mixed or third-party provider set | return `Handled=false` |
+| transient CPA candidate suppression | stable request-local provisional fallback |
+| confirmed candidate loss | commit the best eligible replacement |
+| hard-limited primary, soft-threshold backup | explicitly commit the best soft-threshold backup |
+| all candidates hard-exhausted/quarantined | return `Handled=false` |
+| mixed or third-party provider set | return `Handled=false` |
 
 ## Security boundary
 
-The plugin registers only authenticated Management API routes. It does not place dynamic state, privileged operations, iframes, or host callbacks under the unauthenticated resource route family.
+The plugin registers only authenticated Management API routes. It does not place dynamic state, privileged operations, iframes, or host callbacks under the unauthenticated resource route family. It does not modify credentials, authentication methods, model lists, provider routes, or third-party APIs.

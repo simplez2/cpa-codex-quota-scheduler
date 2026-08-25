@@ -245,12 +245,21 @@ func TestManualSerialPersistenceFailureRestoresAllRuntimeState(t *testing.T) {
 	state.serialFallbackAuthID = "fallback"
 	state.serialMissingSince = now.Add(-time.Minute)
 	state.serialMissingCount = 2
+	previousReplacementSelected := now.Add(-3 * time.Hour)
+	previousReplacementCycle := now.Add(90 * time.Minute)
+	state.serialLastSelected = make(map[string]time.Time)
+	state.serialFiveHourCycle = make(map[string]time.Time)
+	state.serialLastSelected["replacement"] = previousReplacementSelected
+	state.serialFiveHourCycle["replacement"] = previousReplacementCycle
 	state.cfg.StatePath = t.TempDir()
 
 	if _, err := state.setManualSerialActive("replacement", now); err == nil {
 		t.Fatal("manual selection unexpectedly persisted to a directory")
 	}
 	assertManualRuntimeRestored(t, state, "existing", "manual", now.Add(-2*time.Hour), 7, now.Add(-time.Hour), "prior", "missing", "fallback", now.Add(-time.Minute), 2)
+	if !state.serialLastSelected["replacement"].Equal(previousReplacementSelected) || !state.serialFiveHourCycle["replacement"].Equal(previousReplacementCycle) {
+		t.Fatalf("selection history was not restored: last=%v cycle=%v", state.serialLastSelected["replacement"], state.serialFiveHourCycle["replacement"])
+	}
 
 	if _, err := state.clearManualSerialActive(now); err == nil {
 		t.Fatal("manual clear unexpectedly persisted to a directory")

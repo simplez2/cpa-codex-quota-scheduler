@@ -1,6 +1,6 @@
 # Codex Quota Scheduler 运行逻辑与状态机
 
-本文描述 v0.1.19 源码的真实运行逻辑，供代码审查、生产验收和故障定位使用。只有匹配 tag 与 Release 资产均存在时，才视为正式发布。
+本文描述 v0.1.20 源码的真实运行逻辑，供代码审查、生产验收和故障定位使用。只有匹配 tag 与 Release 资产均存在时，才视为正式发布。
 
 ## 1. 数据来源与可信度
 
@@ -16,28 +16,30 @@ window-minutes=0 等 Primary/Secondary 占位头不覆盖 Keeper 的真实周/�
 
 ## 2. 全局串行主账号
 
-serial 模式不读取会话 ID。所有普通请求共享一份持久化主账号状态：
+serial 模式为普通新请求维护一个全局主账号；当 CPA 提供稳定会话 ID 时，只将其哈希用于识别“已经由旧账号服务的会话”，不会据此把新请求随机分散到多个账号：
 
 ~~~text
 未选择
   -> 按窗口等级和同类规则选出主账号
   -> 已提交主账号
        -> 正常：持续使用同一账号
+       -> 旧会话：阈值/硬限额切换后可短时续跑旧账号
+       -> 新会话：只绑定已确认可用的新主账号
        -> 临时候选缺席：请求级 provisional fallback
        -> 阈值/429/隔离/确认缺席：正式切换
 ~~~
 
-### 2.1 首次选择顺序
+### 2.1 候选选择顺序
 
-1. window_order，默认 5h -> weekly -> monthly；
-2. 已识别窗口优先于未知窗口；
-3. prefer_reset_credits=true 时，同类优先有 reset credit；
-4. serial_prefer_active_cycle=true 时，同类优先已启动周期；
-5. 同类优先 used% 更高者，将消耗集中到较少账号；
-6. CPA priority 更高；
-7. auth ID 字典序，保证结果稳定。
+1. weekly 剩余量小于等于 `reserve_weekly_percent` 的账号进入保护分区；存在未保护账号时不消耗保护账号；
+2. drain 状态与 `window_order`，默认 5h -> weekly -> monthly；
+3. `prefer_reset_credits=true` 时优先有 reset credit；
+4. 整个候选池第一次 cold start 才兼容旧 CPA priority/fill-first；
+5. 有选择历史后，以 `switch_hysteresis_percent` 把 weekly 剩余额度分成稳定档位；
+6. 最佳 weekly 档位内优先 5h used% 更低者；
+7. 最久未选择者优先，最后用 CPA priority 与 auth ID 保证稳定。
 
-窗口等级具有严格优先级。当前主账号若属于较低优先级窗口，而更高优先级窗口恢复可用，代码会按 window_order 执行必要的等级抢占；同一等级内不会仅因另一个账号分数变高而抢占。
+weekly 档位在排序前基于整个候选池计算，不做两两 hysteresis 比较，避免出现非传递排序。健康主账号在普通请求之间保持提交状态，不会因每次候选分数波动而切换。
 
 ### 2.2 正式切换条件
 
@@ -47,8 +49,21 @@ serial 模式不读取会话 ID。所有普通请求共享一份持久化主账�
 - 当前账号处于 cooldown/half-open 等不可调度状态；
 - CPA 连续不再提供该候选至少 90 秒且达到 3 次确认；
 - 更高优先级的窗口类别恢复并满足严格抢占条件。
+- 当前主账号进入 weekly reserve，而存在未保护备用账号；
+- 自动模式检测到可信 5h reset anchor 已越过旧边界并前移超过 5 分钟，执行一次受约束轮转。
 
-### 2.3 candidate_unavailable 为什么不等于切号
+`serial_switch_percent` 是软阈值。当前账号硬限额、`allowed=false` 或隔离时，即使所有备用账号都只达到软阈值，也会明确选择最优软阈值备用账号；只有所有候选都硬耗尽或隔离时才返回 `Handled=false`。
+
+### 2.3 5h drain、新周期与 overdraft
+
+- 实际 drain 时长为 `min(drain_window_hours, 完整窗口长度的 10%)`；默认 5h 只在最后约 30 分钟 drain，weekly/monthly 最多 6 小时。
+- drain 可越过软阈值，但不能越过 `limit_reached`、`allowed=false`、429 或隔离。
+- 只有旧 reset 边界已经经过，且新 reset anchor 前移超过 5 分钟，才认定进入新 5h 周期；移动的完整周期占位值不会反复触发。
+- 新周期事件无论成功轮转还是因保护条件被阻止，都会消费一次，避免周期中途延迟轮转。
+- 手工主账号不参与 5h 周期轮转，但仍受硬限额、429、隔离、确认缺席、更高窗口等级和 weekly reserve 保护。
+- overdraft 只保留已经存在的哈希会话绑定，使用 30 分钟滑动空闲 TTL；新会话不会绑定到已经耗尽的旧主账号。
+
+### 2.4 candidate_unavailable 为什么不等于切号
 
 CPA 在 408/5xx 后可能暂时将某 auth 从候选池移除约 60 秒。调度器先保留已提交主账号，仅为当前请求选一个稳定的 provisional auth：
 
@@ -139,7 +154,7 @@ warmup_candidates=0 只说明当前轮没有可执行候选，不等于功能关
 
 ## 7. 平台批量重置与新周期识别
 
-Keeper 的 usage identity 清单会保留 disabled 历史行。v0.1.19 首先按 Keeper 同步的 `disabled/is_deleted` 排除这些行，并拒绝提交未请求的历史 cache item；真正发起 `/quota/refresh` 前，还必须与 CPA 当前 active、非 unavailable 的 Codex auth index 求交集。Host/Management 身份清单不可用时，仅跳过有副作用的 refresh 并记录 `auth_inventory_unavailable`，已读取的配额快照仍可提交。该规则同时覆盖常规 stale/missing 刷新与 ban reset 二次确认，不区分 OAuth 或 PAT，也不会调用 reset-credit 消费接口。
+Keeper 的 usage identity 清单会保留 disabled 历史行。v0.1.20 首先按 Keeper 同步的 `disabled/is_deleted` 排除这些行，并拒绝提交未请求的历史 cache item；真正发起 `/quota/refresh` 前，还必须与 CPA 当前 active、非 unavailable 的 Codex auth index 求交集。Host/Management 身份清单不可用时，仅跳过有副作用的 refresh 并记录 `auth_inventory_unavailable`，已读取的配额快照仍可提交。该规则同时覆盖常规 stale/missing 刷新与 ban reset 二次确认，不区分 OAuth 或 PAT，也不会调用 reset-credit 消费接口。
 
 当平台提前把多个账号恢复为 0% 时，旧 quota ban 不能立即相信，也不能永久保留。对账必须满足：
 
@@ -156,10 +171,12 @@ Keeper 的 usage identity 清单会保留 disabled 历史行。v0.1.19 首先按
 
 ## 8. 热加载与 generation ownership
 
-CPA 热重载可能让新旧动态库 generation 短时间同时存在。v0.1.19 使用两层互斥：
+CPA 热重载可能让新旧动态库 generation 短时间同时存在。v0.1.20 使用两层互斥：
 
-- Generation record：state_path.generation 记录当前 owner。新 generation 原子认领后，旧 generation 发现被替代便停止刷新、调度副作用和完整状态写入。
+- Generation lock 与 record：`state_path.generation.lock` 是永不替换的 OS 锁文件；`state_path.generation` 记录当前 owner。journal 达到 768 KiB 后，会在下一次 generation I/O callback 前自动压缩；旧版遗留的 1–16 MiB journal 会在有界校验后压缩到最后一条有效单调记录。超过 16 MiB 继续 fail closed。
 - Warmup instance lease：state_path.warmup.lock 使用 OS 文件锁，保证跨进程同时只有一个预热执行者。
+
+从 v0.1.19 的“锁 journal 本身”协议首次迁移到独立 lock 文件时，必须受控重启 CPA，确保旧 DSO 句柄全部退出；迁移后同协议版本才可继续使用 generation 热替换。
 
 新 generation 启动后有 15 秒预热宽限，用于合并旧实例刚完成的 outcome journal，避免同一账号在热替换边界被重复请求。被替代实例唯一允许的尾部写入是自己已经持有租约的 warmup outcome，且写到单独 journal；新 owner 合并后清空 journal。
 
@@ -170,7 +187,10 @@ state_path JSON 当前包含：
 - bans 与 half-open/probation 元数据；
 - warmup outcome；
 - 外部 reset 双快照确认进度；
-- serial_active_auth_id、选择时间、正式切换/临时 fallback 计数和最近原因；
+- serial_active_auth_id、selection source、选择时间、正式切换/临时 fallback 计数和最近原因；
+- serial_overdraft 哈希会话绑定；
+- serial_last_selected 账号轮转时间；
+- serial_five_hour_cycle 5h reset anchor；
 - 保存时间和格式版本。
 
 状态不包含 Keeper 密码、CPA Management key、PAT、OAuth token、Cookie 或原始错误正文。目录以 0700 创建，文件以 0600 临时写入、fsync，再在 generation fence 内原子 rename。
@@ -180,6 +200,7 @@ state_path JSON 当前包含：
 ~~~text
 state.json
 state.json.generation
+state.json.generation.lock
 state.json.warmup.lock
 state.json.warmup.outcomes
 ~~~
@@ -194,7 +215,10 @@ GET /v0/management/plugins/codex-quota-scheduler/quota 的关键字段：
 |---|---|
 | scheduler_mode | 生产应为 serial。 |
 | serial_active_auth_id | 当前全局主账号，仅用于已认证管理诊断。 |
+| serial_selection_source | 当前主账号来自 auto 还是 manual。 |
+| serial_overdraft_sessions | 当前仍有效的旧会话续跑绑定数量。 |
 | serial_switches | 正式切换次数，不包含 provisional fallback。 |
+| serial_last_switch_reason | 包含 serial_threshold、weekly_reserve、five_hour_cycle_rotation、threshold_fallback 等原因。 |
 | serial_provisional_fallbacks | 临时候选缺席导致的请求级备用次数。 |
 | generation_active | 当前实例是否仍为 generation owner。 |
 | fresh_snapshots | 可用于真实策略判断的新鲜 Keeper 快照数量。 |
@@ -208,7 +232,7 @@ GET /v0/management/plugins/codex-quota-scheduler/quota 的关键字段：
 ## 11. 不变量
 
 - 正常流量只提交一个全局 auth；预热不会改变它。
-- 5h -> weekly -> monthly 是类别优先级，不是账号轮询顺序。
+- 5h -> weekly -> monthly 是类别优先级；系统不做请求级轮询，但会在可信 5h 新周期边界执行一次串行轮转。
 - 100% 可用不自动等于“未启动”；必须有 reset anchor 证据。
 - HTTP 2xx 不自动等于预热成功；必须由后续 Keeper 快照确认。
 - cyber_policy 原样归类为 blocked code，绝不进入自动重试。

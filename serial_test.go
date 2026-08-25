@@ -684,3 +684,343 @@ func TestSerialWarmupActivatesFullBackupWithoutReplacingActiveTrafficAuth(t *tes
 		t.Fatalf("serial active auth changed to %q during warmup selection", state.serialActiveAuthID)
 	}
 }
+
+func TestSerialSchedulerHardFiveHourLimitFallsBackToSoftThresholdBackup(t *testing.T) {
+	resetBanStoreForTest()
+	now := time.Now()
+	state := newSerialTestState(now)
+	state.mu.Lock()
+	state.serialActiveAuthID = "primary"
+	state.quotas["primary"] = quotaSnapshot{
+		AuthID: "primary", RefreshedAt: now,
+		Windows: []quotaWindow{
+			{Class: "5h", UsedPercent: 100, Allowed: true, LimitReached: true, ResetAt: now.Add(2 * time.Hour), ObservedAt: now},
+			{Class: "weekly", UsedPercent: 40, Allowed: true, ResetAt: now.Add(4 * 24 * time.Hour), ObservedAt: now},
+		},
+	}
+	state.quotas["backup"] = quotaSnapshot{
+		AuthID: "backup", RefreshedAt: now,
+		Windows: []quotaWindow{
+			{Class: "5h", UsedPercent: 98, Allowed: true, ResetAt: now.Add(2 * time.Hour), ObservedAt: now},
+			{Class: "weekly", UsedPercent: 20, Allowed: true, ResetAt: now.Add(4 * 24 * time.Hour), ObservedAt: now},
+		},
+	}
+	state.mu.Unlock()
+	got := state.serialPick(serialTestRequest(), now)
+	if !got.Handled || got.AuthID != "backup" {
+		t.Fatalf("hard exhausted primary did not switch to soft-threshold backup: %#v", got)
+	}
+	if state.serialLastSwitchReason != "limit_reached" {
+		t.Fatalf("switch reason = %q; want limit_reached", state.serialLastSwitchReason)
+	}
+}
+
+func TestSerialSchedulerPrefersLeastUsedFiveHourBackupAfterInitialSelection(t *testing.T) {
+	resetBanStoreForTest()
+	now := time.Now()
+	state := newSerialTestState(now)
+	state.mu.Lock()
+	state.serialActiveAuthID = "primary"
+	state.serialLastSelected = map[string]time.Time{
+		"primary": now.Add(-2 * time.Hour),
+		"backup":  now.Add(-30 * time.Minute),
+		"third":   now.Add(-10 * time.Minute),
+	}
+	state.quotas["primary"] = quotaSnapshot{AuthID: "primary", RefreshedAt: now, Windows: []quotaWindow{
+		{Class: "5h", UsedPercent: 98, Allowed: true, ResetAt: now.Add(4 * time.Hour), ObservedAt: now},
+		{Class: "weekly", UsedPercent: 30, Allowed: true, ResetAt: now.Add(4 * 24 * time.Hour), ObservedAt: now},
+	}}
+	state.quotas["backup"] = quotaSnapshot{AuthID: "backup", RefreshedAt: now, Windows: []quotaWindow{
+		{Class: "5h", UsedPercent: 10, Allowed: true, ResetAt: now.Add(4 * time.Hour), ObservedAt: now},
+		{Class: "weekly", UsedPercent: 30, Allowed: true, ResetAt: now.Add(4 * 24 * time.Hour), ObservedAt: now},
+	}}
+	state.quotas["third"] = quotaSnapshot{AuthID: "third", RefreshedAt: now, Windows: []quotaWindow{
+		{Class: "5h", UsedPercent: 40, Allowed: true, ResetAt: now.Add(4 * time.Hour), ObservedAt: now},
+		{Class: "weekly", UsedPercent: 30, Allowed: true, ResetAt: now.Add(4 * 24 * time.Hour), ObservedAt: now},
+	}}
+	state.mu.Unlock()
+	got := state.serialPick(pluginapi.SchedulerPickRequest{
+		Provider: providerCodex,
+		Candidates: []pluginapi.SchedulerAuthCandidate{
+			{ID: "primary", Provider: providerCodex},
+			{ID: "backup", Provider: providerCodex},
+			{ID: "third", Provider: providerCodex},
+		},
+	}, now)
+	if !got.Handled || got.AuthID != "backup" {
+		t.Fatalf("least-used 5h backup was not selected: %#v", got)
+	}
+}
+
+func TestSerialSchedulerWeeklyReservePreemptsProtectedCurrent(t *testing.T) {
+	resetBanStoreForTest()
+	now := time.Now()
+	state := newSerialTestState(now)
+	state.mu.Lock()
+	state.serialActiveAuthID = "primary"
+	state.serialLastSelected = map[string]time.Time{"primary": now.Add(-time.Hour)}
+	state.quotas["primary"] = quotaSnapshot{AuthID: "primary", RefreshedAt: now, Windows: []quotaWindow{
+		{Class: "5h", UsedPercent: 20, Allowed: true, ResetAt: now.Add(4 * time.Hour), ObservedAt: now},
+		{Class: "weekly", UsedPercent: 95, Allowed: true, ResetAt: now.Add(4 * 24 * time.Hour), ObservedAt: now},
+	}}
+	state.quotas["backup"] = quotaSnapshot{AuthID: "backup", RefreshedAt: now, Windows: []quotaWindow{
+		{Class: "5h", UsedPercent: 30, Allowed: true, ResetAt: now.Add(4 * time.Hour), ObservedAt: now},
+		{Class: "weekly", UsedPercent: 30, Allowed: true, ResetAt: now.Add(4 * 24 * time.Hour), ObservedAt: now},
+	}}
+	state.mu.Unlock()
+	got := state.serialPick(pluginapi.SchedulerPickRequest{
+		Provider: providerCodex,
+		Candidates: []pluginapi.SchedulerAuthCandidate{
+			{ID: "primary", Provider: providerCodex},
+			{ID: "backup", Provider: providerCodex},
+		},
+	}, now)
+	if !got.Handled || got.AuthID != "backup" {
+		t.Fatalf("weekly-protected current was not preempted: %#v", got)
+	}
+}
+
+func TestSerialSchedulerRotatesOnceWhenFiveHourCycleAdvances(t *testing.T) {
+	resetBanStoreForTest()
+	now := time.Now()
+	oldReset := now.Add(-time.Hour)
+	newReset := now.Add(4 * time.Hour)
+	state := newSerialTestState(now)
+	state.mu.Lock()
+	state.serialActiveAuthID = "primary"
+	state.serialSelectionSource = "auto"
+	state.serialLastSelected = map[string]time.Time{
+		"primary": now.Add(-5 * time.Hour),
+		"backup":  now.Add(-10 * time.Hour),
+	}
+	state.serialFiveHourCycle = map[string]time.Time{"primary": oldReset}
+	state.quotas["primary"] = quotaSnapshot{AuthID: "primary", RefreshedAt: now, Windows: []quotaWindow{
+		{Class: "5h", UsedPercent: 0, Allowed: true, ResetAt: newReset, ObservedAt: now},
+		{Class: "weekly", UsedPercent: 45, Allowed: true, ResetAt: now.Add(4 * 24 * time.Hour), ObservedAt: now},
+	}}
+	state.quotas["backup"] = quotaSnapshot{AuthID: "backup", RefreshedAt: now, Windows: []quotaWindow{
+		{Class: "5h", UsedPercent: 0, Allowed: true, ResetAt: newReset, ObservedAt: now},
+		{Class: "weekly", UsedPercent: 25, Allowed: true, ResetAt: now.Add(4 * 24 * time.Hour), ObservedAt: now},
+	}}
+	state.mu.Unlock()
+
+	got := state.serialPick(serialTestRequest(), now)
+	if !got.Handled || got.AuthID != "backup" {
+		t.Fatalf("new 5h cycle did not rotate to balanced backup: %#v", got)
+	}
+	if state.serialLastSwitchReason != "five_hour_cycle_rotation" {
+		t.Fatalf("switch reason = %q; want five_hour_cycle_rotation", state.serialLastSwitchReason)
+	}
+	if !state.serialFiveHourCycle["backup"].Equal(newReset) {
+		t.Fatalf("selected cycle anchor = %v; want %v", state.serialFiveHourCycle["backup"], newReset)
+	}
+
+	again := state.serialPick(serialTestRequest(), now.Add(time.Minute))
+	if !again.Handled || again.AuthID != "backup" {
+		t.Fatalf("cycle rotation repeated inside the same cycle: %#v", again)
+	}
+}
+
+func TestSerialSchedulerDoesNotTreatFutureFiveHourResetDriftAsNewCycle(t *testing.T) {
+	resetBanStoreForTest()
+	now := time.Now()
+	state := newSerialTestState(now)
+	state.mu.Lock()
+	state.serialActiveAuthID = "primary"
+	state.serialSelectionSource = "auto"
+	state.serialLastSelected = map[string]time.Time{
+		"primary": now.Add(-time.Hour),
+		"backup":  now.Add(-2 * time.Hour),
+	}
+	state.serialFiveHourCycle = map[string]time.Time{"primary": now.Add(3 * time.Hour)}
+	state.quotas["primary"] = quotaSnapshot{AuthID: "primary", RefreshedAt: now, Windows: []quotaWindow{
+		{Class: "5h", UsedPercent: 0, Allowed: true, ResetAt: now.Add(4 * time.Hour), ObservedAt: now},
+		{Class: "weekly", UsedPercent: 25, Allowed: true, ResetAt: now.Add(4 * 24 * time.Hour), ObservedAt: now},
+	}}
+	state.quotas["backup"] = quotaSnapshot{AuthID: "backup", RefreshedAt: now, Windows: []quotaWindow{
+		{Class: "5h", UsedPercent: 0, Allowed: true, ResetAt: now.Add(4 * time.Hour), ObservedAt: now},
+		{Class: "weekly", UsedPercent: 25, Allowed: true, ResetAt: now.Add(4 * 24 * time.Hour), ObservedAt: now},
+	}}
+	state.mu.Unlock()
+
+	got := state.serialPick(serialTestRequest(), now)
+	if !got.Handled || got.AuthID != "primary" {
+		t.Fatalf("future reset-anchor drift rotated the active auth: %#v", got)
+	}
+}
+
+func TestSerialSchedulerDoesNotCreateOverdraftForNewHardLimitedSessionWithoutBackup(t *testing.T) {
+	resetBanStoreForTest()
+	now := time.Now()
+	state := newSerialTestState(now)
+	state.mu.Lock()
+	state.serialActiveAuthID = "primary"
+	state.quotas["primary"] = quotaSnapshot{AuthID: "primary", RefreshedAt: now, Windows: []quotaWindow{
+		{Class: "5h", UsedPercent: 100, Allowed: true, LimitReached: true, ResetAt: now.Add(2 * time.Hour), ObservedAt: now},
+		{Class: "weekly", UsedPercent: 40, Allowed: true, ResetAt: now.Add(4 * 24 * time.Hour), ObservedAt: now},
+	}}
+	state.mu.Unlock()
+	req := pluginapi.SchedulerPickRequest{
+		Provider: providerCodex,
+		Model:    "gpt-5.6-sol",
+		Candidates: []pluginapi.SchedulerAuthCandidate{
+			{ID: "primary", Provider: providerCodex},
+		},
+		Options: pluginapi.SchedulerOptions{Headers: map[string][]string{"X-Session-ID": {"new-hard-limited-session"}}},
+	}
+
+	first := state.serialPick(req, now)
+	if first.Handled {
+		t.Fatalf("new session was routed to a hard-limited auth: %#v", first)
+	}
+	second := state.serialPick(req, now.Add(time.Second))
+	if second.Handled {
+		t.Fatalf("new session acquired an overdraft binding after hard limit: %#v", second)
+	}
+	if len(state.serialOverdraft) != 0 {
+		t.Fatalf("unexpected overdraft bindings: %#v", state.serialOverdraft)
+	}
+}
+
+func TestSerialSchedulerManualSelectionDoesNotRotateOnFiveHourCycleAdvance(t *testing.T) {
+	resetBanStoreForTest()
+	now := time.Now()
+	state := newSerialTestState(now)
+	state.mu.Lock()
+	state.serialActiveAuthID = "primary"
+	state.serialSelectionSource = "manual"
+	state.serialFiveHourCycle = map[string]time.Time{"primary": now.Add(time.Hour)}
+	state.quotas["primary"] = quotaSnapshot{AuthID: "primary", RefreshedAt: now, Windows: []quotaWindow{
+		{Class: "5h", UsedPercent: 0, Allowed: true, ResetAt: now.Add(4 * time.Hour), ObservedAt: now},
+		{Class: "weekly", UsedPercent: 40, Allowed: true, ResetAt: now.Add(4 * 24 * time.Hour), ObservedAt: now},
+	}}
+	state.quotas["backup"] = quotaSnapshot{AuthID: "backup", RefreshedAt: now, Windows: []quotaWindow{
+		{Class: "5h", UsedPercent: 0, Allowed: true, ResetAt: now.Add(4 * time.Hour), ObservedAt: now},
+		{Class: "weekly", UsedPercent: 10, Allowed: true, ResetAt: now.Add(4 * 24 * time.Hour), ObservedAt: now},
+	}}
+	state.mu.Unlock()
+
+	got := state.serialPick(serialTestRequest(), now)
+	if !got.Handled || got.AuthID != "primary" {
+		t.Fatalf("manual primary was rotated automatically: %#v", got)
+	}
+}
+
+func TestSerialSchedulerFiveHourDrainDoesNotCoverWholeCycle(t *testing.T) {
+	now := time.Now()
+	cfg := defaultPluginConfig()
+	window := quotaWindow{Class: "5h", WindowSeconds: int64((5 * time.Hour).Seconds()), Allowed: true, ResetAt: now.Add(4 * time.Hour)}
+	if serialWindowDrains(window, cfg, now) {
+		t.Fatal("5h window entered drain mode four hours before reset")
+	}
+	window.ResetAt = now.Add(20 * time.Minute)
+	if !serialWindowDrains(window, cfg, now) {
+		t.Fatal("5h window did not enter drain mode during its final 30 minutes")
+	}
+}
+
+func TestInspectSerialCandidateHardLimitOverridesEarlierSoftThreshold(t *testing.T) {
+	now := time.Now()
+	cfg := defaultPluginConfig()
+	choice := inspectSerialCandidate(
+		pluginapi.SchedulerAuthCandidate{ID: "acct", Provider: providerCodex},
+		quotaSnapshot{AuthID: "acct", RefreshedAt: now, Windows: []quotaWindow{
+			{Class: "weekly", UsedPercent: 98, Allowed: true, ResetAt: now.Add(4 * 24 * time.Hour), ObservedAt: now},
+			{Class: "5h", UsedPercent: 100, Allowed: true, LimitReached: true, ResetAt: now.Add(2 * time.Hour), ObservedAt: now},
+		}},
+		true,
+		cfg,
+		now,
+	)
+	if choice.Eligible || choice.Reason != "limit_reached" {
+		t.Fatalf("hard limit was masked by earlier soft threshold: %#v", choice)
+	}
+}
+
+func TestSortSerialCandidatesKeepsWeeklyReserveProtected(t *testing.T) {
+	now := time.Now()
+	cfg := defaultPluginConfig()
+	choices := []serialCandidate{
+		{
+			Candidate:       pluginapi.SchedulerAuthCandidate{ID: "protected", Priority: 100},
+			QuotaKnown:      true,
+			WeeklyKnown:     true,
+			WeeklyRemaining: 5,
+			WeeklyProtected: true,
+			DrainActive:     true,
+			ResetCredits:    1,
+			LastSelectedAt:  now.Add(-2 * time.Hour),
+		},
+		{
+			Candidate:       pluginapi.SchedulerAuthCandidate{ID: "safe", Priority: 1},
+			QuotaKnown:      true,
+			WeeklyKnown:     true,
+			WeeklyRemaining: 40,
+			LastSelectedAt:  now.Add(-time.Hour),
+		},
+	}
+	sortSerialCandidates(choices, cfg)
+	if choices[0].Candidate.ID != "safe" {
+		t.Fatalf("weekly-protected account outranked safe capacity: %#v", choices)
+	}
+}
+
+func TestSortSerialCandidatesHysteresisIsInputOrderIndependent(t *testing.T) {
+	now := time.Now()
+	cfg := defaultPluginConfig()
+	base := []serialCandidate{
+		{Candidate: pluginapi.SchedulerAuthCandidate{ID: "a"}, WeeklyKnown: true, WeeklyRemaining: 50, FiveHourKnown: true, FiveHourUsed: 40, LastSelectedAt: now.Add(-time.Hour)},
+		{Candidate: pluginapi.SchedulerAuthCandidate{ID: "b"}, WeeklyKnown: true, WeeklyRemaining: 49, FiveHourKnown: true, FiveHourUsed: 10, LastSelectedAt: now.Add(-2 * time.Hour)},
+		{Candidate: pluginapi.SchedulerAuthCandidate{ID: "c"}, WeeklyKnown: true, WeeklyRemaining: 47, FiveHourKnown: true, FiveHourUsed: 0, LastSelectedAt: now.Add(-3 * time.Hour)},
+	}
+	orders := [][]int{{0, 1, 2}, {2, 0, 1}, {1, 2, 0}}
+	for _, order := range orders {
+		choices := []serialCandidate{base[order[0]], base[order[1]], base[order[2]]}
+		sortSerialCandidates(choices, cfg)
+		got := []string{choices[0].Candidate.ID, choices[1].Candidate.ID, choices[2].Candidate.ID}
+		want := []string{"b", "a", "c"}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("input order %v produced %v; want %v", order, got, want)
+			}
+		}
+	}
+}
+
+func TestSerialSchedulerConsumesBlockedFiveHourCycleRotation(t *testing.T) {
+	resetBanStoreForTest()
+	now := time.Now()
+	newReset := now.Add(4 * time.Hour)
+	state := newSerialTestState(now)
+	state.mu.Lock()
+	state.serialActiveAuthID = "primary"
+	state.serialSelectionSource = "auto"
+	state.serialFiveHourCycle = map[string]time.Time{"primary": now.Add(-time.Hour)}
+	state.quotas["primary"] = quotaSnapshot{AuthID: "primary", RefreshedAt: now, Windows: []quotaWindow{
+		{Class: "5h", UsedPercent: 0, Allowed: true, ResetAt: newReset, ObservedAt: now},
+		{Class: "weekly", UsedPercent: 20, Allowed: true, ResetAt: now.Add(4 * 24 * time.Hour), ObservedAt: now},
+	}}
+	state.quotas["backup"] = quotaSnapshot{AuthID: "backup", RefreshedAt: now, Windows: []quotaWindow{
+		{Class: "5h", UsedPercent: 0, Allowed: true, ResetAt: newReset, ObservedAt: now},
+		{Class: "weekly", UsedPercent: 95, Allowed: true, ResetAt: now.Add(4 * 24 * time.Hour), ObservedAt: now},
+	}}
+	state.mu.Unlock()
+
+	first := state.serialPick(serialTestRequest(), now)
+	if !first.Handled || first.AuthID != "primary" {
+		t.Fatalf("protected backup received blocked cycle rotation: %#v", first)
+	}
+	if !state.serialFiveHourCycle["primary"].Equal(newReset) {
+		t.Fatalf("blocked cycle transition was not consumed: %v", state.serialFiveHourCycle["primary"])
+	}
+
+	state.mu.Lock()
+	backup := state.quotas["backup"]
+	backup.Windows[1].UsedPercent = 20
+	state.quotas["backup"] = backup
+	state.mu.Unlock()
+	second := state.serialPick(serialTestRequest(), now.Add(time.Minute))
+	if !second.Handled || second.AuthID != "primary" {
+		t.Fatalf("consumed cycle rotated late after protection changed: %#v", second)
+	}
+}

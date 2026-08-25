@@ -1,7 +1,7 @@
 package main
 
 import (
-	"bufio"
+	"bytes"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
@@ -20,6 +20,9 @@ const (
 	generationLockWait               = 2 * time.Second
 	generationLockRetry              = 5 * time.Millisecond
 	generationRecordMaxBytes         = 1 << 20
+	generationRecordCompactAt        = 3 << 18
+	generationRecordRecoveryMaxBytes = 16 << 20
+	generationRecordLineMaxBytes     = 64 << 10
 )
 
 var errGenerationLockBusy = errors.New("scheduler generation record is busy")
@@ -388,51 +391,77 @@ func schedulerGenerationPath(statePath string) string {
 	return strings.TrimSpace(statePath) + ".generation"
 }
 
+func schedulerGenerationLockPath(statePath string) string {
+	return schedulerGenerationPath(statePath) + ".lock"
+}
+
 func readSchedulerGenerationRecord(statePath string) (schedulerGenerationRecord, error) {
 	return updateSchedulerGenerationRecord(statePath, func(_ *schedulerGenerationRecord) (bool, error) {
 		return false, nil
 	})
 }
 
-// updateSchedulerGenerationRecord locks an append-only journal. A previous
-// complete record survives a host crash during the next append.
+// updateSchedulerGenerationRecord serializes all generation I/O through a
+// stable lock file. The journal itself can then be atomically compacted without
+// moving the inode that carries the inter-process lock.
 func updateSchedulerGenerationRecord(statePath string, update func(*schedulerGenerationRecord) (bool, error)) (schedulerGenerationRecord, error) {
 	path := schedulerGenerationPath(statePath)
+	lockPath := schedulerGenerationLockPath(statePath)
 	if strings.TrimSpace(statePath) == "" {
 		return schedulerGenerationRecord{}, nil
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return schedulerGenerationRecord{}, fmt.Errorf("create generation directory: %w", err)
 	}
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
-		return schedulerGenerationRecord{}, fmt.Errorf("open generation record: %w", err)
+		return schedulerGenerationRecord{}, fmt.Errorf("open generation lock: %w", err)
 	}
 	locked := false
 	deadline := time.Now().Add(generationLockWait)
 	for {
-		locked, err = tryExclusiveFileLock(file)
+		locked, err = tryExclusiveFileLock(lockFile)
 		if err != nil || locked || !time.Now().Before(deadline) {
 			break
 		}
 		time.Sleep(generationLockRetry)
 	}
 	if err != nil {
-		_ = file.Close()
+		_ = lockFile.Close()
 		return schedulerGenerationRecord{}, fmt.Errorf("lock generation record: %w", err)
 	}
 	if !locked {
-		_ = file.Close()
+		_ = lockFile.Close()
 		return schedulerGenerationRecord{}, errGenerationLockBusy
 	}
 	defer func() {
-		_ = unlockExclusiveFile(file)
-		_ = file.Close()
+		_ = unlockExclusiveFile(lockFile)
+		_ = lockFile.Close()
 	}()
 
-	record, err := readSchedulerGenerationRecordLocked(file)
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return schedulerGenerationRecord{}, fmt.Errorf("open generation record: %w", err)
+	}
+	record, truncatedTail, err := readSchedulerGenerationRecordLocked(file)
+	stat, statErr := file.Stat()
+	closeErr := file.Close()
 	if err != nil {
 		return schedulerGenerationRecord{}, err
+	}
+	if statErr != nil {
+		return schedulerGenerationRecord{}, statErr
+	}
+	if closeErr != nil {
+		return schedulerGenerationRecord{}, closeErr
+	}
+	// Compact the last durable record before the callback. Some callbacks
+	// commit shared state while this lock is held; compacting afterwards could
+	// report failure after that side effect has already become visible.
+	if truncatedTail || stat.Size() >= generationRecordCompactAt {
+		if err := compactSchedulerGenerationRecord(path, record); err != nil {
+			return schedulerGenerationRecord{}, fmt.Errorf("compact generation journal: %w", err)
+		}
 	}
 	write, err := update(&record)
 	if err != nil {
@@ -443,58 +472,121 @@ func updateSchedulerGenerationRecord(statePath string, update func(*schedulerGen
 		if err := validateSchedulerGenerationRecord(record); err != nil {
 			return schedulerGenerationRecord{}, err
 		}
-		if err := appendSchedulerGenerationRecordLocked(file, record); err != nil {
-			return schedulerGenerationRecord{}, err
+		file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
+		if err != nil {
+			return schedulerGenerationRecord{}, fmt.Errorf("reopen generation record: %w", err)
+		}
+		appendErr := appendSchedulerGenerationRecordLocked(file, record)
+		closeErr := file.Close()
+		if appendErr != nil {
+			return schedulerGenerationRecord{}, appendErr
+		}
+		if closeErr != nil {
+			return schedulerGenerationRecord{}, closeErr
 		}
 	}
 	return record, nil
 }
 
-func readSchedulerGenerationRecordLocked(file *os.File) (schedulerGenerationRecord, error) {
+func readSchedulerGenerationRecordLocked(file *os.File) (schedulerGenerationRecord, bool, error) {
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return schedulerGenerationRecord{}, err
+		return schedulerGenerationRecord{}, false, err
 	}
 	stat, err := file.Stat()
 	if err != nil {
-		return schedulerGenerationRecord{}, err
+		return schedulerGenerationRecord{}, false, err
 	}
 	if stat.Size() == 0 {
-		return schedulerGenerationRecord{Version: schedulerGenerationRecordVersion}, nil
+		return schedulerGenerationRecord{Version: schedulerGenerationRecordVersion}, false, nil
 	}
-	if stat.Size() > generationRecordMaxBytes {
-		return schedulerGenerationRecord{}, fmt.Errorf("generation journal exceeds %d bytes", generationRecordMaxBytes)
+	if stat.Size() > generationRecordRecoveryMaxBytes {
+		return schedulerGenerationRecord{}, false, fmt.Errorf("generation journal exceeds recovery limit %d bytes", generationRecordRecoveryMaxBytes)
 	}
-	scanner := bufio.NewScanner(io.LimitReader(file, generationRecordMaxBytes+1))
-	scanner.Buffer(make([]byte, 4096), 64*1024)
+	raw, err := io.ReadAll(io.LimitReader(file, generationRecordRecoveryMaxBytes+1))
+	if err != nil {
+		return schedulerGenerationRecord{}, false, err
+	}
+	if len(raw) > generationRecordRecoveryMaxBytes {
+		return schedulerGenerationRecord{}, false, fmt.Errorf("generation journal exceeds recovery limit %d bytes", generationRecordRecoveryMaxBytes)
+	}
+	lines := bytes.Split(raw, []byte{'\n'})
+	endsWithNewline := len(raw) > 0 && raw[len(raw)-1] == '\n'
 	var latest schedulerGenerationRecord
 	found := false
-	nonEmpty := false
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
+	truncatedTail := false
+	for index, rawLine := range lines {
+		line := bytes.TrimSpace(rawLine)
+		if len(line) == 0 {
 			continue
 		}
-		nonEmpty = true
+		if len(line) > generationRecordLineMaxBytes {
+			return schedulerGenerationRecord{}, false, fmt.Errorf("generation journal line exceeds %d bytes", generationRecordLineMaxBytes)
+		}
+		incompleteTail := index == len(lines)-1 && !endsWithNewline
 		var candidate schedulerGenerationRecord
-		if err := json.Unmarshal([]byte(line), &candidate); err != nil {
-			continue
+		if err := json.Unmarshal(line, &candidate); err != nil {
+			// A crashed append may leave only a prefix at EOF. Do not hide a
+			// structurally complete but corrupt final object merely because its
+			// trailing newline is absent.
+			if incompleteTail && isTruncatedGenerationJSON(err) {
+				truncatedTail = true
+				continue
+			}
+			return schedulerGenerationRecord{}, false, fmt.Errorf("decode generation journal line %d: %w", index+1, err)
 		}
 		if err := validateSchedulerGenerationRecord(candidate); err != nil {
-			continue
+			return schedulerGenerationRecord{}, false, fmt.Errorf("validate generation journal line %d: %w", index+1, err)
+		}
+		if found && (candidate.HighestReserved < latest.HighestReserved || candidate.ActiveGeneration < latest.ActiveGeneration) {
+			return schedulerGenerationRecord{}, false, fmt.Errorf("generation journal is non-monotonic at line %d", index+1)
 		}
 		latest = candidate
 		found = true
 	}
-	if err := scanner.Err(); err != nil {
-		return schedulerGenerationRecord{}, err
-	}
-	if nonEmpty && !found {
-		return schedulerGenerationRecord{}, errors.New("generation journal has no valid record")
+	if len(bytes.TrimSpace(raw)) > 0 && !found {
+		return schedulerGenerationRecord{}, false, errors.New("generation journal has no valid record")
 	}
 	if !found {
 		latest.Version = schedulerGenerationRecordVersion
 	}
-	return latest, nil
+	return latest, truncatedTail, nil
+}
+
+func isTruncatedGenerationJSON(err error) bool {
+	var syntaxErr *json.SyntaxError
+	return errors.As(err, &syntaxErr) && syntaxErr.Error() == "unexpected end of JSON input"
+}
+
+func compactSchedulerGenerationRecord(path string, record schedulerGenerationRecord) error {
+	record.Version = schedulerGenerationRecordVersion
+	if err := validateSchedulerGenerationRecord(record); err != nil {
+		return err
+	}
+	raw, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	raw = append(raw, '\n')
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".generation-compact-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	_ = tmp.Chmod(0600)
+	if err := writeFileAll(tmp, raw); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return replaceGenerationJournal(tmpName, path)
 }
 
 func appendSchedulerGenerationRecordLocked(file *os.File, record schedulerGenerationRecord) error {

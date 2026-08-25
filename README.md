@@ -1,17 +1,19 @@
 <div align="center">
   <img src="assets/logo.svg" width="96" alt="Codex Quota Scheduler logo">
   <h1>Codex Quota Scheduler</h1>
-  <p><strong>CPA-native serial fill-first scheduling, persistent 429 quarantine, and safe full-quota activation for Codex account pools.</strong></p>
+  <p><strong>CPA-native one-account-at-a-time scheduling, 5h/weekly quota balancing, persistent 429 quarantine, and safe full-quota activation.</strong></p>
   <p>
     <a href="https://github.com/simplez2/cpa-codex-quota-scheduler/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/simplez2/cpa-codex-quota-scheduler/ci.yml?branch=main&style=flat-square&label=CI"></a>
     <a href="https://github.com/simplez2/cpa-codex-quota-scheduler/releases"><img alt="Release" src="https://img.shields.io/github/v/release/simplez2/cpa-codex-quota-scheduler?style=flat-square"></a>
     <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-111827?style=flat-square"></a>
     <img alt="CPA plugin" src="https://img.shields.io/badge/CPA-dynamic%20plugin-374151?style=flat-square">
-    <img alt="Scheduling" src="https://img.shields.io/badge/mode-serial%20fill--first-0f766e?style=flat-square">
+    <img alt="Scheduling" src="https://img.shields.io/badge/mode-serial%20quota--balanced-0f766e?style=flat-square">
   </p>
 </div>
 
-> **Version note:** the source and registry declare plugin version **v0.1.19**. A build is a published release only after the matching `v0.1.19` tag and release assets are available.
+> **Version note:** the source and registry declare plugin version **v0.1.20**. A build is a published release only after the matching `v0.1.20` tag and release assets are available.
+
+> **Upgrade exception:** the first upgrade from **v0.1.19 or earlier** to **v0.1.20** changes the generation-lock protocol and requires one controlled quick restart of CPA. Do not hot-load old and new DSOs together. Later v0.1.20-compatible reloads use the stable lock protocol normally.
 
 The plugin keeps normal Codex traffic on one globally committed credential. It switches only when quota policy, an authoritative 429, quarantine, or confirmed candidate loss requires it. Fully available accounts can be activated separately, one at a time, without turning normal traffic into round-robin usage.
 
@@ -42,28 +44,29 @@ flowchart LR
     S --> P[(owner-only state)]
 ```
 
-The scheduler never rewrites models, credentials, provider definitions, or third-party routes. It only returns an auth choice for a pure `codex` candidate set and exposes redacted diagnostics under CPA's authenticated Management API.
+The scheduler never rewrites models, credentials, provider definitions, or third-party routes. It only returns an auth choice for a pure `codex` candidate set. Management responses are authenticated but may contain operational auth identifiers, so they must not be pasted into public issues without redaction.
 
 ## Selection and switching
 
-When no active auth is committed, or a real switch is required, healthy candidates are sorted by:
+Normal traffic still has exactly one committed global primary; this is not request-level round-robin. When an initial selection or committed switch is required, the scheduler applies these rules:
 
-1. `window_order` — default `5h`, `weekly`, `monthly`;
-2. known Keeper class before unknown class;
-3. reset-credit availability when `prefer_reset_credits` is enabled;
-4. already-started cycle when `serial_prefer_active_cycle` is enabled;
-5. higher used percentage to concentrate consumption;
-6. CPA priority and stable auth ID.
+1. keep accounts below `reserve_weekly_percent` in a protected partition while any unprotected account exists;
+2. honor end-of-cycle drain and `window_order`;
+3. prefer reset-credit accounts when configured;
+4. preserve the historical CPA priority/fill-first rule only for the first cold-start selection;
+5. after the pool has selection history, group weekly remaining capacity by `switch_hysteresis_percent`;
+6. inside the best weekly band, prefer the least-used 5h window;
+7. use the longest-idle selection timestamp, CPA priority, and stable auth ID as deterministic tie-breakers.
 
-Once selected, a more attractive backup does **not** preempt the active auth. A switch occurs only when an active window reaches `serial_switch_percent`, becomes disallowed/exhausted, receives a qualifying 429, is quarantined, or remains absent from CPA candidates for at least 90 seconds and three confirmations.
+A healthy primary remains committed between switch boundaries. It can be preempted when a higher-priority window becomes usable, when its weekly capacity enters the protected reserve while a safe backup exists, or once at a verified new 5h cycle boundary in automatic mode. Hard limits, `allowed=false`, 429, quarantine, and confirmed candidate loss always remain failover signals. If the primary is hard-limited and every backup has only crossed the soft threshold, the scheduler explicitly selects the best soft-threshold backup rather than delegating an unsafe choice back to CPA.
 
 ### End-of-cycle drain
 
-When a usable window is within `drain_window_hours` (default 6h, 0 disables) of its reset, that account enters drain mode: it may run past `serial_switch_percent` until Keeper reports the window as fully consumed, and drain accounts are preferred over fresh backups so expiring quota is used before it resets. This mirrors the official courtesy behavior where an in-flight session continues to completion after the usage limit is hit without extra charge; new requests are only blocked once the window is truly exhausted.
+Drain duration is capped at the smaller of `drain_window_hours` and the final 10% of the quota window. With defaults, a 5h window drains only during its final 30 minutes, while weekly and monthly windows keep the six-hour cap. Drain may cross the soft threshold, but never overrides `limit_reached`, `allowed=false`, quarantine, or 429.
 
 ### In-flight overdraft (session pinning)
 
-Serial mode pins every active conversation to the auth serving it (`serial_overdraft` bindings, 30-minute sliding TTL, persisted across restarts). The global switch still happens exactly as configured at `serial_switch_percent` or `limit_reached`, but conversations already in flight on the exhausted account keep being routed there while the official courtesy allows them. New sessions immediately land on the fresh backup. Overdraft bindings are dropped automatically when the pinned auth disappears from CPA candidates, becomes quarantined, or the TTL lapses. Runtime status exposes the live count as `serial_overdraft_sessions`.
+When CPA supplies a stable session identifier, serial mode records which auth already served that conversation. After a global threshold or hard-limit switch, only that pre-existing conversation may continue on its prior auth; a newly observed session is never bound to an already exhausted primary. Bindings use a 30-minute sliding inactivity TTL, persist across restarts, and are removed if the auth disappears or becomes quarantined. This is a bounded compatibility mechanism for observed upstream continuation behavior, not a promise about future quota or billing semantics. Runtime status exposes the live count as `serial_overdraft_sessions`.
 
 ## Warmup in one paragraph
 
@@ -132,7 +135,7 @@ All routes live below `/v0/management/plugins/codex-quota-scheduler`:
 
 | Method | Route | Purpose |
 |---|---|---|
-| `GET` | `/quota` | Serial, Keeper, generation, warmup, reconciliation, and redacted decision status. |
+| `GET` | `/quota` | Serial, Keeper, generation, warmup, reconciliation, and authenticated operational status. |
 | `PUT` | `/serial-active` | Manually select one active, fresh, eligible serial primary with `{"auth_id":"..."}`. |
 | `DELETE` | `/serial-active` | Clear the manual primary and return to automatic selection. |
 | `GET` | `/bans` | Current cooldown, probation, and half-open entries. |
@@ -147,7 +150,7 @@ Manual primary selection, unban, and warmup retry are privileged actions. The se
 - Handles only pure `codex` candidate pools; mixed or third-party sets fall back to CPA.
 - Does not modify OAuth, PATs, cookies, auth files, official/default models, or third-party APIs.
 - Reads Keeper and CPA Management secrets only from mounted files.
-- Persists scheduling metadata, redacted failure codes, bans, and warmup outcomes — never secret values.
+- Persists scheduling metadata, auth identifiers, hashed session identifiers, reset anchors, redacted failure codes, bans, and warmup outcomes — never credential values.
 - Treats `cyber_policy` and `cyber_abuse` as terminal blocked results; no retry loop is started.
 - Writes state atomically with owner-only permissions and fences hot-reload generations.
 
@@ -165,7 +168,7 @@ Read [SECURITY.md](SECURITY.md) before exposing Management routes.
 
 `legacy`, `shadow`, and `enforce` remain for migration. New deployments should use `serial`; it is the only mode that guarantees independent sessions do not intentionally spread normal traffic across the pool.
 
-If every account is exhausted or quarantined, the current CPA scheduler ABI cannot return a hard-denied filtered set. The plugin returns `Handled=false`, and final behavior depends on the CPA host version.
+If every account is hard-exhausted or quarantined, the current CPA scheduler ABI cannot return a hard-denied filtered set. The plugin returns `Handled=false`, and final behavior depends on the CPA host version. A backup that has crossed only the soft threshold is still preferred over a hard-exhausted primary.
 
 ## License and provenance
 

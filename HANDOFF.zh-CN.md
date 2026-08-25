@@ -4,8 +4,8 @@
 
 ## 1. 接管前必须知道
 
-- 默认生产模式是 serial，不要改成轮询，也不要让多个会话主动分散到不同账号。
-- 默认类别顺序是 5h -> weekly -> monthly；有 reset credit、已启动周期和 used% 只在类别内继续排序。
+- 默认生产模式是 serial，不要改成请求级轮询，也不要让新会话并发分散到多个账号；可信 5h 新周期边界的一次串行轮转属于设计行为。
+- 默认类别顺序是 5h -> weekly -> monthly；weekly reserve、weekly 平衡档位、5h 使用量和 last-selected 历史共同决定切换后的账号。
 - 预热与普通调度是两条路径。预热绝不能改变已提交主账号。
 - cyber_policy、cyber_abuse 和认证类 blocked 必须停止自动重试。
 - 插件不应修改 CPA 官方/default 模型、OAuth、PAT、Cookie、第三方 provider 或第三方 API。
@@ -20,7 +20,7 @@
 | Git tag / GitHub Release | 对外正式发布版本。 |
 | Draft PR | 尚未发布、供审查的功能分支。 |
 
-当前源码与 registry 为 v0.1.19。正式发布时必须同时校验 pluginVersion、registry、tag、资产名和 Release 说明；未生成匹配 Release 资产前，只能称为测试构建。
+当前源码与 registry 为 v0.1.20。正式发布时必须同时校验 pluginVersion、registry、tag、资产名和 Release 说明；未生成匹配 Release 资产前，只能称为测试构建。
 
 ## 3. 推荐生产挂载
 
@@ -32,6 +32,7 @@ host/
   scheduler/
     state.json
     state.json.generation
+    state.json.generation.lock
     state.json.warmup.lock
     state.json.warmup.outcomes
   secrets/
@@ -92,13 +93,31 @@ git diff --check
 
 若 CPA 宿主不支持可靠插件热重载，可以重启 CPA；不要为了零中断冒险加载损坏的共享库。
 
+### 5.3 v0.1.19 -> v0.1.20 generation 锁迁移
+
+v0.1.19 把锁附着在 `state.json.generation` 本身；v0.1.20 改为稳定的 `state.json.generation.lock`，才能安全原子压缩 journal。首次跨协议升级必须：
+
+1. 备份当前动态库、`state.json`、`state.json.generation` 和插件配置；
+2. 校验 journal 小于 16 MiB、所有完整记录 JSON 有效且 generation 单调；
+3. 停止并立即启动 CPA，使旧 DSO 与旧 journal 文件句柄全部退出；
+4. 新版本先取得独立 lock，再把超过 768 KiB 的 journal 压缩为最后有效记录；
+5. 验证 `generation_active=true`、generation 数值继续递增、`last_error` 为空；
+6. 保留旧动态库和完整 journal 备份用于回滚。
+
+不能在 v0.1.19 写者仍存活时直接 rename journal；那会让新旧进程锁住不同 inode。
+
 ## 6. 上线验收
 
 ### 6.1 串行调度
 
 - scheduler_mode=serial；
 - 多个独立会话命中同一 serial_active_auth_id；
-- 同类内 used% 更高账号优先但不会中途抢占；
+- weekly reserve 账号不会在存在未保护账号时被选择；
+- weekly 差距超过 hysteresis 时优先剩余额度更高者；weekly 接近平衡时优先 5h used% 更低者；
+- 可信 5h reset anchor 越过旧边界后，自动模式只轮转一次；manual 不因该边界轮转；
+- 新会话不会继承已耗尽旧主账号的 overdraft，旧会话绑定仍可按空闲 TTL 续跑；
+- 5h 默认只在最后约 30 分钟 drain，不会因 6 小时配置覆盖整个 5h 周期；
+- hard-limit 主账号可切到仅达到 soft threshold 的最优备用账号；
 - 5h 可用时不会先选 weekly/monthly；
 - 5h 不可用后才进入 weekly，再到 monthly；
 - provisional fallback 不增加 serial_switches。
@@ -175,7 +194,11 @@ git diff --check
 
 ### Keeper 周期性 service_unavailable
 
-先核对错误时间是否与 `keeper_refresh_requested_at` 对齐。Keeper 会保留 disabled 历史身份；v0.1.19 会在读取阶段排除其缓存，并在真正请求 `/quota/refresh` 前再与 CPA 当前 active Codex 清单求交集。若 `keeper_refresh_error=auth_inventory_unavailable`，只读快照仍会保留，但有副作用的刷新会 fail closed；应修复 Management key/Host API，不要反复启用历史账号。
+先核对错误时间是否与 `keeper_refresh_requested_at` 对齐。Keeper 会保留 disabled 历史身份；v0.1.20 会在读取阶段排除其缓存，并在真正请求 `/quota/refresh` 前再与 CPA 当前 active Codex 清单求交集。若 `keeper_refresh_error=auth_inventory_unavailable`，只读快照仍会保留，但有副作用的刷新会 fail closed；应修复 Management key/Host API，不要反复启用历史账号。
+
+### generation journal 接近或超过 1 MiB
+
+v0.1.20 会在 journal 达到 768 KiB 后，于下一次 generation I/O callback 前自动压缩；旧版遗留文件只要不超过 16 MiB 且记录有效、单调，也会在受控重启时自愈。上线前必须备份，禁止手工 truncate 或删除。超过恢复上限或记录非单调时 fail closed，先离线审计。
 
 ## 9. 手工恢复操作
 
@@ -193,7 +216,7 @@ git diff --check
 
 1. 保留当前动态库、SHA-256 和状态文件副本；
 2. 将上一已验证动态库原子替换回 plugin 目录；
-3. 保留 state.json，除非回滚版本无法读取当前格式；
+3. 保留 state.json；若回滚到 v0.1.19，还要恢复升级前的完整 generation journal 备份，因为旧版不使用独立 lock 协议；
 4. 若必须回滚状态，先停止或隔离 CPA，避免旧 generation 写回；
 5. 恢复后检查 generation owner、Keeper refresh 和 active auth；
 6. 先用 canary 请求验证，避免直接对全池进行 unban-all。
@@ -209,6 +232,7 @@ git diff --check
 - [ ] 无动态 /v0/resource/plugins/... 状态或特权操作。
 - [ ] 预热一次一个，普通主账号不改变。
 - [ ] 429 half-open 只有一个并发 probe。
+- [ ] generation journal 已压缩，独立 lock 存在且 owner 仍 active。
 - [ ] 更新 Draft PR，而不是创建重复 PR。
 
 ## 12. 禁止事项

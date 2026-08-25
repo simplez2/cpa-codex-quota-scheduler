@@ -1,4 +1,4 @@
-# Recommended configuration for Codex Quota Scheduler v0.1.19.
+# Recommended configuration for Codex Quota Scheduler v0.1.20.
 # Secrets stay in mounted files. This plugin does not change model names,
 # provider routes, OAuth/PAT state, or third-party APIs.
 plugins:
@@ -8,17 +8,17 @@ plugins:
       enabled: true
       priority: 2000
 
-      # One global active account. It switches only at the configured quota
-      # threshold, on 429/quarantine, or when CPA removes the auth candidate.
+      # One global active account. It switches at a hard/soft quota boundary,
+      # 429/quarantine, confirmed candidate loss, weekly-reserve protection,
+      # higher-priority window availability, or a confirmed new 5h cycle.
       scheduler_mode: serial
       serial_switch_percent: 98
       serial_prefer_active_cycle: true
 
-      # End-of-cycle drain: when a usable window is within this many hours of
-      # its reset, the account may run past the soft threshold until Keeper
-      # reports the window as fully consumed. This mirrors the official
-      # courtesy that lets an in-flight session finish without extra charge
-      # after the limit is hit.
+      # End-of-cycle drain is capped at the smaller of this value and the last
+      # 10% of the quota window. With 6h configured, 5h drains only in its
+      # final 30m; hard limits, disallowed windows, quarantine, and 429 still
+      # force failover.
       drain_window_hours: 6
 
       keeper_url: http://cpa-usage-keeper:8080/keeper
@@ -33,8 +33,9 @@ plugins:
       half_open_probe_timeout: 15m
       half_open_retry_after: 2m
 
-      # Weekly accounts are selected before monthly accounts. Within the same
-      # class, an active cycle and then higher used percentage are preferred.
+      # Window order is strict. After cold start, weekly remaining-capacity
+      # tiers are balanced first; inside the best tier, lower 5h usage and the
+      # longest-idle account win deterministic tie-breaks.
       prefer_reset_credits: true
       window_order:
         - 5h

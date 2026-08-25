@@ -190,9 +190,12 @@ func (s *schedulerRuntimeState) setManualSerialActive(requestedAuthID string, no
 	previousFallbackAuthID := s.serialFallbackAuthID
 	previousMissingSince := s.serialMissingSince
 	previousMissingCount := s.serialMissingCount
+	previousLastSelectedAt, previousLastSelectedOK := s.serialLastSelected[canonicalAuthID]
+	previousFiveHourCycle, previousFiveHourCycleOK := s.serialFiveHourCycle[canonicalAuthID]
 	s.serialActiveAuthID = canonicalAuthID
 	s.serialSelectionSource = "manual"
 	s.serialSelectedAt = now
+	s.markSerialSelectedLocked(canonicalAuthID, choice.FiveHourResetAt, now)
 	if strings.TrimSpace(previousAuthID) != canonicalAuthID {
 		s.serialSwitches++
 	}
@@ -214,6 +217,16 @@ func (s *schedulerRuntimeState) setManualSerialActive(requestedAuthID string, no
 			s.serialFallbackAuthID = previousFallbackAuthID
 			s.serialMissingSince = previousMissingSince
 			s.serialMissingCount = previousMissingCount
+			if previousLastSelectedOK {
+				s.serialLastSelected[canonicalAuthID] = previousLastSelectedAt
+			} else {
+				delete(s.serialLastSelected, canonicalAuthID)
+			}
+			if previousFiveHourCycleOK {
+				s.serialFiveHourCycle[canonicalAuthID] = previousFiveHourCycle
+			} else {
+				delete(s.serialFiveHourCycle, canonicalAuthID)
+			}
 		}
 		s.mu.Unlock()
 		return manualSerialActiveResult{}, &managementSerialActiveError{

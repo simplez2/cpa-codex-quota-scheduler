@@ -9,9 +9,9 @@
 // Three capabilities are registered:
 //   - usage_plugin: merges fresh x-codex-* window headers, observes request
 //     cost, and drives the cooldown/probation/half-open state machine.
-//   - scheduler: defaults to serial fill-first routing, excludes exhausted or
-//     quarantined credentials, and never changes model/provider routes.
-//   - management_api: exposes non-secret quota/pacing diagnostics plus explicit
+//   - scheduler: defaults to one-account-at-a-time, quota-balanced routing,
+//     excludes exhausted or quarantined credentials, and never changes routes.
+//   - management_api: exposes authenticated quota/pacing diagnostics plus explicit
 //     manual unban operations for upstream reset-card actions.
 package main
 
@@ -105,7 +105,7 @@ import (
 
 const (
 	pluginName    = "codex-quota-scheduler"
-	pluginVersion = "0.1.19"
+	pluginVersion = "0.1.20"
 
 	// providerCodex is the CPA provider key for OpenAI Codex (ChatGPT backend).
 	providerCodex = "codex"
@@ -535,8 +535,8 @@ func pluginRegistration() registration {
 			Author:           "simplez2",
 			GitHubRepository: "https://github.com/simplez2/cpa-codex-quota-scheduler",
 			ConfigFields: []pluginapi.ConfigField{
-				{Name: "scheduler_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"serial", "legacy", "shadow", "enforce"}, Description: "Runtime policy mode. Serial keeps one global active Codex auth, but strictly preempts it when a higher-priority quota window becomes available."},
-				{Name: "serial_switch_percent", Type: pluginapi.ConfigFieldTypeNumber, Description: "In serial mode, switch away when any active quota window reaches this used percentage. Defaults to 98."},
+				{Name: "scheduler_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"serial", "legacy", "shadow", "enforce"}, Description: "Runtime policy mode. Serial keeps one global active Codex auth while balancing 5h and weekly capacity at committed switch boundaries."},
+				{Name: "serial_switch_percent", Type: pluginapi.ConfigFieldTypeNumber, Description: "Soft used-percent switch threshold. Drain mode may cross it; hard limits, disallowed windows, and 429 still force failover."},
 				{Name: "serial_prefer_active_cycle", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Prefer an already-started quota cycle when choosing the next serial auth."},
 				{Name: "keeper_url", Type: pluginapi.ConfigFieldTypeString, Description: "Keeper base URL, for example http://cpa-usage-keeper:8080/keeper."},
 				{Name: "keeper_password_file", Type: pluginapi.ConfigFieldTypeString, Description: "Mounted Keeper login-password file; the password is never placed in YAML."},
@@ -550,10 +550,10 @@ func pluginRegistration() registration {
 				{Name: "warmup_retry_after", Type: pluginapi.ConfigFieldTypeString, Description: "Minimum delay before retrying a warmup that did not return a reset window."},
 				{Name: "refresh_interval", Type: pluginapi.ConfigFieldTypeString, Description: "How often to read Keeper's cached Codex quota (for example 30s)."},
 				{Name: "stale_after", Type: pluginapi.ConfigFieldTypeString, Description: "Maximum age of a quota snapshot before native CPA scheduling is used."},
-				{Name: "state_path", Type: pluginapi.ConfigFieldTypeString, Description: "Owner-only JSON file for quarantine, serial active-auth, and warmup bookkeeping; contains no secrets."},
+				{Name: "state_path", Type: pluginapi.ConfigFieldTypeString, Description: "Owner-only JSON file for quarantine, serial auth identifiers, hashed session bindings, cycle anchors, and warmup bookkeeping; it contains no credential material."},
 				{Name: "soft_limit_percent", Type: pluginapi.ConfigFieldTypeNumber, Description: "Avoid a window at or above this percentage when a healthier same-priority choice exists."},
 				{Name: "reserve_5h_percent", Type: pluginapi.ConfigFieldTypeNumber, Description: "Safety reserve retained in every five-hour quota window."},
-				{Name: "reserve_weekly_percent", Type: pluginapi.ConfigFieldTypeNumber, Description: "Safety reserve retained in every weekly quota window."},
+				{Name: "reserve_weekly_percent", Type: pluginapi.ConfigFieldTypeNumber, Description: "Hard weekly reserve partition for serial selection; protected accounts are used only when no unprotected candidate remains."},
 				{Name: "reserve_monthly_percent", Type: pluginapi.ConfigFieldTypeNumber, Description: "Safety reserve retained in every monthly quota window."},
 				{Name: "low_quota_percent", Type: pluginapi.ConfigFieldTypeNumber, Description: "Remaining quota threshold that raises request-cost prediction from P75 to P90."},
 				{Name: "fallback_ban", Type: pluginapi.ConfigFieldTypeString, Description: "Temporary 429 ban when upstream reset headers are absent."},
@@ -561,7 +561,7 @@ func pluginRegistration() registration {
 				{Name: "half_open_probe_timeout", Type: pluginapi.ConfigFieldTypeString, Description: "Lease for the single half-open probe after a cooldown expires."},
 				{Name: "half_open_retry_after", Type: pluginapi.ConfigFieldTypeString, Description: "Delay before retrying a half-open probe that failed without a 429."},
 				{Name: "sticky_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "Idle lifetime for hashed session-to-credential bindings; zero disables plugin stickiness."},
-				{Name: "switch_hysteresis_percent", Type: pluginapi.ConfigFieldTypeNumber, Description: "Minimum score advantage required before a healthy sticky session may switch."},
+				{Name: "switch_hysteresis_percent", Type: pluginapi.ConfigFieldTypeNumber, Description: "Weekly remaining-capacity band used before serial selection balances the 5h window; legacy pacing also uses it for sticky switching."},
 				{Name: "switch_confirmations", Type: pluginapi.ConfigFieldTypeInteger, Description: "Consecutive challenger wins required before switching a healthy sticky session."},
 				{Name: "cost_sample_limit", Type: pluginapi.ConfigFieldTypeInteger, Description: "Maximum rolling normal-request credit samples retained in memory."},
 				{Name: "decision_history_limit", Type: pluginapi.ConfigFieldTypeInteger, Description: "Maximum redacted scheduler decisions retained for diagnostics."},
