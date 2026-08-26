@@ -177,6 +177,9 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 	}
 	if in.Serial5hSwitchPercent != nil {
 		cfg.Serial5hSwitchPercent = *in.Serial5hSwitchPercent
+		if strings.TrimSpace(in.Serial5hHandoffMode) == "" {
+			cfg.Serial5hHandoffMode = "custom_threshold"
+		}
 	}
 	if in.SerialPreferActiveCycle != nil {
 		cfg.SerialPreferActiveCycle = *in.SerialPreferActiveCycle
