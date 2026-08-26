@@ -34,7 +34,7 @@ func projectedFiveHourState(now time.Time, used, predicted float64) *schedulerRu
 				},
 			},
 		},
-		warmups:    make(map[string]warmupEntry),
+		warmups:     make(map[string]warmupEntry),
 		costSamples: map[string][]float64{},
 		pacingAccounts: map[string]*accountPacingState{
 			"primary": {Capacities: map[string]capacityEstimate{"5h": {Credits: 100, Samples: 8}}, LastQuota: map[string]quotaCalibrationPoint{}},
