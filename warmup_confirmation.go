@@ -8,13 +8,14 @@ import (
 // pendingWarmupKeeperRefreshTargets closes the confirmation loop after a
 // successful warmup that did not return authoritative quota reset headers.
 //
-// A pending warmup must be confirmed by a Keeper observation newer than the
-// completed model request. Otherwise the regular /quota/cache row may remain a
-// pre-warmup placeholder for up to stale_after, making 5h/weekly activation
-// appear stuck even though the warmup request succeeded.
+// Each pending quota class must have its own Keeper observation newer than the
+// completed model request. A newer 5h row cannot confirm weekly, and a newer
+// weekly row cannot confirm 5h. This matters for partial Keeper cache responses
+// where the snapshot envelope may be new while one sibling window is still
+// missing or carried from an older observation.
 //
 // This helper never issues model traffic. It only asks the existing Keeper
-// refresh path for one newer quota observation, and the normal cross-instance
+// refresh path for a newer quota observation, and the normal cross-instance
 // refresh gate still controls duplicate/backoff behavior.
 func (s *schedulerRuntimeState) pendingWarmupKeeperRefreshTargets(indexes []string, current map[string]quotaSnapshot) []keeperRefreshTarget {
 	activeIndexes := make(map[string]struct{}, len(indexes))
@@ -49,10 +50,11 @@ func (s *schedulerRuntimeState) pendingWarmupKeeperRefreshTargets(indexes []stri
 		}
 
 		snapshot, ok := current[index]
-		if ok && !snapshot.RefreshedAt.IsZero() && snapshot.RefreshedAt.After(entry.CompletedAt) {
-			// A post-warmup Keeper observation already exists. The normal
+		if ok && warmupEntryHasPostCompletionObservation(entry, snapshot) {
+			// This quota class already has a post-warmup observation. The normal
 			// confirmPendingWarmups pass will either confirm its fixed reset
-			// anchor or leave the entry under the existing retry/grace policy.
+			// anchor or leave it under the existing retry/grace policy. Other
+			// pending classes on the same auth are still evaluated independently.
 			continue
 		}
 
@@ -68,4 +70,22 @@ func (s *schedulerRuntimeState) pendingWarmupKeeperRefreshTargets(indexes []stri
 		seen[index] = struct{}{}
 	}
 	return targets
+}
+
+func warmupEntryHasPostCompletionObservation(entry warmupEntry, snapshot quotaSnapshot) bool {
+	class := normalizeWindowClass(entry.Window)
+	if class == "" || entry.CompletedAt.IsZero() {
+		return false
+	}
+	for _, window := range snapshot.Windows {
+		if normalizeWindowClass(window.Class) != class {
+			continue
+		}
+		observedAt := window.ObservedAt
+		if observedAt.IsZero() {
+			observedAt = snapshot.RefreshedAt
+		}
+		return !observedAt.IsZero() && observedAt.After(entry.CompletedAt)
+	}
+	return false
 }
