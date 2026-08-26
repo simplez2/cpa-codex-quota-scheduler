@@ -528,6 +528,98 @@ func (s *schedulerRuntimeState) requestActiveCPAKeeperQuotaRefreshTargets(ctx co
 	return s.requestKeeperQuotaRefreshTargets(ctx, cfg, password, token, targets, now)
 }
 
+func collectCarriedStaleWindowRefreshTargets(indexes []string, current, previous map[string]quotaSnapshot, now time.Time, staleAfter time.Duration) []keeperRefreshTarget {
+	if staleAfter <= 0 {
+		staleAfter = 15 * time.Minute
+	}
+	targets := make([]keeperRefreshTarget, 0)
+	for _, rawIndex := range indexes {
+		index := strings.TrimSpace(rawIndex)
+		if index == "" {
+			continue
+		}
+		currentSnapshot, ok := current[index]
+		if !ok {
+			// A completely missing cache item is already handled by the normal
+			// cache-recovery collector.
+			continue
+		}
+		present := make(map[string]struct{}, len(currentSnapshot.Windows))
+		for _, window := range currentSnapshot.Windows {
+			if class := normalizeWindowClass(window.Class); class != "" {
+				present[class] = struct{}{}
+			}
+		}
+		previousSnapshot, ok := previous[index]
+		if !ok {
+			continue
+		}
+		staleCarry := false
+		oldestObservedAt := time.Time{}
+		for _, window := range previousSnapshot.Windows {
+			class := normalizeWindowClass(window.Class)
+			if class == "" {
+				continue
+			}
+			if _, exists := present[class]; exists {
+				continue
+			}
+			// Keep this exactly aligned with mergePartialQuotaSnapshot: only a
+			// missing window whose old reset is still in the future would be
+			// carried into the new runtime snapshot.
+			if window.ResetAt.IsZero() || !now.Before(window.ResetAt) {
+				continue
+			}
+			observedAt := window.ObservedAt
+			if observedAt.IsZero() {
+				observedAt = previousSnapshot.RefreshedAt
+			}
+			if !observedAt.IsZero() && !now.Before(observedAt) && now.Sub(observedAt) <= staleAfter {
+				continue
+			}
+			staleCarry = true
+			if oldestObservedAt.IsZero() || (!observedAt.IsZero() && observedAt.Before(oldestObservedAt)) {
+				oldestObservedAt = observedAt
+			}
+		}
+		if staleCarry {
+			targets = append(targets, keeperRefreshTarget{
+				AuthIndex:  index,
+				Reason:     "carried_stale_window",
+				ObservedAt: oldestObservedAt,
+			})
+		}
+	}
+	return targets
+}
+
+func mergeKeeperRefreshTargets(groups ...[]keeperRefreshTarget) []keeperRefreshTarget {
+	byIndex := make(map[string]keeperRefreshTarget)
+	for _, group := range groups {
+		for _, target := range group {
+			index := strings.TrimSpace(target.AuthIndex)
+			if index == "" {
+				continue
+			}
+			if _, exists := byIndex[index]; exists {
+				continue
+			}
+			target.AuthIndex = index
+			byIndex[index] = target
+		}
+	}
+	indexes := make([]string, 0, len(byIndex))
+	for index := range byIndex {
+		indexes = append(indexes, index)
+	}
+	sort.Strings(indexes)
+	out := make([]keeperRefreshTarget, 0, len(indexes))
+	for _, index := range indexes {
+		out = append(out, byIndex[index])
+	}
+	return out
+}
+
 func (s *schedulerRuntimeState) maybeRequestKeeperQuotaRefresh(ctx context.Context, cfg pluginConfig, password, token string, indexes []string, cache keeperCacheResponse, quotas map[string]quotaSnapshot, now time.Time) error {
 	// Keeper cache recovery is scheduler safety work, not model warmup. It must
 	// remain available while warmup is drained so a newly loaded scheduler can
@@ -537,6 +629,16 @@ func (s *schedulerRuntimeState) maybeRequestKeeperQuotaRefresh(ctx context.Conte
 		return nil
 	}
 	targets := collectKeeperRefreshTargets(indexes, cache, quotas, now, cfg.StaleAfter)
+	s.mu.RLock()
+	previous := make(map[string]quotaSnapshot, len(s.quotas))
+	for key, snapshot := range s.quotas {
+		previous[key] = snapshot
+	}
+	s.mu.RUnlock()
+	targets = mergeKeeperRefreshTargets(
+		targets,
+		collectCarriedStaleWindowRefreshTargets(indexes, quotas, previous, now, cfg.StaleAfter),
+	)
 	if len(targets) == 0 {
 		s.clearKeeperRefreshTargets()
 		return nil

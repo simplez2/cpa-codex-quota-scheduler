@@ -629,13 +629,16 @@ func normalizeQuotaSnapshot(index, fileName string, response keeperCheckResponse
 		out.ResetCredits = *response.RateLimitResetCreditsAvailableCount
 	}
 	for _, row := range response.Quota {
-		class := normalizeWindowClass(row.Label)
 		seconds := int64(0)
 		if row.Window != nil && row.Window.Seconds != nil {
 			seconds = *row.Window.Seconds
 		}
+		// Keeper's primary/secondary labels describe positions, not stable
+		// quota classes. Weekly-only and monthly-only plans can place their
+		// long window in the primary slot, so a recognized duration wins.
+		class := windowClassFromSeconds(seconds)
 		if class == "" {
-			class = windowClassFromSeconds(seconds)
+			class = normalizeWindowClass(row.Label)
 		}
 		if class == "" {
 			// A future Keeper window type should not make the plugin unusable;
@@ -656,7 +659,11 @@ func normalizeQuotaSnapshot(index, fileName string, response keeperCheckResponse
 		}
 		resetAt := parseKeeperTime(row.ResetAt)
 		if resetAt.IsZero() && row.ResetAfterSeconds != nil && *row.ResetAfterSeconds > 0 {
-			resetAt = now.Add(time.Duration(*row.ResetAfterSeconds) * time.Second)
+			resetAnchor := refreshedAt
+			if resetAnchor.IsZero() {
+				resetAnchor = now
+			}
+			resetAt = resetAnchor.Add(time.Duration(*row.ResetAfterSeconds) * time.Second)
 		}
 		window := quotaWindow{
 			Class:         class,

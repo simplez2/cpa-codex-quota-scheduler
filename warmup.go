@@ -516,7 +516,11 @@ func quotaWindowHasPlaceholderReset(window quotaWindow, refreshedAt, now time.Ti
 	}
 	toleranceSeconds := int64(warmupResetPlaceholderSkew / time.Second)
 	if window.ResetAfterSecondsKnown {
-		return window.ResetAfterSeconds >= window.WindowSeconds-toleranceSeconds
+		delta := window.ResetAfterSeconds - window.WindowSeconds
+		if delta < 0 {
+			delta = -delta
+		}
+		return delta <= toleranceSeconds
 	}
 	observedAt := window.ObservedAt
 	if observedAt.IsZero() {
