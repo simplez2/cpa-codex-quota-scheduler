@@ -486,10 +486,11 @@ func (s *schedulerRuntimeState) serialRequestLocalPickLocked(
 		}
 		snapshot, found := s.quotas[candidate.ID]
 		choice := inspectSerialCandidate(candidate, snapshot, found, cfg, now)
+		strictFiveHourBoundary := found && serialFiveHourStrictThresholdReached(snapshot, cfg, now)
 		s.annotateSerialCandidateLocked(&choice)
 		if choice.Eligible {
 			choices = append(choices, choice)
-		} else if choice.Reason == "serial_threshold" {
+		} else if choice.Reason == "serial_threshold" && !strictFiveHourBoundary {
 			thresholdChoices = append(thresholdChoices, choice)
 		}
 	}
@@ -642,7 +643,7 @@ func (s *schedulerRuntimeState) serialPick(req pluginapi.SchedulerPickRequest, n
 		}
 		if choice.Eligible {
 			choices = append(choices, choice)
-		} else if choice.Reason == "serial_threshold" {
+		} else if choice.Reason == "serial_threshold" && !strictFiveHourBoundary {
 			thresholdChoices = append(thresholdChoices, choice)
 		}
 	}
@@ -719,13 +720,21 @@ func (s *schedulerRuntimeState) serialPick(req pluginapi.SchedulerPickRequest, n
 		thresholdFallback = true
 	}
 	if len(choices) == 0 && previous != "" && currentSeen && currentReason == "serial_threshold" {
-		if currentStrictFiveHourBoundary && len(thresholdChoices) > 0 {
-			// A dedicated 5h threshold is strict for the current auth. If every
-			// replacement has also crossed a soft threshold, move to the best
-			// replacement instead of knowingly keeping the boundary-crossed
-			// current auth. This is still bounded by actual pool availability.
-			choices = thresholdChoices
-			thresholdFallback = true
+		if currentStrictFiveHourBoundary {
+			// A dedicated 5h threshold is strict for the current auth. Only
+			// non-strict threshold replacements are safe; strict-boundary
+			// replacements were filtered while collecting thresholdChoices and
+			// are checked again here to keep this fallback fail-closed.
+			softThresholdChoices := make([]serialCandidate, 0, len(thresholdChoices))
+			for _, choice := range thresholdChoices {
+				if !serialFiveHourStrictThresholdReached(choice.Snapshot, cfg, now) {
+					softThresholdChoices = append(softThresholdChoices, choice)
+				}
+			}
+			if len(softThresholdChoices) > 0 {
+				choices = softThresholdChoices
+				thresholdFallback = true
+			}
 		} else {
 			// Legacy/global soft thresholds remain a preference: when no safer
 			// replacement exists, keep one committed account until an

@@ -136,3 +136,82 @@ func TestInspectSerialCandidateAllExpiredWindowsIsQuotaUnknown(t *testing.T) {
 		t.Fatalf("all-expired snapshot was treated as known quota: %#v", choice)
 	}
 }
+
+func TestSerialSchedulerStrictThresholdDoesNotUseStrictFallback(t *testing.T) {
+	resetBanStoreForTest()
+	now := time.Now()
+	state := strictFiveHourState(now)
+	state.serialActiveAuthID = "primary"
+	state.serialSelectionSource = "auto"
+	backup := state.quotas["backup"]
+	backup.Windows[0].UsedPercent = 96
+	state.quotas["backup"] = backup
+
+	got := state.serialPick(strictFiveHourRequest(""), now)
+	if got.Handled || got.AuthID != "" {
+		t.Fatalf("strict threshold selected an unsafe fallback: %#v", got)
+	}
+	if state.serialActiveAuthID != "" {
+		t.Fatalf("unsafe primary remained committed: %q", state.serialActiveAuthID)
+	}
+}
+
+func TestSerialSchedulerStrictThresholdCanUseSoftWeeklyFallback(t *testing.T) {
+	resetBanStoreForTest()
+	now := time.Now()
+	state := strictFiveHourState(now)
+	state.serialActiveAuthID = "primary"
+	state.serialSelectionSource = "auto"
+	backup := state.quotas["backup"]
+	backup.Windows[1].UsedPercent = 99
+	state.quotas["backup"] = backup
+
+	got := state.serialPick(strictFiveHourRequest(""), now)
+	if !got.Handled || got.AuthID != "backup" {
+		t.Fatalf("safe soft-threshold fallback was not selected: %#v", got)
+	}
+	if state.serialLastSwitchReason != "serial_threshold" {
+		t.Fatalf("switch reason = %q; want serial_threshold", state.serialLastSwitchReason)
+	}
+}
+
+func TestSerialSchedulerPinnedStrictThresholdDoesNotFallback(t *testing.T) {
+	resetBanStoreForTest()
+	now := time.Now()
+	state := strictFiveHourState(now)
+	state.serialActiveAuthID = "primary"
+	state.serialSelectionSource = "auto"
+	req := strictFiveHourRequest("pinned-strict")
+	req.Options.Metadata = map[string]any{"pinned_auth_id": "primary"}
+
+	got := state.serialPick(req, now)
+	if got.Handled || got.AuthID != "" {
+		t.Fatalf("pinned strict account was returned after its boundary: %#v", got)
+	}
+	if state.serialActiveAuthID != "primary" {
+		t.Fatalf("pinned request changed committed auth: %q", state.serialActiveAuthID)
+	}
+}
+
+func TestSerialSchedulerHardLimitDoesNotUseStrictThresholdFallback(t *testing.T) {
+	resetBanStoreForTest()
+	now := time.Now()
+	state := strictFiveHourState(now)
+	state.serialActiveAuthID = "primary"
+	state.serialSelectionSource = "auto"
+	primary := state.quotas["primary"]
+	primary.Windows[0].UsedPercent = 100
+	primary.Windows[0].LimitReached = true
+	state.quotas["primary"] = primary
+	backup := state.quotas["backup"]
+	backup.Windows[0].UsedPercent = 96
+	state.quotas["backup"] = backup
+
+	got := state.serialPick(strictFiveHourRequest(""), now)
+	if got.Handled || got.AuthID != "" {
+		t.Fatalf("hard-limited primary selected a strict-boundary fallback: %#v", got)
+	}
+	if state.serialActiveAuthID != "" {
+		t.Fatalf("hard-limited primary remained committed: %q", state.serialActiveAuthID)
+	}
+}
