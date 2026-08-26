@@ -535,7 +535,7 @@ func (s *schedulerRuntimeState) serialOverdraftPickLocked(
 		snapshot, found := s.quotas[candidate.ID]
 		if found {
 			choice := inspectSerialCandidate(candidate, snapshot, true, cfg, now)
-			projectedBoundary := choice.Eligible && s.serialProjectedFiveHourBoundaryLocked(req, choice, now)
+			projectedBoundary := choice.QuotaKnown && s.serialProjectedFiveHourBoundaryLocked(req, choice, now)
 			if choice.QuotaKnown && (choice.Reason == "limit_reached" || choice.Reason == "not_allowed" || serialFiveHourStrictThresholdReached(snapshot, cfg, now) || projectedBoundary) {
 				delete(s.serialOverdraft, session)
 				return pluginapi.SchedulerPickResponse{}, false
@@ -548,21 +548,54 @@ func (s *schedulerRuntimeState) serialOverdraftPickLocked(
 	return pluginapi.SchedulerPickResponse{}, false
 }
 
-func (s *schedulerRuntimeState) serialPick(req pluginapi.SchedulerPickRequest, now time.Time) (response pluginapi.SchedulerPickResponse) {
-	// Keep decision + predicted debit atomic with respect to other serial picks.
+func (s *schedulerRuntimeState) serialPick(req pluginapi.SchedulerPickRequest, now time.Time) pluginapi.SchedulerPickResponse {
+	// Keep the decision and its predicted debit atomic for direct callers.
+	// The host-facing path uses serialAdmissionPick below so the probe lease
+	// claim is part of the same admission transaction.
 	serialAdmissionGate.Lock()
-	defer func() {
-		if response.Handled && strings.TrimSpace(response.AuthID) != "" {
-			// Half-open candidates are finalized by the outer global probe lease.
-			// Do not reserve them here or a losing probe contender would leave a
-			// phantom pending debit for a request that was never sent.
-			entry, quarantined := banStore.lookup(response.AuthID)
-			if !quarantined || banEntryDisposition(entry, now) != banDispositionProbeReady {
-				s.recordSerialPredictedDebit(response.AuthID, req, now)
-			}
+	defer serialAdmissionGate.Unlock()
+	response := s.serialPickDecision(req, now)
+	if response.Handled && strings.TrimSpace(response.AuthID) != "" {
+		// A direct caller does not run the outer probe lease. Preserve the old
+		// behavior for healthy candidates, but never reserve a quarantined one.
+		if _, quarantined := banStore.lookup(response.AuthID); !quarantined {
+			s.recordSerialPredictedDebit(response.AuthID, req, now)
 		}
-		serialAdmissionGate.Unlock()
-	}()
+	}
+	return response
+}
+
+// serialAdmissionPick performs serial selection, the final half-open probe
+// claim, and predicted-debit reservation as one transaction. Keeping all
+// three steps under serialAdmissionGate prevents a concurrent pick from
+// observing an unreserved headroom gap or leaving a reservation for a probe
+// contender that lost the global lease.
+func (s *schedulerRuntimeState) serialAdmissionPick(
+	req pluginapi.SchedulerPickRequest,
+	now time.Time,
+	probeLease time.Duration,
+) (response pluginapi.SchedulerPickResponse, probeAllowed, probeStarted bool) {
+	serialAdmissionGate.Lock()
+	defer serialAdmissionGate.Unlock()
+	response = s.serialPickDecision(req, now)
+	if !response.Handled || strings.TrimSpace(response.AuthID) == "" {
+		return response, true, false
+	}
+	probeAllowed, probeStarted = banStore.tryStartProbe(response.AuthID, now, probeLease)
+	if !probeAllowed {
+		// The final probe lease was won by another request. No predicted debit
+		// has been recorded yet, so the retry cannot inherit a phantom debit.
+		return response, false, false
+	}
+	s.recordSerialPredictedDebit(response.AuthID, req, now)
+	return response, true, probeStarted
+}
+
+// serialPickDecision contains the serial ranking and state transition. The
+// caller must hold serialAdmissionGate; it is deliberately separated from
+// probe claiming so host retries can remove a losing candidate and re-enter
+// this transaction without releasing another serial pick into the gap.
+func (s *schedulerRuntimeState) serialPickDecision(req pluginapi.SchedulerPickRequest, now time.Time) pluginapi.SchedulerPickResponse {
 
 	blocked := make(map[string]banDisposition, len(req.Candidates))
 	for _, candidate := range req.Candidates {
@@ -632,7 +665,7 @@ func (s *schedulerRuntimeState) serialPick(req pluginapi.SchedulerPickRequest, n
 		}
 		snapshot, found := s.quotas[candidate.ID]
 		choice := inspectSerialCandidate(candidate, snapshot, found, cfg, now)
-		projectedBoundary := choice.Eligible && s.serialProjectedFiveHourBoundaryLocked(req, choice, now)
+		projectedBoundary := choice.QuotaKnown && s.serialProjectedFiveHourBoundaryLocked(req, choice, now)
 		if projectedBoundary {
 			choice.Eligible = false
 			choice.Reason = "serial_projected_threshold"
@@ -735,13 +768,14 @@ func (s *schedulerRuntimeState) serialPick(req pluginapi.SchedulerPickRequest, n
 	}
 
 	thresholdFallback := false
+	softThresholdChoices := s.serialSoftFallbackChoicesLocked(req, thresholdChoices, cfg, now)
 	if len(choices) == 0 && previous != "" && currentSeen &&
 		(currentReason == "limit_reached" || currentReason == "not_allowed" || currentReason == "quarantined") &&
-		len(thresholdChoices) > 0 {
+		len(softThresholdChoices) > 0 {
 		// A hard-exhausted primary must never delegate to CPA merely because
 		// every backup is at the soft threshold. Use the least-used backup and
 		// let overdraft affect only the already-pinned session.
-		choices = thresholdChoices
+		choices = softThresholdChoices
 		thresholdFallback = true
 	}
 	if len(choices) == 0 && previous != "" && currentSeen && serialSoftThresholdReason(currentReason) {
@@ -750,12 +784,6 @@ func (s *schedulerRuntimeState) serialPick(req pluginapi.SchedulerPickRequest, n
 			// non-strict threshold replacements are safe; strict-boundary
 			// replacements were filtered while collecting thresholdChoices and
 			// are checked again here to keep this fallback fail-closed.
-			softThresholdChoices := make([]serialCandidate, 0, len(thresholdChoices))
-			for _, choice := range thresholdChoices {
-				if serialSoftFallbackCandidateLocked(req, choice, cfg, now) {
-					softThresholdChoices = append(softThresholdChoices, choice)
-				}
-			}
 			if len(softThresholdChoices) > 0 {
 				choices = softThresholdChoices
 				thresholdFallback = true
@@ -768,13 +796,13 @@ func (s *schedulerRuntimeState) serialPick(req pluginapi.SchedulerPickRequest, n
 			return pluginapi.SchedulerPickResponse{AuthID: previous, Handled: true}
 		}
 	}
-	if len(choices) == 0 && previous == "" && len(thresholdChoices) > 0 {
-		choices = thresholdChoices
+	if len(choices) == 0 && previous == "" && len(softThresholdChoices) > 0 {
+		choices = softThresholdChoices
 		thresholdFallback = true
 	}
 	if previous != "" && !currentSeen {
 		if len(choices) == 0 {
-			choices = thresholdChoices
+			choices = softThresholdChoices
 		}
 		sortSerialCandidates(choices, cfg)
 		if s.serialMissingAuthID != previous {

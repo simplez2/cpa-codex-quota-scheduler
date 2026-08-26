@@ -29,6 +29,52 @@ func serialSoftThresholdReason(reason string) bool {
 	return reason == "serial_threshold" || reason == "serial_projected_threshold"
 }
 
+// serialSoftFallbackCandidateLocked reports whether a threshold candidate is
+// safe to use as an emergency replacement. A dedicated custom 5h boundary is
+// fail-closed: neither an observed crossing nor a request that would be
+// projected to cross that boundary may be selected as fallback. The caller
+// must hold s.mu.
+func (s *schedulerRuntimeState) serialSoftFallbackCandidateLocked(
+	req pluginapi.SchedulerPickRequest,
+	choice serialCandidate,
+	cfg pluginConfig,
+	now time.Time,
+) bool {
+	if choice.Reason != "serial_threshold" {
+		return false
+	}
+	if serialFiveHourStrictThresholdReached(choice.Snapshot, cfg, now) {
+		return false
+	}
+	if choice.QuotaKnown && s.serialProjectedFiveHourBoundaryLocked(req, choice, now) {
+		return false
+	}
+	return true
+}
+
+// serialSoftFallbackChoicesLocked removes strict 5h candidates from a
+// threshold-only fallback pool. It is intentionally evaluated at the point of
+// fallback, after all request reservations have been accounted for, so a
+// candidate cannot re-enter merely because it was classified earlier in the
+// scan. The caller must hold s.mu.
+func (s *schedulerRuntimeState) serialSoftFallbackChoicesLocked(
+	req pluginapi.SchedulerPickRequest,
+	choices []serialCandidate,
+	cfg pluginConfig,
+	now time.Time,
+) []serialCandidate {
+	if len(choices) == 0 {
+		return nil
+	}
+	out := make([]serialCandidate, 0, len(choices))
+	for _, choice := range choices {
+		if s.serialSoftFallbackCandidateLocked(req, choice, cfg, now) {
+			out = append(out, choice)
+		}
+	}
+	return out
+}
+
 // serialFiveHourCapacityCreditsLocked returns the best currently available
 // estimate of a 5h window's total credit capacity. Caller must hold s.mu.
 func (s *schedulerRuntimeState) serialFiveHourCapacityCreditsLocked(authID string, snapshot quotaSnapshot, now time.Time) float64 {

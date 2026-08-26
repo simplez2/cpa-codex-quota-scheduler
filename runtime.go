@@ -1154,8 +1154,17 @@ func (s *schedulerRuntimeState) schedulerPick(req pluginapi.SchedulerPickRequest
 		dynamic := pluginapi.SchedulerPickResponse{Handled: false}
 		returned := pluginapi.SchedulerPickResponse{Handled: false}
 		var candidates []pacingCandidate
+		probeStarted := false
 		if mode == "serial" {
-			returned = s.serialPick(attempt, now)
+			var probeAllowed bool
+			returned, probeAllowed, probeStarted = s.serialAdmissionPick(attempt, now, probeLease)
+			if !probeAllowed {
+				// Another concurrent pick won the half-open lease after this
+				// decision was ranked. Retry with that credential removed; the
+				// serial admission transaction has not recorded a debit for it.
+				remaining = schedulerCandidatesWithout(remaining, returned.AuthID)
+				continue
+			}
 		} else {
 			var err error
 			legacy, err = s.legacySchedulerPick(attempt, now)
@@ -1176,13 +1185,16 @@ func (s *schedulerRuntimeState) schedulerPick(req pluginapi.SchedulerPickRequest
 			return returned, nil
 		}
 
-		allowed, probeStarted := banStore.tryStartProbe(returned.AuthID, now, probeLease)
-		if !allowed {
-			// Another concurrent pick won the half-open lease after this decision
-			// was ranked. Retry with that credential removed instead of issuing a
-			// second probe.
-			remaining = schedulerCandidatesWithout(remaining, returned.AuthID)
-			continue
+		if mode != "serial" {
+			allowed, started := banStore.tryStartProbe(returned.AuthID, now, probeLease)
+			if !allowed {
+				// Another concurrent pick won the half-open lease after this
+				// decision was ranked. Retry with that credential removed instead
+				// of issuing a second probe.
+				remaining = schedulerCandidatesWithout(remaining, returned.AuthID)
+				continue
+			}
+			probeStarted = started
 		}
 		if probeStarted {
 			s.persistAfterBanChange()

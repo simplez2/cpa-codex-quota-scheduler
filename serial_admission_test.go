@@ -149,3 +149,72 @@ func TestSerialProjectedFiveHourGuardUsesKeeperWindowCostBootstrap(t *testing.T)
 		t.Fatalf("Keeper window-cost capacity bootstrap did not guard the request: %#v", got)
 	}
 }
+
+func TestSerialHalfOpenCollisionReservesOnlyAdmittedProbe(t *testing.T) {
+	resetBanStoreForTest()
+	now := time.Now()
+	state := projectedFiveHourState(now, 20, 1)
+	state.serialActiveAuthID = "primary"
+	banStore.set("primary", banEntry{
+		Kind:     banKindQuota,
+		Phase:    banPhaseCooldown,
+		Window:   "5h",
+		BannedAt: now.Add(-time.Minute),
+		ResetAt:  now.Add(-time.Second),
+	})
+	req := projectedFiveHourRequest()
+
+	const workers = 32
+	start := make(chan struct{})
+	results := make(chan pluginapi.SchedulerPickResponse, workers)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			got, err := state.schedulerPick(req)
+			if err != nil {
+				t.Errorf("scheduler pick: %v", err)
+				return
+			}
+			results <- got
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+
+	primaryPicks := 0
+	backupPicks := 0
+	for got := range results {
+		if !got.Handled {
+			t.Fatalf("half-open collision pick was unhandled: %#v", got)
+		}
+		switch got.AuthID {
+		case "primary":
+			primaryPicks++
+		case "backup":
+			backupPicks++
+		default:
+			t.Fatalf("unexpected half-open collision auth: %#v", got)
+		}
+	}
+	if primaryPicks != 1 || backupPicks != workers-1 {
+		t.Fatalf("half-open collision picks primary=%d backup=%d; want 1/%d", primaryPicks, backupPicks, workers-1)
+	}
+
+	state.mu.RLock()
+	primaryPending := append([]float64(nil), state.pacingAccounts["primary"].PendingPredicted...)
+	backupPending := append([]float64(nil), state.pacingAccounts["backup"].PendingPredicted...)
+	state.mu.RUnlock()
+	if len(primaryPending) != 1 || primaryPending[0] != 1 {
+		t.Fatalf("primary pending reservations = %#v; want exactly one admitted probe", primaryPending)
+	}
+	if len(backupPending) != workers-1 {
+		t.Fatalf("backup pending reservations = %d; want %d", len(backupPending), workers-1)
+	}
+	if stats := banStore.stats(); stats.ProbeStarts != 1 {
+		t.Fatalf("probe starts=%d; want 1", stats.ProbeStarts)
+	}
+}

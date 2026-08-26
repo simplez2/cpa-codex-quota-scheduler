@@ -215,3 +215,40 @@ func TestSerialSchedulerHardLimitDoesNotUseStrictThresholdFallback(t *testing.T)
 		t.Fatalf("hard-limited primary remained committed: %q", state.serialActiveAuthID)
 	}
 }
+
+func TestSerialSchedulerProjectedStrictFallbackIsRejected(t *testing.T) {
+	resetBanStoreForTest()
+	now := time.Now()
+	state := projectedFiveHourState(now, 96, 2)
+	state.serialActiveAuthID = "primary"
+	state.serialSelectionSource = "auto"
+	backup := state.quotas["backup"]
+	// Make the backup look like a weekly soft-threshold candidate while the
+	// request-cost projection would still cross its dedicated 5h boundary.
+	backup.Windows[0].UsedPercent = 94
+	backup.Windows[1].UsedPercent = 99
+	state.quotas["backup"] = backup
+
+	got := state.serialPick(projectedFiveHourRequest(), now)
+	if got.Handled || got.AuthID != "" {
+		t.Fatalf("projected strict fallback selected an unsafe account: %#v", got)
+	}
+	if state.serialActiveAuthID != "" {
+		t.Fatalf("projected strict primary remained committed: %q", state.serialActiveAuthID)
+	}
+}
+
+func TestSerialSchedulerProjectedStrictPinnedPickFailsClosed(t *testing.T) {
+	resetBanStoreForTest()
+	now := time.Now()
+	state := projectedFiveHourState(now, 96, 2)
+	state.serialActiveAuthID = "primary"
+	state.serialSelectionSource = "auto"
+	req := projectedFiveHourRequest()
+	req.Options.Metadata = map[string]any{"pinned_auth_id": "primary"}
+
+	got := state.serialPick(req, now)
+	if got.Handled || got.AuthID != "" {
+		t.Fatalf("projected strict pinned account was returned: %#v", got)
+	}
+}
