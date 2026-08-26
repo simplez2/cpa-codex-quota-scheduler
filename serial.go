@@ -79,10 +79,13 @@ func serialWindowDrains(window quotaWindow, cfg pluginConfig, now time.Time) boo
 	return window.ResetAt.Sub(now) <= drainDuration
 }
 
-func serialWindowClass(snapshot quotaSnapshot, order []string) string {
+func serialWindowClass(snapshot quotaSnapshot, order []string, now time.Time) string {
 	selected := "unknown"
 	selectedRank := windowRankInOrder(selected, order)
 	for _, window := range snapshot.Windows {
+		if !window.ResetAt.IsZero() && !now.Before(window.ResetAt) {
+			continue
+		}
 		class := normalizeWindowClass(window.Class)
 		if class == "" {
 			continue
@@ -126,6 +129,39 @@ func serialWindowHandoffPolicy(cfg pluginConfig, class string) (mode string, thr
 	return mode, threshold
 }
 
+// serialFiveHourStrictThresholdReached reports whether the operator-selected
+// dedicated 5h threshold has been crossed. custom_threshold is intentionally
+// strict: unlike inherited/global thresholds it is a safety handoff boundary,
+// so drain and in-flight session continuation must not route another request
+// to the old auth once a healthy replacement is available.
+func serialFiveHourStrictThresholdReached(snapshot quotaSnapshot, cfg pluginConfig, now time.Time) bool {
+	if normalizeSerial5hHandoffMode(cfg.Serial5hHandoffMode) != "custom_threshold" {
+		return false
+	}
+	threshold := cfg.Serial5hSwitchPercent
+	if threshold <= 0 || threshold > 100 {
+		threshold = cfg.SerialSwitchPercent
+		if threshold <= 0 || threshold > 100 {
+			threshold = 98
+		}
+	}
+	for _, window := range snapshot.Windows {
+		if normalizeWindowClass(window.Class) != "5h" {
+			continue
+		}
+		if !window.ResetAt.IsZero() && !now.Before(window.ResetAt) {
+			continue
+		}
+		if !window.Allowed || window.LimitReached || window.UsedPercent >= usedPercentThreshold {
+			continue
+		}
+		if window.UsedPercent >= threshold {
+			return true
+		}
+	}
+	return false
+}
+
 func inspectSerialCandidate(candidate pluginapi.SchedulerAuthCandidate, snapshot quotaSnapshot, found bool, cfg pluginConfig, now time.Time) serialCandidate {
 	choice := serialCandidate{
 		Candidate:   candidate,
@@ -138,14 +174,14 @@ func inspectSerialCandidate(candidate pluginapi.SchedulerAuthCandidate, snapshot
 		return choice
 	}
 
-	choice.QuotaKnown = true
-	choice.Reason = "eligible"
-	choice.WindowClass = serialWindowClass(snapshot, cfg.WindowOrder)
+	activeWindows := 0
 	choice.ResetCredits = snapshot.ResetCredits
+	choice.WindowClass = serialWindowClass(snapshot, cfg.WindowOrder, now)
 	for _, window := range snapshot.Windows {
 		if !window.ResetAt.IsZero() && !now.Before(window.ResetAt) {
 			continue
 		}
+		activeWindows++
 		remaining := math.Max(0, math.Min(100, 100-window.UsedPercent))
 		switch normalizeWindowClass(window.Class) {
 		case "5h":
@@ -162,11 +198,13 @@ func inspectSerialCandidate(candidate pluginapi.SchedulerAuthCandidate, snapshot
 			}
 		}
 	}
-	choice.WeeklyProtected = choice.WeeklyKnown && choice.WeeklyRemaining <= cfg.ReserveWeeklyPercent
-	threshold := cfg.SerialSwitchPercent
-	if threshold <= 0 || threshold > 100 {
-		threshold = 98
+	if activeWindows == 0 {
+		return choice
 	}
+
+	choice.QuotaKnown = true
+	choice.Reason = "eligible"
+	choice.WeeklyProtected = choice.WeeklyKnown && choice.WeeklyRemaining <= cfg.ReserveWeeklyPercent
 	reason := "eligible"
 	for _, window := range snapshot.Windows {
 		if !window.ResetAt.IsZero() && !now.Before(window.ResetAt) {
@@ -202,7 +240,8 @@ func inspectSerialCandidate(candidate pluginapi.SchedulerAuthCandidate, snapshot
 			class != "" && reserve > 0 &&
 			100-window.UsedPercent <= reserve
 		thresholdReached := handoffMode != "429_only" && window.UsedPercent >= threshold
-		if reason == "eligible" && !draining && (thresholdReached || reserveReached) {
+		strictFiveHourBoundary := class == "5h" && normalizeSerial5hHandoffMode(cfg.Serial5hHandoffMode) == "custom_threshold"
+		if reason == "eligible" && (thresholdReached || reserveReached) && (!draining || strictFiveHourBoundary) {
 			reason = "serial_threshold"
 		}
 	}
@@ -465,9 +504,9 @@ func (s *schedulerRuntimeState) serialRequestLocalPickLocked(
 }
 
 // serialOverdraftPickLocked serves one request from the session's pinned
-// overdraft auth. The candidate must still be present in CPA's list; the
-// quota check is skipped on purpose because the binding preserves the already
-// running conversation for a short, bounded compatibility window.
+// overdraft auth. The candidate must still be present in CPA's list. Legacy
+// soft thresholds may keep a short continuation binding, but a dedicated 5h
+// custom threshold is a strict safety boundary and invalidates that binding.
 func (s *schedulerRuntimeState) serialOverdraftPickLocked(
 	candidates []pluginapi.SchedulerAuthCandidate,
 	session, overdraftAuthID string,
@@ -487,14 +526,10 @@ func (s *schedulerRuntimeState) serialOverdraftPickLocked(
 			delete(s.serialOverdraft, session)
 			return pluginapi.SchedulerPickResponse{}, false
 		}
-		// Overdraft is only a bounded compatibility path for a soft threshold.
-		// Never bypass a fresh hard quota result: routing an already exhausted
-		// 5h auth back into the same conversation turns a recoverable handoff
-		// into the upstream "usage limit reached" interruption.
 		snapshot, found := s.quotas[candidate.ID]
 		if found {
 			choice := inspectSerialCandidate(candidate, snapshot, true, cfg, now)
-			if choice.QuotaKnown && (choice.Reason == "limit_reached" || choice.Reason == "not_allowed") {
+			if choice.QuotaKnown && (choice.Reason == "limit_reached" || choice.Reason == "not_allowed" || serialFiveHourStrictThresholdReached(snapshot, cfg, now)) {
 				delete(s.serialOverdraft, session)
 				return pluginapi.SchedulerPickResponse{}, false
 			}
@@ -548,6 +583,7 @@ func (s *schedulerRuntimeState) serialPick(req pluginapi.SchedulerPickRequest, n
 	}
 	currentSeen := false
 	currentEligible := false
+	currentStrictFiveHourBoundary := false
 	currentChoice := serialCandidate{}
 	currentReason := "candidate_unavailable"
 	choices := make([]serialCandidate, 0, len(req.Candidates))
@@ -575,8 +611,10 @@ func (s *schedulerRuntimeState) serialPick(req pluginapi.SchedulerPickRequest, n
 		snapshot, found := s.quotas[candidate.ID]
 		choice := inspectSerialCandidate(candidate, snapshot, found, cfg, now)
 		s.annotateSerialCandidateLocked(&choice)
+		strictFiveHourBoundary := found && serialFiveHourStrictThresholdReached(snapshot, cfg, now)
 		if candidate.ID == previous {
 			currentSeen = true
+			currentStrictFiveHourBoundary = strictFiveHourBoundary
 			if choice.Eligible {
 				currentEligible = true
 				currentChoice = choice
@@ -587,20 +625,15 @@ func (s *schedulerRuntimeState) serialPick(req pluginapi.SchedulerPickRequest, n
 				continue
 			}
 			if session != "" && sessionPinned == candidate.ID &&
-				choice.Reason == "serial_threshold" && overdraftOverride == "" {
-				// In-flight overdraft: this exact conversation was already
-				// being served by the now-exhausted auth, so remember to keep
-				// serving it there for the bounded compatibility window. Do not short-circuit:
-				// the global switch below must still move every other session
-				// onto a fresh backup.
+				choice.Reason == "serial_threshold" && !strictFiveHourBoundary && overdraftOverride == "" {
+				// Legacy soft-threshold continuation: preserve this exact
+				// conversation on the previous auth while the global primary
+				// moves. A dedicated 5h custom threshold is excluded because it
+				// is an operator-selected strict safety boundary.
 				overdraftOverride = candidate.ID
 				s.setSerialOverdraftLocked(session, candidate.ID, now)
 			} else if session != "" && sessionPinned == candidate.ID &&
-				(choice.Reason == "limit_reached" || choice.Reason == "not_allowed") {
-				// A hard limit invalidates the old session pin immediately. The
-				// normal candidate selection below must be allowed to hand the
-				// request to a healthy backup instead of returning the exhausted
-				// auth through overdraftOverride.
+				(choice.Reason == "limit_reached" || choice.Reason == "not_allowed" || strictFiveHourBoundary) {
 				delete(s.serialOverdraft, session)
 				sessionPinned = ""
 			}
@@ -621,7 +654,8 @@ func (s *schedulerRuntimeState) serialPick(req pluginapi.SchedulerPickRequest, n
 	}
 	if currentEligible {
 		// A drain-window account is intentionally allowed to consume its
-		// expiring quota; never preempt it with a fresh backup.
+		// expiring quota for legacy/inherited policies. Dedicated 5h custom
+		// thresholds never reach this branch after crossing their boundary.
 		if currentChoice.DrainActive {
 			s.mu.Unlock()
 			return pluginapi.SchedulerPickResponse{AuthID: previous, Handled: true}
@@ -685,11 +719,20 @@ func (s *schedulerRuntimeState) serialPick(req pluginapi.SchedulerPickRequest, n
 		thresholdFallback = true
 	}
 	if len(choices) == 0 && previous != "" && currentSeen && currentReason == "serial_threshold" {
-		// A soft threshold is a switch preference, not a reason to delegate to
-		// CPA when every backup is equally full. Keep one account active until
-		// a hard limit or 429 provides an authoritative failover signal.
-		s.mu.Unlock()
-		return pluginapi.SchedulerPickResponse{AuthID: previous, Handled: true}
+		if currentStrictFiveHourBoundary && len(thresholdChoices) > 0 {
+			// A dedicated 5h threshold is strict for the current auth. If every
+			// replacement has also crossed a soft threshold, move to the best
+			// replacement instead of knowingly keeping the boundary-crossed
+			// current auth. This is still bounded by actual pool availability.
+			choices = thresholdChoices
+			thresholdFallback = true
+		} else {
+			// Legacy/global soft thresholds remain a preference: when no safer
+			// replacement exists, keep one committed account until an
+			// authoritative hard failure requires failover.
+			s.mu.Unlock()
+			return pluginapi.SchedulerPickResponse{AuthID: previous, Handled: true}
+		}
 	}
 	if len(choices) == 0 && previous == "" && len(thresholdChoices) > 0 {
 		choices = thresholdChoices
