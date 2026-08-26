@@ -6,19 +6,20 @@ import (
 )
 
 type runtimeEffectiveFiveHourPolicy struct {
-	Mode                        string  `json:"mode"`
-	ThresholdPercent            float64 `json:"threshold_percent,omitempty"`
-	ThresholdSource             string  `json:"threshold_source"`
-	ReservePercent              float64 `json:"reserve_percent,omitempty"`
-	StrictBoundary              bool    `json:"strict_boundary"`
-	ProjectedAdmissionGuard     bool    `json:"projected_admission_guard"`
-	DrainCanOverrideBoundary    bool    `json:"drain_can_override_boundary"`
-	SessionContinuationPastLine bool    `json:"session_continuation_past_boundary"`
-	QuotaReady                  bool    `json:"quota_ready"`
-	GenerationReady             bool    `json:"generation_ready"`
-	PolicyReady                 bool    `json:"policy_ready"`
-	CurrentPrimary5hUsed        float64 `json:"current_primary_5h_used_percent,omitempty"`
-	CurrentPrimaryBoundaryHit   bool    `json:"current_primary_boundary_reached"`
+	Mode                         string  `json:"mode"`
+	ThresholdPercent             float64 `json:"threshold_percent,omitempty"`
+	ThresholdSource              string  `json:"threshold_source"`
+	ReservePercent               float64 `json:"reserve_percent,omitempty"`
+	StrictBoundary               bool    `json:"strict_boundary"`
+	ProjectedAdmissionConfigured bool    `json:"projected_admission_configured"`
+	ProjectionFallback           string  `json:"projection_fallback,omitempty"`
+	DrainCanOverrideBoundary     bool    `json:"drain_can_override_boundary"`
+	SessionContinuationPastLine  bool    `json:"session_continuation_past_boundary"`
+	QuotaReady                   bool    `json:"quota_ready"`
+	GenerationReady              bool    `json:"generation_ready"`
+	PolicyReady                  bool    `json:"policy_ready"`
+	CurrentPrimary5hUsed         float64 `json:"current_primary_5h_used_percent,omitempty"`
+	CurrentPrimaryBoundaryHit    bool    `json:"current_primary_boundary_reached"`
 }
 
 // MarshalJSON augments the existing runtime status without removing or
@@ -39,12 +40,12 @@ func (status runtimeStatus) MarshalJSON() ([]byte, error) {
 func effectiveFiveHourPolicy(status runtimeStatus) runtimeEffectiveFiveHourPolicy {
 	mode := normalizeSerial5hHandoffMode(status.Serial5hHandoffMode)
 	policy := runtimeEffectiveFiveHourPolicy{
-		Mode:                    mode,
-		ThresholdSource:         "none",
-		ReservePercent:          status.Reserve5hPercent,
-		ProjectedAdmissionGuard: mode == "custom_threshold",
-		QuotaReady:              status.FreshSnapshots > 0,
-		GenerationReady:         !status.GenerationManaged || status.GenerationActive,
+		Mode:                         mode,
+		ThresholdSource:              "none",
+		ReservePercent:               status.Reserve5hPercent,
+		ProjectedAdmissionConfigured: mode == "custom_threshold",
+		QuotaReady:                   status.FreshSnapshots > 0,
+		GenerationReady:              !status.GenerationManaged || status.GenerationActive,
 	}
 
 	switch mode {
@@ -52,6 +53,7 @@ func effectiveFiveHourPolicy(status runtimeStatus) runtimeEffectiveFiveHourPolic
 		policy.ThresholdPercent = normalizedRuntimeThreshold(status.Serial5hSwitchPercent, status.SerialSwitchPercent)
 		policy.ThresholdSource = "serial_5h_switch_percent"
 		policy.StrictBoundary = true
+		policy.ProjectionFallback = "observed_threshold_when_capacity_unknown"
 		policy.DrainCanOverrideBoundary = false
 		policy.SessionContinuationPastLine = false
 	case "reserve_aware":
