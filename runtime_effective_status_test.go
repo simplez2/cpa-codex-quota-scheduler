@@ -43,8 +43,11 @@ func TestRuntimeStatusExposesStrictEffectiveFiveHourPolicy(t *testing.T) {
 	if decoded.Effective.Mode != "custom_threshold" || decoded.Effective.ThresholdPercent != 95 || decoded.Effective.ThresholdSource != "serial_5h_switch_percent" {
 		t.Fatalf("effective strict policy = %#v", decoded.Effective)
 	}
-	if !decoded.Effective.StrictBoundary || !decoded.Effective.ProjectedAdmissionGuard || decoded.Effective.DrainCanOverrideBoundary || decoded.Effective.SessionContinuationPastLine {
+	if !decoded.Effective.StrictBoundary || !decoded.Effective.ProjectedAdmissionConfigured || decoded.Effective.DrainCanOverrideBoundary || decoded.Effective.SessionContinuationPastLine {
 		t.Fatalf("strict safety semantics = %#v", decoded.Effective)
+	}
+	if decoded.Effective.ProjectionFallback != "observed_threshold_when_capacity_unknown" {
+		t.Fatalf("projection fallback = %q", decoded.Effective.ProjectionFallback)
 	}
 	if !decoded.Effective.PolicyReady || decoded.Effective.CurrentPrimary5hUsed != 96 || !decoded.Effective.CurrentPrimaryBoundaryHit {
 		t.Fatalf("runtime readiness/current boundary = %#v", decoded.Effective)
@@ -64,7 +67,7 @@ func TestRuntimeStatusReportsInheritedPolicyAsNonStrict(t *testing.T) {
 	if policy.Mode != "inherit_global/reserve_aware" || policy.ThresholdPercent != 98 || policy.ThresholdSource != "serial_switch_percent" {
 		t.Fatalf("inherited effective policy = %#v", policy)
 	}
-	if policy.StrictBoundary || policy.ProjectedAdmissionGuard || !policy.DrainCanOverrideBoundary || !policy.SessionContinuationPastLine {
+	if policy.StrictBoundary || policy.ProjectedAdmissionConfigured || !policy.DrainCanOverrideBoundary || !policy.SessionContinuationPastLine {
 		t.Fatalf("inherited safety flags = %#v", policy)
 	}
 	if !policy.PolicyReady {
