@@ -468,15 +468,15 @@ func (s *schedulerRuntimeState) setSerialOverdraftLocked(session, authID string,
 // committed global serial auth. It is used for explicit pinned requests and
 // transient candidate subsets. The caller must hold s.mu.
 func (s *schedulerRuntimeState) serialRequestLocalPickLocked(
-	candidates []pluginapi.SchedulerAuthCandidate,
+	req pluginapi.SchedulerPickRequest,
 	pinnedAuthID string,
 	blocked map[string]banDisposition,
 	cfg pluginConfig,
 	now time.Time,
 ) pluginapi.SchedulerPickResponse {
-	choices := make([]serialCandidate, 0, len(candidates))
-	thresholdChoices := make([]serialCandidate, 0, len(candidates))
-	for _, candidate := range candidates {
+	choices := make([]serialCandidate, 0, len(req.Candidates))
+	thresholdChoices := make([]serialCandidate, 0, len(req.Candidates))
+	for _, candidate := range req.Candidates {
 		candidate.ID = strings.TrimSpace(candidate.ID)
 		if candidate.ID == "" || (pinnedAuthID != "" && candidate.ID != pinnedAuthID) {
 			continue
@@ -486,10 +486,14 @@ func (s *schedulerRuntimeState) serialRequestLocalPickLocked(
 		}
 		snapshot, found := s.quotas[candidate.ID]
 		choice := inspectSerialCandidate(candidate, snapshot, found, cfg, now)
+		if choice.Eligible && s.serialProjectedFiveHourBoundaryLocked(req, choice, now) {
+			choice.Eligible = false
+			choice.Reason = "serial_projected_threshold"
+		}
 		s.annotateSerialCandidateLocked(&choice)
 		if choice.Eligible {
 			choices = append(choices, choice)
-		} else if choice.Reason == "serial_threshold" {
+		} else if serialSoftThresholdReason(choice.Reason) {
 			thresholdChoices = append(thresholdChoices, choice)
 		}
 	}
@@ -506,9 +510,10 @@ func (s *schedulerRuntimeState) serialRequestLocalPickLocked(
 // serialOverdraftPickLocked serves one request from the session's pinned
 // overdraft auth. The candidate must still be present in CPA's list. Legacy
 // soft thresholds may keep a short continuation binding, but a dedicated 5h
-// custom threshold is a strict safety boundary and invalidates that binding.
+// custom threshold (observed or projected) is a strict safety boundary and
+// invalidates that binding.
 func (s *schedulerRuntimeState) serialOverdraftPickLocked(
-	candidates []pluginapi.SchedulerAuthCandidate,
+	req pluginapi.SchedulerPickRequest,
 	session, overdraftAuthID string,
 	blocked map[string]banDisposition,
 	cfg pluginConfig,
@@ -517,7 +522,7 @@ func (s *schedulerRuntimeState) serialOverdraftPickLocked(
 	if overdraftAuthID == "" {
 		return pluginapi.SchedulerPickResponse{}, false
 	}
-	for _, candidate := range candidates {
+	for _, candidate := range req.Candidates {
 		candidate.ID = strings.TrimSpace(candidate.ID)
 		if candidate.ID != overdraftAuthID {
 			continue
@@ -529,7 +534,8 @@ func (s *schedulerRuntimeState) serialOverdraftPickLocked(
 		snapshot, found := s.quotas[candidate.ID]
 		if found {
 			choice := inspectSerialCandidate(candidate, snapshot, true, cfg, now)
-			if choice.QuotaKnown && (choice.Reason == "limit_reached" || choice.Reason == "not_allowed" || serialFiveHourStrictThresholdReached(snapshot, cfg, now)) {
+			projectedBoundary := choice.Eligible && s.serialProjectedFiveHourBoundaryLocked(req, choice, now)
+			if choice.QuotaKnown && (choice.Reason == "limit_reached" || choice.Reason == "not_allowed" || serialFiveHourStrictThresholdReached(snapshot, cfg, now) || projectedBoundary) {
 				delete(s.serialOverdraft, session)
 				return pluginapi.SchedulerPickResponse{}, false
 			}
@@ -541,7 +547,22 @@ func (s *schedulerRuntimeState) serialOverdraftPickLocked(
 	return pluginapi.SchedulerPickResponse{}, false
 }
 
-func (s *schedulerRuntimeState) serialPick(req pluginapi.SchedulerPickRequest, now time.Time) pluginapi.SchedulerPickResponse {
+func (s *schedulerRuntimeState) serialPick(req pluginapi.SchedulerPickRequest, now time.Time) (response pluginapi.SchedulerPickResponse) {
+	// Keep decision + predicted debit atomic with respect to other serial picks.
+	serialAdmissionGate.Lock()
+	defer func() {
+		if response.Handled && strings.TrimSpace(response.AuthID) != "" {
+			// Half-open candidates are finalized by the outer global probe lease.
+			// Do not reserve them here or a losing probe contender would leave a
+			// phantom pending debit for a request that was never sent.
+			entry, quarantined := banStore.lookup(response.AuthID)
+			if !quarantined || banEntryDisposition(entry, now) != banDispositionProbeReady {
+				s.recordSerialPredictedDebit(response.AuthID, req, now)
+			}
+		}
+		serialAdmissionGate.Unlock()
+	}()
+
 	blocked := make(map[string]banDisposition, len(req.Candidates))
 	for _, candidate := range req.Candidates {
 		authID := strings.TrimSpace(candidate.ID)
@@ -570,12 +591,12 @@ func (s *schedulerRuntimeState) serialPick(req pluginapi.SchedulerPickRequest, n
 		sessionPinned = s.serialOverdraftAuthLocked(session, now)
 	}
 	if pinnedAuthID := serialPinnedAuthID(req); pinnedAuthID != "" {
-		response := s.serialRequestLocalPickLocked(req.Candidates, pinnedAuthID, blocked, cfg, now)
+		response := s.serialRequestLocalPickLocked(req, pinnedAuthID, blocked, cfg, now)
 		s.mu.Unlock()
 		return response
 	}
 	if overdraftAuthID := s.serialOverdraftAuthLocked(session, now); overdraftAuthID != "" && overdraftAuthID != previous {
-		if response, ok := s.serialOverdraftPickLocked(req.Candidates, session, overdraftAuthID, blocked, cfg, now); ok {
+		if response, ok := s.serialOverdraftPickLocked(req, session, overdraftAuthID, blocked, cfg, now); ok {
 			s.mu.Unlock()
 			return response
 		}
@@ -610,8 +631,13 @@ func (s *schedulerRuntimeState) serialPick(req pluginapi.SchedulerPickRequest, n
 		}
 		snapshot, found := s.quotas[candidate.ID]
 		choice := inspectSerialCandidate(candidate, snapshot, found, cfg, now)
+		projectedBoundary := choice.Eligible && s.serialProjectedFiveHourBoundaryLocked(req, choice, now)
+		if projectedBoundary {
+			choice.Eligible = false
+			choice.Reason = "serial_projected_threshold"
+		}
 		s.annotateSerialCandidateLocked(&choice)
-		strictFiveHourBoundary := found && serialFiveHourStrictThresholdReached(snapshot, cfg, now)
+		strictFiveHourBoundary := found && (serialFiveHourStrictThresholdReached(snapshot, cfg, now) || projectedBoundary)
 		if candidate.ID == previous {
 			currentSeen = true
 			currentStrictFiveHourBoundary = strictFiveHourBoundary
@@ -625,11 +651,10 @@ func (s *schedulerRuntimeState) serialPick(req pluginapi.SchedulerPickRequest, n
 				continue
 			}
 			if session != "" && sessionPinned == candidate.ID &&
-				choice.Reason == "serial_threshold" && !strictFiveHourBoundary && overdraftOverride == "" {
+				serialSoftThresholdReason(choice.Reason) && !strictFiveHourBoundary && overdraftOverride == "" {
 				// Legacy soft-threshold continuation: preserve this exact
 				// conversation on the previous auth while the global primary
-				// moves. A dedicated 5h custom threshold is excluded because it
-				// is an operator-selected strict safety boundary.
+				// moves. Dedicated 5h observed/projected boundaries are excluded.
 				overdraftOverride = candidate.ID
 				s.setSerialOverdraftLocked(session, candidate.ID, now)
 			} else if session != "" && sessionPinned == candidate.ID &&
@@ -642,7 +667,7 @@ func (s *schedulerRuntimeState) serialPick(req pluginapi.SchedulerPickRequest, n
 		}
 		if choice.Eligible {
 			choices = append(choices, choice)
-		} else if choice.Reason == "serial_threshold" {
+		} else if serialSoftThresholdReason(choice.Reason) {
 			thresholdChoices = append(thresholdChoices, choice)
 		}
 	}
@@ -718,7 +743,7 @@ func (s *schedulerRuntimeState) serialPick(req pluginapi.SchedulerPickRequest, n
 		choices = thresholdChoices
 		thresholdFallback = true
 	}
-	if len(choices) == 0 && previous != "" && currentSeen && currentReason == "serial_threshold" {
+	if len(choices) == 0 && previous != "" && currentSeen && serialSoftThresholdReason(currentReason) {
 		if currentStrictFiveHourBoundary && len(thresholdChoices) > 0 {
 			// A dedicated 5h threshold is strict for the current auth. If every
 			// replacement has also crossed a soft threshold, move to the best
