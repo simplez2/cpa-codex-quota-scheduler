@@ -1,0 +1,46 @@
+name: Per-window warmup confirmation verification
+
+on:
+  push:
+    branches: [fix/warmup-window-cycles]
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-verify:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/warmup-window-cycles
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache: true
+      - name: Apply per-window confirmation tests
+        run: python3 .github/warmup_window_confirmation_patch.py
+      - name: Format
+        run: gofmt -w warmup_confirmation.go warmup_window_cycles_regression_test.go
+      - name: Test
+        run: go test ./...
+      - name: Race test
+        run: go test -race ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Build Linux plugin
+        env:
+          CGO_ENABLED: "1"
+        run: go build -buildmode=c-shared -o /tmp/codex-quota-scheduler.so .
+      - name: Commit verified per-window confirmation
+        shell: bash
+        run: |
+          rm .github/workflows/warmup-window-confirmation-bot.yml .github/warmup_window_confirmation_patch.py
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "fix: confirm 5h and weekly warmups independently"
+          git push origin HEAD:fix/warmup-window-cycles
