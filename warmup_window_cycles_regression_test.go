@@ -126,3 +126,28 @@ func TestPlaceholderResetRequiresApproximatelyFullCycle(t *testing.T) {
 		t.Fatalf("oversized resetAfter was accepted as placeholder: %#v", oversized)
 	}
 }
+
+func TestCarriedStaleWindowWithoutResetRequestsKeeperRefresh(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	current := map[string]quotaSnapshot{"idx": {AuthID: "acct", AuthIndex: "idx", RefreshedAt: now, Windows: []quotaWindow{{Class: "5h", Allowed: true, ObservedAt: now}}}}
+	previous := map[string]quotaSnapshot{"idx": {
+		AuthID: "acct", AuthIndex: "idx", RefreshedAt: now,
+		Windows: []quotaWindow{{Class: "weekly", Allowed: true, ObservedAt: now.Add(-16 * time.Minute)}},
+	}}
+	targets := collectCarriedStaleWindowRefreshTargets([]string{"idx"}, current, previous, now, 15*time.Minute)
+	if len(targets) != 1 || targets[0].Reason != "carried_stale_window" {
+		t.Fatalf("stale zero-reset carried sibling was not refreshed: %#v", targets)
+	}
+}
+
+func TestStaleOuterSnapshotCannotProduceCarriedRefreshTarget(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	current := map[string]quotaSnapshot{"idx": {AuthID: "acct", AuthIndex: "idx", RefreshedAt: now, Windows: []quotaWindow{{Class: "5h", Allowed: true, ObservedAt: now}}}}
+	previous := map[string]quotaSnapshot{"idx": {
+		AuthID: "acct", AuthIndex: "idx", RefreshedAt: now.Add(-16 * time.Minute),
+		Windows: []quotaWindow{{Class: "weekly", Allowed: true, ResetAt: now.Add(6 * 24 * time.Hour), ObservedAt: now.Add(-16 * time.Minute)}},
+	}}
+	if targets := collectCarriedStaleWindowRefreshTargets([]string{"idx"}, current, previous, now, 15*time.Minute); len(targets) != 0 {
+		t.Fatalf("window from an outer-stale snapshot cannot be carried but requested refresh: %#v", targets)
+	}
+}

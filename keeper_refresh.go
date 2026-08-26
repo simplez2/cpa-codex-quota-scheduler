@@ -554,6 +554,12 @@ func collectCarriedStaleWindowRefreshTargets(indexes []string, current, previous
 		if !ok {
 			continue
 		}
+		// Match mergePartialQuotaSnapshot: an old snapshot outside the outer
+		// freshness envelope is discarded wholesale and therefore cannot leave
+		// a carried sibling that needs recovery.
+		if previousSnapshot.RefreshedAt.IsZero() || now.Before(previousSnapshot.RefreshedAt) || now.Sub(previousSnapshot.RefreshedAt) > staleAfter {
+			continue
+		}
 		staleCarry := false
 		oldestObservedAt := time.Time{}
 		for _, window := range previousSnapshot.Windows {
@@ -567,7 +573,7 @@ func collectCarriedStaleWindowRefreshTargets(indexes []string, current, previous
 			// Keep this exactly aligned with mergePartialQuotaSnapshot: only a
 			// missing window whose old reset is still in the future would be
 			// carried into the new runtime snapshot.
-			if window.ResetAt.IsZero() || !now.Before(window.ResetAt) {
+			if !window.ResetAt.IsZero() && !now.Before(window.ResetAt) {
 				continue
 			}
 			observedAt := window.ObservedAt
