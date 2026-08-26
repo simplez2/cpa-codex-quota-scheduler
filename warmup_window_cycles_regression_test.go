@@ -134,3 +134,42 @@ func TestStaleOuterSnapshotCannotProduceCarriedRefreshTarget(t *testing.T) {
 		t.Fatalf("window from an outer-stale snapshot cannot be carried but requested refresh: %#v", targets)
 	}
 }
+
+func TestPendingWarmupRequestsFreshKeeperConfirmation(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	completedAt := now.Add(-time.Minute)
+	state := schedulerRuntimeState{warmups: map[string]warmupEntry{
+		"acct|5h":     {AuthID: "acct", AuthIndex: "idx", Window: "5h", CompletedAt: completedAt},
+		"acct|weekly": {AuthID: "acct", AuthIndex: "idx", Window: "weekly", CompletedAt: completedAt},
+	}}
+	current := map[string]quotaSnapshot{"idx": {AuthID: "acct", AuthIndex: "idx", RefreshedAt: completedAt.Add(-time.Second)}}
+	targets := state.pendingWarmupKeeperRefreshTargets([]string{"idx"}, current)
+	if len(targets) != 1 || targets[0].AuthIndex != "idx" || targets[0].Reason != "warmup_pending_confirmation" {
+		t.Fatalf("pending warmup confirmation targets = %#v", targets)
+	}
+}
+
+func TestPostWarmupKeeperObservationDoesNotRequestRedundantConfirmation(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	completedAt := now.Add(-time.Minute)
+	state := schedulerRuntimeState{warmups: map[string]warmupEntry{
+		"acct|5h": {AuthID: "acct", AuthIndex: "idx", Window: "5h", CompletedAt: completedAt},
+	}}
+	current := map[string]quotaSnapshot{"idx": {AuthID: "acct", AuthIndex: "idx", RefreshedAt: completedAt.Add(time.Second)}}
+	if targets := state.pendingWarmupKeeperRefreshTargets([]string{"idx"}, current); len(targets) != 0 {
+		t.Fatalf("post-warmup Keeper observation requested redundant refresh: %#v", targets)
+	}
+}
+
+func TestWarmupConfirmationRefreshSkipsActivatedBlockedAndInactiveAuths(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	completedAt := now.Add(-time.Minute)
+	state := schedulerRuntimeState{warmups: map[string]warmupEntry{
+		"active-done|5h":    {AuthID: "active-done", AuthIndex: "done", Window: "5h", CompletedAt: completedAt, ActivatedAt: completedAt},
+		"active-blocked|5h": {AuthID: "active-blocked", AuthIndex: "blocked", Window: "5h", CompletedAt: completedAt, Blocked: true},
+		"inactive|5h":       {AuthID: "inactive", AuthIndex: "inactive", Window: "5h", CompletedAt: completedAt},
+	}}
+	if targets := state.pendingWarmupKeeperRefreshTargets([]string{"done", "blocked"}, nil); len(targets) != 0 {
+		t.Fatalf("non-actionable warmup entries requested confirmation refresh: %#v", targets)
+	}
+}

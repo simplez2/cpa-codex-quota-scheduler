@@ -410,8 +410,11 @@ func TestRefreshOnceQueuesStaleKeeperCacheThenWarmsExactlyOnce(t *testing.T) {
 	if got := warmupCalls.Load(); got != 1 {
 		t.Fatalf("pending confirmation repeated warmup: %d", got)
 	}
+	if got := refreshCalls.Load(); got != 2 {
+		t.Fatalf("pending warmup confirmation refresh calls = %d; want 2 total", got)
+	}
 	status := state.status()
-	if status.KeeperRefreshTargets != 0 || status.KeeperRefreshRequests != 1 || status.KeeperRefreshError != "" {
+	if status.KeeperRefreshTargets != 1 || status.KeeperRefreshRequests != 2 || status.KeeperRefreshError != "" {
 		t.Fatalf("keeper refresh status = %#v", status)
 	}
 }

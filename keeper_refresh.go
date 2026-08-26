@@ -644,6 +644,7 @@ func (s *schedulerRuntimeState) maybeRequestKeeperQuotaRefresh(ctx context.Conte
 	targets = mergeKeeperRefreshTargets(
 		targets,
 		collectCarriedStaleWindowRefreshTargets(indexes, quotas, previous, now, cfg.StaleAfter),
+		s.pendingWarmupKeeperRefreshTargets(indexes, quotas),
 	)
 	if len(targets) == 0 {
 		s.clearKeeperRefreshTargets()
