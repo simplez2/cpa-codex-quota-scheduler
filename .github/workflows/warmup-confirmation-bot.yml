@@ -23,7 +23,7 @@ jobs:
       - name: Apply confirmation-loop fix
         run: python3 .github/warmup_confirmation_patch.py
       - name: Format
-        run: gofmt -w keeper_refresh.go warmup_window_cycles_regression_test.go
+        run: gofmt -w keeper_refresh.go keeper_refresh_test.go warmup_confirmation.go warmup_window_cycles_regression_test.go
       - name: Test
         run: go test ./...
       - name: Race test
