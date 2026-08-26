@@ -94,6 +94,7 @@ func (s *schedulerRuntimeState) serialFiveHourAdmissionEstimateLocked(req plugin
 			if value > 0 && !math.IsNaN(value) && !math.IsInf(value, 0) {
 				pending += value
 			}
+		}
 	}
 	projected := choice.FiveHourUsed + (pending+predicted)*100/capacity
 	if projected < choice.FiveHourUsed {
