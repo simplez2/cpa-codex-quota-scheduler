@@ -449,6 +449,16 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 	if err := s.maybeRequestKeeperQuotaRefresh(ctx, cfg, password, token, indexes, cacheResp, quotas, now); err != nil {
 		s.recordRefreshError(err)
 	}
+	// A quota ban that has reached its reset boundary must get a targeted
+	// Keeper observation even when the broad cache response is temporarily
+	// incomplete. This closes the gap where a 5h reset is visible in the UI but
+	// the old scheduler cooldown still blocks warmup.
+	if expiredTargets := collectExpiredQuotaBanRefreshTargets(indexToFile, quotas, now); len(expiredTargets) > 0 {
+		if err := s.requestActiveCPAKeeperQuotaRefreshTargets(ctx, cfg, password, token, expiredTargets, now); err != nil {
+			s.recordRefreshError(err)
+		}
+	}
+
 	if len(quotas) == 0 {
 		s.recordRefreshError(errors.New("Keeper quota cache contained no usable Codex windows"))
 		return

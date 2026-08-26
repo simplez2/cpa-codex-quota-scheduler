@@ -11,7 +11,7 @@
   </p>
 </div>
 
-> **Version note:** the source and registry declare plugin version **v0.1.23**. A build is a published release only after the matching `v0.1.23` tag and release assets are available.
+> **Version note:** the source and registry declare plugin version **v0.1.24**. A build is a published release only after the matching `v0.1.24` tag and release assets are available.
 
 > **Upgrade exception:** the first upgrade from **v0.1.19 or earlier** to **v0.1.20** changes the generation-lock protocol and requires one controlled quick restart of CPA. Do not hot-load old and new DSOs together. Later v0.1.20-compatible reloads use the stable lock protocol normally.
 
@@ -22,7 +22,7 @@ The plugin keeps normal Codex traffic on one globally committed credential. It s
 | Requirement | Behavior |
 |---|---|
 | Lower account-risk exposure | One committed account serves normal traffic until a real switch trigger occurs. |
-| Spend short cycles before long cycles | Default class order is **5h ‚Üí weekly ‚Üí monthly**. |
+| Spend short cycles before long cycles | Default class order is **5h ‚Ü?weekly ‚Ü?monthly**. |
 | Avoid wasting reset credits | Within a class, reset-credit accounts can be preferred before active-cycle and usage concentration tie-breakers. |
 | Survive transient 408/5xx suppression | CPA candidate loss first becomes a request-local provisional fallback, not an immediate permanent switch. |
 | Recover safely after 429 | Durable cooldown, one global half-open probe, then healthy or probation. |
@@ -70,7 +70,7 @@ When CPA supplies a stable session identifier, serial mode records which auth al
 
 ## Warmup in one paragraph
 
-A warmup candidate must have a fresh Keeper row, all recognized active windows at 0% used and allowed, a credible ‚Äúnot started‚Äù reset signal, a valid CPA auth binding, no quarantine, no active/pending/blocked warmup record, and no competing generation or instance lease. The plugin then sends a pinned non-streaming `hello` request with `store=false` and `max_output_tokens=16`. Success is not assumed from HTTP 2xx alone: later Keeper data must confirm a stable reset anchor. Cyber-policy, abuse, auth, deactivated-workspace, and similar terminal failures are stored only as redacted blocked codes and are never retried automatically.
+A warmup candidate must have a fresh Keeper row, all recognized active windows at 0% used and allowed, a credible ‚Äúnot started‚Ä?reset signal, a valid CPA auth binding, no quarantine, no active/pending/blocked warmup record, and no competing generation or instance lease. The plugin then sends a pinned non-streaming `hello` request with `store=false` and `max_output_tokens=16`. Success is not assumed from HTTP 2xx alone: later Keeper data must confirm a stable reset anchor. Cyber-policy, abuse, auth, deactivated-workspace, and similar terminal failures are stored only as redacted blocked codes and are never retried automatically.
 
 Completed HTTP failures, including 502/503 and HTTP 200 streams that end in an error event, keep their original `AttemptedAt` backoff across plugin generations. Only a genuinely unfinished attempt with no upstream status, or a lifecycle cancellation before any result, may resume immediately after hot reload.
 
@@ -171,7 +171,7 @@ Manual primary selection, unban, and warmup retry are privileged actions. The se
 - Handles only pure `codex` candidate pools; mixed or third-party sets fall back to CPA.
 - Does not modify OAuth, PATs, cookies, auth files, official/default models, or third-party APIs.
 - Reads Keeper and CPA Management secrets only from mounted files.
-- Persists scheduling metadata, auth identifiers, hashed session identifiers, reset anchors, redacted failure codes, bans, and warmup outcomes ‚Äî never credential values.
+- Persists scheduling metadata, auth identifiers, hashed session identifiers, reset anchors, redacted failure codes, bans, and warmup outcomes ‚Ä?never credential values.
 - Treats `cyber_policy` and `cyber_abuse` as terminal blocked results; no retry loop is started.
 - Writes state atomically with owner-only permissions and fences hot-reload generations.
 

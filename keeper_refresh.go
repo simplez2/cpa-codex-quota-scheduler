@@ -337,6 +337,46 @@ func collectKeeperRefreshTargets(indexes []string, cache keeperCacheResponse, qu
 	return targets
 }
 
+// collectExpiredQuotaBanRefreshTargets asks Keeper for a fresh observation as
+// soon as a quota cooldown has elapsed. A normal cache refresh can briefly
+// return a completed row without usable windows while the asynchronous
+// refresh task is still settling; without this targeted retry the old ban can
+// suppress warmup until a later unrelated refresh happens.
+func collectExpiredQuotaBanRefreshTargets(indexToFile map[string]string, quotas map[string]quotaSnapshot, now time.Time) []keeperRefreshTarget {
+	if len(indexToFile) == 0 {
+		return nil
+	}
+	byAuth := make(map[string]quotaSnapshot, len(quotas))
+	for _, snapshot := range quotas {
+		authID := strings.TrimSpace(snapshot.AuthID)
+		if authID == "" {
+			continue
+		}
+		if previous, ok := byAuth[authID]; !ok || snapshot.RefreshedAt.After(previous.RefreshedAt) {
+			byAuth[authID] = snapshot
+		}
+	}
+	targets := make([]keeperRefreshTarget, 0)
+	for authIndex, authID := range indexToFile {
+		authID = strings.TrimSpace(authID)
+		entry, ok := banStore.lookup(authID)
+		if !ok || entry.Kind != banKindQuota || entry.Phase != banPhaseCooldown || entry.ResetAt.IsZero() || now.Before(entry.ResetAt) {
+			continue
+		}
+		observedAt := time.Time{}
+		if snapshot, exists := byAuth[authID]; exists {
+			observedAt = snapshot.RefreshedAt
+		}
+		targets = append(targets, keeperRefreshTarget{
+			AuthIndex:  strings.TrimSpace(authIndex),
+			Reason:     "expired_quota_cooldown",
+			ObservedAt: observedAt,
+		})
+	}
+	sort.Slice(targets, func(i, j int) bool { return targets[i].AuthIndex < targets[j].AuthIndex })
+	return targets
+}
+
 func keeperCacheItemNewer(candidate, previous keeperCacheItem) bool {
 	candidateCompleted := strings.EqualFold(strings.TrimSpace(candidate.Status), "completed") && candidate.Quota != nil
 	previousCompleted := strings.EqualFold(strings.TrimSpace(previous.Status), "completed") && previous.Quota != nil

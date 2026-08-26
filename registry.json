@@ -6,7 +6,7 @@
       "name": "Codex Quota Scheduler",
       "description": "CPA-native one-account-at-a-time Codex quota scheduler with 5h/weekly balancing, cycle-aware rotation, transient 5xx failover, persistent 429 quarantine, and sequential full-quota warmup.",
       "author": "simplez2",
-      "version": "0.1.23",
+      "version": "0.1.24",
       "repository": "https://github.com/simplez2/cpa-codex-quota-scheduler",
       "homepage": "https://github.com/simplez2/cpa-codex-quota-scheduler",
       "license": "MIT",

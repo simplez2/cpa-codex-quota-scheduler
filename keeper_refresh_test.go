@@ -485,3 +485,28 @@ func TestHotReloadGenerationsQueueOnlyOneKeeperRefresh(t *testing.T) {
 		t.Fatalf("hot reload refresh calls = %d; want 1", got)
 	}
 }
+
+func TestCollectExpiredQuotaBanRefreshTargetsIncludesElapsedFiveHourBan(t *testing.T) {
+	resetBanStoreForTest()
+	now := time.Now().UTC()
+	banStore.set("auth-a", banEntry{
+		Kind:   banKindQuota,
+		Phase:  banPhaseCooldown,
+		Window: "5h",
+		ResetAt: now.Add(-time.Minute),
+		BannedAt: now.Add(-2 * time.Hour),
+	})
+	defer resetBanStoreForTest()
+
+	targets := collectExpiredQuotaBanRefreshTargets(
+		map[string]string{"idx-a": "auth-a"},
+		nil,
+		now,
+	)
+	if len(targets) != 1 {
+		t.Fatalf("targets = %#v, want one expired cooldown target", targets)
+	}
+	if targets[0].AuthIndex != "idx-a" || targets[0].Reason != "expired_quota_cooldown" {
+		t.Fatalf("target = %#v, want idx-a/expired_quota_cooldown", targets[0])
+	}
+}
