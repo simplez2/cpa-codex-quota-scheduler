@@ -81,11 +81,11 @@ func warmupEntryHasPostCompletionObservation(entry warmupEntry, snapshot quotaSn
 		if normalizeWindowClass(window.Class) != class {
 			continue
 		}
-		observedAt := window.ObservedAt
-		if observedAt.IsZero() {
-			observedAt = snapshot.RefreshedAt
-		}
-		return !observedAt.IsZero() && observedAt.After(entry.CompletedAt)
+		// A snapshot-level refreshed_at cannot prove that this particular
+		// quota class was observed in a partial-cache response. Normalized
+		// Keeper rows and response-header rows both carry an explicit
+		// per-window ObservedAt, so zero here must remain unconfirmed.
+		return !window.ObservedAt.IsZero() && window.ObservedAt.After(entry.CompletedAt)
 	}
 	return false
 }
