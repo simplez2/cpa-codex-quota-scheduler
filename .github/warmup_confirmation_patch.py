@@ -16,6 +16,12 @@ replace_once(
     "\ttargets = mergeKeeperRefreshTargets(\n\t\ttargets,\n\t\tcollectCarriedStaleWindowRefreshTargets(indexes, quotas, previous, now, cfg.StaleAfter),\n\t\ts.pendingWarmupKeeperRefreshTargets(indexes, quotas),\n\t)\n",
 )
 
+replace_once(
+    "keeper_refresh_test.go",
+    '''\tstatus := state.status()\n\tif status.KeeperRefreshTargets != 0 || status.KeeperRefreshRequests != 1 || status.KeeperRefreshError != "" {\n\t\tt.Fatalf("keeper refresh status = %#v", status)\n\t}\n''',
+    '''\tif got := refreshCalls.Load(); got != 2 {\n\t\tt.Fatalf("pending warmup confirmation refresh calls = %d; want 2 total", got)\n\t}\n\tstatus := state.status()\n\tif status.KeeperRefreshTargets != 1 || status.KeeperRefreshRequests != 2 || status.KeeperRefreshError != "" {\n\t\tt.Fatalf("keeper refresh status = %#v", status)\n\t}\n''',
+)
+
 p = Path("warmup_window_cycles_regression_test.go")
 text = p.read_text()
 if "func TestPendingWarmupRequestsFreshKeeperConfirmation" in text:
