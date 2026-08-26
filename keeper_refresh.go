@@ -570,9 +570,9 @@ func collectCarriedStaleWindowRefreshTargets(indexes []string, current, previous
 			if _, exists := present[class]; exists {
 				continue
 			}
-			// Keep this exactly aligned with mergePartialQuotaSnapshot: only a
-			// missing window whose old reset is still in the future would be
-			// carried into the new runtime snapshot.
+			// Keep this exactly aligned with mergePartialQuotaSnapshot: a missing
+			// window is carried while its old reset is unknown or still in the
+			// future; an explicitly expired reset is dropped.
 			if !window.ResetAt.IsZero() && !now.Before(window.ResetAt) {
 				continue
 			}

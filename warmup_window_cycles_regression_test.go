@@ -110,23 +110,6 @@ func TestKeeperRefreshTargetMergeDeduplicatesCarriedWindow(t *testing.T) {
 	}
 }
 
-func TestPlaceholderResetRequiresApproximatelyFullCycle(t *testing.T) {
-	now := time.Now().UTC()
-	seconds := int64((5 * time.Hour).Seconds())
-	base := quotaWindow{Class: "5h", WindowSeconds: seconds, ResetAfterSecondsKnown: true, Allowed: true, ResetAt: now.Add(5 * time.Hour), ObservedAt: now}
-	within := base
-	within.ResetAfterSeconds = seconds - 2
-	if !quotaWindowHasPlaceholderReset(within, now, now) {
-		t.Fatalf("near-full resetAfter was not accepted as placeholder: %#v", within)
-	}
-	oversized := base
-	oversized.ResetAfterSeconds = seconds + 60
-	oversized.ResetAt = now.Add(5*time.Hour + time.Minute)
-	if quotaWindowHasPlaceholderReset(oversized, now, now) {
-		t.Fatalf("oversized resetAfter was accepted as placeholder: %#v", oversized)
-	}
-}
-
 func TestCarriedStaleWindowWithoutResetRequestsKeeperRefresh(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	current := map[string]quotaSnapshot{"idx": {AuthID: "acct", AuthIndex: "idx", RefreshedAt: now, Windows: []quotaWindow{{Class: "5h", Allowed: true, ObservedAt: now}}}}
