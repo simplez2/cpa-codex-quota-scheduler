@@ -105,7 +105,7 @@ import (
 
 const (
 	pluginName    = "codex-quota-scheduler"
-	pluginVersion = "0.1.20"
+	pluginVersion = "0.1.23"
 
 	// providerCodex is the CPA provider key for OpenAI Codex (ChatGPT backend).
 	providerCodex = "codex"
@@ -537,6 +537,9 @@ func pluginRegistration() registration {
 			ConfigFields: []pluginapi.ConfigField{
 				{Name: "scheduler_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"serial", "legacy", "shadow", "enforce"}, Description: "Runtime policy mode. Serial keeps one global active Codex auth while balancing 5h and weekly capacity at committed switch boundaries."},
 				{Name: "serial_switch_percent", Type: pluginapi.ConfigFieldTypeNumber, Description: "Soft used-percent switch threshold. Drain mode may cross it; hard limits, disallowed windows, and 429 still force failover."},
+				{Name: "serial_handoff_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"threshold_only", "reserve_aware"}, Description: "Account handoff policy. threshold_only follows serial_switch_percent; reserve_aware also hands off before the configured reserve for the active 5h, weekly, or monthly window is consumed."},
+				{Name: "serial_5h_handoff_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"inherit_global", "custom_threshold", "reserve_aware", "429_only"}, Description: "5h-specific handoff policy. inherit_global keeps the existing global threshold; custom_threshold uses serial_5h_switch_percent; reserve_aware preserves the 5h reserve; 429_only waits for hard limit, disallowed state, or 429."},
+				{Name: "serial_5h_switch_percent", Type: pluginapi.ConfigFieldTypeNumber, Description: "Custom 5h used-percent handoff threshold when serial_5h_handoff_mode is custom_threshold. Defaults to the global serial_switch_percent when omitted."},
 				{Name: "serial_prefer_active_cycle", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Prefer an already-started quota cycle when choosing the next serial auth."},
 				{Name: "keeper_url", Type: pluginapi.ConfigFieldTypeString, Description: "Keeper base URL, for example http://cpa-usage-keeper:8080/keeper."},
 				{Name: "keeper_password_file", Type: pluginapi.ConfigFieldTypeString, Description: "Mounted Keeper login-password file; the password is never placed in YAML."},

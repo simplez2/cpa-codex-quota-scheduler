@@ -1,4 +1,4 @@
-# Recommended configuration for Codex Quota Scheduler v0.1.20.
+# Recommended configuration for Codex Quota Scheduler v0.1.21.
 # Secrets stay in mounted files. This plugin does not change model names,
 # provider routes, OAuth/PAT state, or third-party APIs.
 plugins:
@@ -13,6 +13,15 @@ plugins:
       # higher-priority window availability, or a confirmed new 5h cycle.
       scheduler_mode: serial
       serial_switch_percent: 98
+      # threshold_only follows serial_switch_percent exactly. Set this to
+      # reserve_aware when you want handoff to preserve the reserve for the
+      # active 5h, weekly, or monthly window.
+      serial_handoff_mode: threshold_only
+      # 5h-only override. inherit_global preserves serial_switch_percent;
+      # custom_threshold uses serial_5h_switch_percent; reserve_aware keeps
+      # reserve_5h_percent; 429_only waits for hard limit/disallowed/429.
+      serial_5h_handoff_mode: inherit_global
+      serial_5h_switch_percent: 98
       serial_prefer_active_cycle: true
 
       # End-of-cycle drain is capped at the smaller of this value and the last
@@ -25,6 +34,10 @@ plugins:
       keeper_password_file: /run/secrets/keeper_login_password
       refresh_interval: 30s
       stale_after: 15m
+
+      # Used by reserve_aware handoff for the 5h window. Weekly and monthly
+      # use reserve_weekly_percent and reserve_monthly_percent respectively.
+      reserve_5h_percent: 15
 
       state_path: /var/lib/codex-quota-scheduler/state.json
 

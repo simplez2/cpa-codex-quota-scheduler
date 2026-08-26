@@ -882,6 +882,37 @@ func TestSerialSchedulerDoesNotCreateOverdraftForNewHardLimitedSessionWithoutBac
 	}
 }
 
+func TestSerialSchedulerClearsOverdraftWhenFiveHourLimitIsReached(t *testing.T) {
+	resetBanStoreForTest()
+	now := time.Now()
+	req := serialTestRequest()
+	req.Options.Headers = map[string][]string{"X-Session-ID": {"session-hard-limit"}}
+	session := schedulerSessionHash(req)
+	state := newSerialTestState(now)
+	state.mu.Lock()
+	state.serialActiveAuthID = "primary"
+	state.serialOverdraft = map[string]serialOverdraftBinding{
+		session: {AuthID: "primary", LastUsedAt: now},
+	}
+	state.quotas["primary"] = quotaSnapshot{AuthID: "primary", RefreshedAt: now, Windows: []quotaWindow{
+		{Class: "5h", UsedPercent: 100, Allowed: true, LimitReached: true, ResetAt: now.Add(2 * time.Hour), ObservedAt: now},
+		{Class: "weekly", UsedPercent: 40, Allowed: true, ResetAt: now.Add(4 * 24 * time.Hour), ObservedAt: now},
+	}}
+	state.quotas["backup"] = quotaSnapshot{AuthID: "backup", RefreshedAt: now, Windows: []quotaWindow{
+		{Class: "5h", UsedPercent: 20, Allowed: true, ResetAt: now.Add(4 * time.Hour), ObservedAt: now},
+		{Class: "weekly", UsedPercent: 20, Allowed: true, ResetAt: now.Add(4 * 24 * time.Hour), ObservedAt: now},
+	}}
+	state.mu.Unlock()
+
+	got := state.serialPick(req, now.Add(time.Second))
+	if !got.Handled || got.AuthID != "backup" {
+		t.Fatalf("hard-limited session was not handed off: %#v", got)
+	}
+	if binding, ok := state.serialOverdraft[session]; !ok || binding.AuthID != "backup" {
+		t.Fatalf("hard-limited overdraft binding was not replaced by backup: %#v", state.serialOverdraft)
+	}
+}
+
 func TestSerialSchedulerManualSelectionDoesNotRotateOnFiveHourCycleAdvance(t *testing.T) {
 	resetBanStoreForTest()
 	now := time.Now()
@@ -934,6 +965,83 @@ func TestInspectSerialCandidateHardLimitOverridesEarlierSoftThreshold(t *testing
 	)
 	if choice.Eligible || choice.Reason != "limit_reached" {
 		t.Fatalf("hard limit was masked by earlier soft threshold: %#v", choice)
+	}
+}
+
+func TestInspectSerialCandidateReserveAwareHandoffIsUserSelectable(t *testing.T) {
+	now := time.Now()
+	candidate := pluginapi.SchedulerAuthCandidate{ID: "acct", Provider: providerCodex}
+	thresholdOnly := defaultPluginConfig()
+	thresholdOnly.SerialSwitchPercent = 98
+	thresholdOnly.SerialHandoffMode = "threshold_only"
+	reserveAware := thresholdOnly
+	reserveAware.SerialHandoffMode = "reserve_aware"
+	reserveAware.Reserve5hPercent = 15
+	reserveAware.ReserveWeeklyPercent = 8
+	reserveAware.ReserveMonthlyPercent = 12
+
+	for _, test := range []struct {
+		class string
+		used  float64
+		reset time.Duration
+	}{
+		{class: "5h", used: 86, reset: 2 * time.Hour},
+		{class: "weekly", used: 93, reset: 4 * 24 * time.Hour},
+		{class: "monthly", used: 89, reset: 20 * 24 * time.Hour},
+	} {
+		snapshot := quotaSnapshot{AuthID: "acct", RefreshedAt: now, Windows: []quotaWindow{
+			{Class: test.class, UsedPercent: test.used, Allowed: true, ResetAt: now.Add(test.reset), ObservedAt: now},
+		}}
+		choice := inspectSerialCandidate(candidate, snapshot, true, thresholdOnly, now)
+		if !choice.Eligible || choice.Reason != "eligible" {
+			t.Fatalf("threshold-only mode unexpectedly reserved %s capacity: %#v", test.class, choice)
+		}
+		choice = inspectSerialCandidate(candidate, snapshot, true, reserveAware, now)
+		if choice.Eligible || choice.Reason != "serial_threshold" {
+			t.Fatalf("reserve-aware mode did not hand off before consuming the %s reserve: %#v", test.class, choice)
+		}
+	}
+}
+
+func TestInspectSerialCandidate5hHandoffModesAreIndependentFromGlobalPolicy(t *testing.T) {
+	now := time.Now()
+	candidate := pluginapi.SchedulerAuthCandidate{ID: "acct", Provider: providerCodex}
+	snapshot := quotaSnapshot{AuthID: "acct", RefreshedAt: now, Windows: []quotaWindow{
+		{Class: "5h", UsedPercent: 91, Allowed: true, ResetAt: now.Add(2 * time.Hour), ObservedAt: now},
+		{Class: "weekly", UsedPercent: 10, Allowed: true, ResetAt: now.Add(4 * 24 * time.Hour), ObservedAt: now},
+	}}
+
+	custom := defaultPluginConfig()
+	custom.SerialSwitchPercent = 98
+	custom.SerialHandoffMode = "threshold_only"
+	custom.Serial5hHandoffMode = "custom_threshold"
+	custom.Serial5hSwitchPercent = 90
+	choice := inspectSerialCandidate(candidate, snapshot, true, custom, now)
+	if choice.Eligible || choice.Reason != "serial_threshold" {
+		t.Fatalf("custom 5h threshold did not trigger: %#v", choice)
+	}
+
+	inherit := custom
+	inherit.Serial5hHandoffMode = "inherit_global"
+	choice = inspectSerialCandidate(candidate, snapshot, true, inherit, now)
+	if !choice.Eligible || choice.Reason != "eligible" {
+		t.Fatalf("inherit_global did not preserve 98%% behavior: %#v", choice)
+	}
+
+	reserve := custom
+	reserve.Serial5hHandoffMode = "reserve_aware"
+	reserve.Serial5hSwitchPercent = 90
+	reserve.Reserve5hPercent = 15
+	choice = inspectSerialCandidate(candidate, snapshot, true, reserve, now)
+	if choice.Eligible || choice.Reason != "serial_threshold" {
+		t.Fatalf("5h reserve-aware mode did not trigger: %#v", choice)
+	}
+
+	hardOnly := custom
+	hardOnly.Serial5hHandoffMode = "429_only"
+	choice = inspectSerialCandidate(candidate, snapshot, true, hardOnly, now)
+	if !choice.Eligible || choice.Reason != "eligible" {
+		t.Fatalf("429_only incorrectly applied a soft 5h threshold: %#v", choice)
 	}
 }
 

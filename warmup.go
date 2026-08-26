@@ -457,11 +457,15 @@ func unstartedWarmupWindow(snapshot quotaSnapshot, now time.Time) (quotaWindow, 
 			// recognized 5h/weekly/monthly Codex window.
 			continue
 		}
+		// Evaluate each recognized window independently. A weekly/monthly row
+		// that has already started must not suppress a fresh 5h window on the
+		// same auth. Likewise, one exhausted row must not hide another window
+		// that is still waiting for its first activation.
 		if window.UsedPercent > warmupMinimumAvailablePercent || window.LimitReached || !window.Allowed {
-			return quotaWindow{}, false
+			continue
 		}
 		if window.WindowUsageCreditsKnown && window.WindowUsageCredits > warmupMinimumUsageCredits {
-			return quotaWindow{}, false
+			continue
 		}
 		if quotaWindowNeedsActivation(window, snapshot.RefreshedAt, now) {
 			window.Class = class
@@ -1066,6 +1070,35 @@ func (s *schedulerRuntimeState) recordWarmupOutcome(candidate warmupCandidate, s
 		target.SuppressUntil = now.Add(warmupFallbackWindow(candidate.Window))
 	}
 	s.warmups[targetKey] = target
+	if err == nil && status >= 200 && status < 300 {
+		// One successful generation request starts every unstarted quota window
+		// attached to the same Codex workspace. Persist pending sibling entries
+		// now instead of issuing a second low-cost request for weekly/monthly while
+		// Keeper or the upstream response headers are still converging.
+		for _, covered := range warmupActivationWindows(candidate.Snapshot, now) {
+			class := normalizeWindowClass(covered.Class)
+			if class == "" {
+				continue
+			}
+			key := warmupKey(candidate.Snapshot.AuthID, class)
+			entry := s.warmups[key]
+			if entry.Blocked || (!entry.ActivatedAt.IsZero() && !entry.ResetAt.IsZero() && now.Before(entry.ResetAt)) {
+				continue
+			}
+			entry.AuthID = candidate.Snapshot.AuthID
+			entry.AuthIndex = candidate.Snapshot.AuthIndex
+			entry.Window = class
+			entry.AttemptedAt = target.AttemptedAt
+			entry.CompletedAt = target.CompletedAt
+			entry.ActivatedAt = time.Time{}
+			entry.ResetAt = time.Time{}
+			entry.SuppressUntil = now.Add(warmupFallbackWindow(covered))
+			entry.Status = status
+			entry.Error = ""
+			entry.Blocked = false
+			s.warmups[key] = entry
+		}
+	}
 	for _, window := range windows {
 		if window.ResetAt.IsZero() || !now.Before(window.ResetAt) {
 			continue
@@ -1093,6 +1126,22 @@ func (s *schedulerRuntimeState) recordWarmupOutcome(candidate warmupCandidate, s
 	s.warmups[targetKey] = target
 	s.warmupMu.Unlock()
 	s.persistBanState()
+}
+
+// warmupActivationWindows returns every recognized window that the admitted
+// request is expected to start. A single generation activates the workspace,
+// not just the highest-priority row selected as the scheduling label.
+func warmupActivationWindows(snapshot quotaSnapshot, now time.Time) []quotaWindow {
+	covered := make([]quotaWindow, 0, len(snapshot.Windows))
+	for _, window := range snapshot.Windows {
+		class := normalizeWindowClass(window.Class)
+		if class == "" || !quotaWindowNeedsActivation(window, snapshot.RefreshedAt, now) {
+			continue
+		}
+		window.Class = class
+		covered = append(covered, window)
+	}
+	return covered
 }
 
 func classifyWarmupFailure(status int, err error) (string, bool) {

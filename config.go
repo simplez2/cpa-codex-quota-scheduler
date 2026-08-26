@@ -19,6 +19,9 @@ type pluginConfig struct {
 	Priority                int
 	SchedulerMode           string
 	SerialSwitchPercent     float64
+	SerialHandoffMode       string
+	Serial5hHandoffMode     string
+	Serial5hSwitchPercent   float64
 	SerialPreferActiveCycle bool
 	DrainWindowHours        float64
 	KeeperURL               string
@@ -61,6 +64,9 @@ type yamlPluginConfig struct {
 	Priority                *int     `yaml:"priority"`
 	SchedulerMode           string   `yaml:"scheduler_mode"`
 	SerialSwitchPercent     *float64 `yaml:"serial_switch_percent"`
+	SerialHandoffMode       string   `yaml:"serial_handoff_mode"`
+	Serial5hHandoffMode     string   `yaml:"serial_5h_handoff_mode"`
+	Serial5hSwitchPercent   *float64 `yaml:"serial_5h_switch_percent"`
 	SerialPreferActiveCycle *bool    `yaml:"serial_prefer_active_cycle"`
 	DrainWindowHours        *float64 `yaml:"drain_window_hours"`
 	KeeperURL               string   `yaml:"keeper_url"`
@@ -103,6 +109,9 @@ func defaultPluginConfig() pluginConfig {
 		Enabled:                 true,
 		SchedulerMode:           "serial",
 		SerialSwitchPercent:     98,
+		SerialHandoffMode:       "threshold_only",
+		Serial5hHandoffMode:     "inherit_global",
+		Serial5hSwitchPercent:   98,
 		SerialPreferActiveCycle: true,
 		DrainWindowHours:        6,
 		KeeperPasswordFile:      "/run/secrets/keeper_login_password",
@@ -159,6 +168,15 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 	}
 	if in.SerialSwitchPercent != nil {
 		cfg.SerialSwitchPercent = *in.SerialSwitchPercent
+	}
+	if strings.TrimSpace(in.SerialHandoffMode) != "" {
+		cfg.SerialHandoffMode = strings.ToLower(strings.TrimSpace(in.SerialHandoffMode))
+	}
+	if strings.TrimSpace(in.Serial5hHandoffMode) != "" {
+		cfg.Serial5hHandoffMode = strings.ToLower(strings.TrimSpace(in.Serial5hHandoffMode))
+	}
+	if in.Serial5hSwitchPercent != nil {
+		cfg.Serial5hSwitchPercent = *in.Serial5hSwitchPercent
 	}
 	if in.SerialPreferActiveCycle != nil {
 		cfg.SerialPreferActiveCycle = *in.SerialPreferActiveCycle
@@ -274,6 +292,8 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 	// routing outage.  The plugin remains loaded and falls back to CPA's native
 	// scheduler until a usable Keeper snapshot is available.
 	cfg.SchedulerMode = normalizeSchedulerMode(cfg.SchedulerMode)
+	cfg.SerialHandoffMode = normalizeSerialHandoffMode(cfg.SerialHandoffMode)
+	cfg.Serial5hHandoffMode = normalizeSerial5hHandoffMode(cfg.Serial5hHandoffMode)
 	cfg.WarmupExecutionMode = normalizeWarmupExecutionMode(cfg.WarmupExecutionMode)
 	if cfg.RefreshInterval < time.Second {
 		cfg.RefreshInterval = time.Second
@@ -310,6 +330,9 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 	}
 	if cfg.SerialSwitchPercent <= 0 || cfg.SerialSwitchPercent > 100 {
 		cfg.SerialSwitchPercent = 98
+	}
+	if cfg.Serial5hSwitchPercent <= 0 || cfg.Serial5hSwitchPercent > 100 {
+		cfg.Serial5hSwitchPercent = cfg.SerialSwitchPercent
 	}
 	if cfg.DrainWindowHours <= 0 || cfg.DrainWindowHours > 168 {
 		cfg.DrainWindowHours = 6
@@ -356,6 +379,28 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 		cfg.WindowOrder = []string{"5h", "weekly", "monthly"}
 	}
 	return cfg, nil
+}
+
+func normalizeSerialHandoffMode(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "reserve", "reserve-aware", "reserve_aware", "safe", "safe-reserve":
+		return "reserve_aware"
+	default:
+		return "threshold_only"
+	}
+}
+
+func normalizeSerial5hHandoffMode(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "custom", "threshold", "threshold-only", "threshold_only", "custom-threshold", "custom_threshold":
+		return "custom_threshold"
+	case "reserve", "reserve-aware", "reserve_aware", "safe", "safe-reserve":
+		return "reserve_aware"
+	case "429", "429-only", "429_only", "hard-limit", "hard_limit", "hard-limit-only", "hard_limit_only":
+		return "429_only"
+	default:
+		return "inherit_global"
+	}
 }
 
 func normalizeWarmupExecutionMode(raw string) string {

@@ -295,8 +295,11 @@ func TestSchedulerConfigDefaultsToSerialAndValidatesThreshold(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.SchedulerMode != "serial" || cfg.SerialSwitchPercent != 98 || cfg.StickySeconds != 1500 {
+	if cfg.SchedulerMode != "serial" || cfg.SerialSwitchPercent != 98 || cfg.SerialHandoffMode != "threshold_only" || cfg.StickySeconds != 1500 {
 		t.Fatalf("unsafe mode/sticky defaults: mode=%q sticky=%d", cfg.SchedulerMode, cfg.StickySeconds)
+	}
+	if cfg.Serial5hHandoffMode != "inherit_global" || cfg.Serial5hSwitchPercent != 98 {
+		t.Fatalf("unsafe 5h handoff defaults: mode=%q threshold=%v", cfg.Serial5hHandoffMode, cfg.Serial5hSwitchPercent)
 	}
 	if cfg.NormalCostQuantile != 0.75 || cfg.GuardCostQuantile != 0.90 || cfg.HighCostQuantile != 0.95 {
 		t.Fatalf("invalid quantiles were not reset: %#v", cfg)
@@ -310,6 +313,49 @@ func TestSchedulerConfigDefaultsToSerialAndValidatesThreshold(t *testing.T) {
 	}
 	if native.WarmupExecutionMode != "native" {
 		t.Fatalf("explicit native warmup mode = %q", native.WarmupExecutionMode)
+	}
+}
+
+func TestSchedulerConfigAllowsUserSelectedSerialHandoffMode(t *testing.T) {
+	for _, test := range []struct {
+		raw  string
+		want string
+	}{
+		{raw: "serial_handoff_mode: threshold_only\n", want: "threshold_only"},
+		{raw: "serial_handoff_mode: reserve_aware\n", want: "reserve_aware"},
+		{raw: "serial_handoff_mode: safe-reserve\n", want: "reserve_aware"},
+		{raw: "serial_handoff_mode: invalid\n", want: "threshold_only"},
+	} {
+		cfg, err := parsePluginConfig([]byte(test.raw))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.SerialHandoffMode != test.want {
+			t.Fatalf("serial_handoff_mode for %q = %q; want %q", test.raw, cfg.SerialHandoffMode, test.want)
+		}
+	}
+}
+
+func TestSchedulerConfigAllowsUserSelected5hHandoffMode(t *testing.T) {
+	for _, test := range []struct {
+		raw       string
+		wantMode  string
+		wantLimit float64
+	}{
+		{raw: "serial_5h_handoff_mode: inherit_global\n", wantMode: "inherit_global", wantLimit: 98},
+		{raw: "serial_5h_handoff_mode: custom_threshold\nserial_5h_switch_percent: 91\n", wantMode: "custom_threshold", wantLimit: 91},
+		{raw: "serial_5h_handoff_mode: threshold_only\nserial_5h_switch_percent: 91\n", wantMode: "custom_threshold", wantLimit: 91},
+		{raw: "serial_5h_handoff_mode: reserve_aware\n", wantMode: "reserve_aware", wantLimit: 98},
+		{raw: "serial_5h_handoff_mode: 429_only\n", wantMode: "429_only", wantLimit: 98},
+		{raw: "serial_5h_handoff_mode: invalid\nserial_5h_switch_percent: 0\n", wantMode: "inherit_global", wantLimit: 98},
+	} {
+		cfg, err := parsePluginConfig([]byte(test.raw))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Serial5hHandoffMode != test.wantMode || cfg.Serial5hSwitchPercent != test.wantLimit {
+			t.Fatalf("5h handoff for %q = mode=%q threshold=%v; want mode=%q threshold=%v", test.raw, cfg.Serial5hHandoffMode, cfg.Serial5hSwitchPercent, test.wantMode, test.wantLimit)
+		}
 	}
 }
 
@@ -363,6 +409,48 @@ func TestPluginRegistrationExposesKeeperRefreshCooldown(t *testing.T) {
 	}
 }
 
+func TestPluginRegistrationExposesUserSelectableSerialHandoff(t *testing.T) {
+	registration := pluginRegistration()
+	matched := 0
+	for _, field := range registration.Metadata.ConfigFields {
+		if field.Name != "serial_handoff_mode" {
+			continue
+		}
+		matched++
+		if field.Type != pluginapi.ConfigFieldTypeEnum {
+			t.Fatalf("serial_handoff_mode type = %q; want enum", field.Type)
+		}
+		if strings.Join(field.EnumValues, ",") != "threshold_only,reserve_aware" {
+			t.Fatalf("serial_handoff_mode enum = %v", field.EnumValues)
+		}
+	}
+	if matched != 1 {
+		t.Fatalf("serial_handoff_mode registration count = %d; want 1", matched)
+	}
+}
+
+func TestPluginRegistrationExposesUserSelectable5hHandoff(t *testing.T) {
+	registration := pluginRegistration()
+	var mode, threshold int
+	for _, field := range registration.Metadata.ConfigFields {
+		switch field.Name {
+		case "serial_5h_handoff_mode":
+			mode++
+			if field.Type != pluginapi.ConfigFieldTypeEnum || strings.Join(field.EnumValues, ",") != "inherit_global,custom_threshold,reserve_aware,429_only" {
+				t.Fatalf("serial_5h_handoff_mode field = %#v", field)
+			}
+		case "serial_5h_switch_percent":
+			threshold++
+			if field.Type != pluginapi.ConfigFieldTypeNumber || !strings.Contains(field.Description, "custom_threshold") {
+				t.Fatalf("serial_5h_switch_percent field = %#v", field)
+			}
+		}
+	}
+	if mode != 1 || threshold != 1 {
+		t.Fatalf("5h handoff registration counts = mode:%d threshold:%d", mode, threshold)
+	}
+}
+
 func TestSerialConfigExampleParsesWithSafeRolloutValues(t *testing.T) {
 	raw, err := os.ReadFile("SERIAL_CONFIG.example.yaml")
 	if err != nil {
@@ -388,7 +476,7 @@ func TestSerialConfigExampleParsesWithSafeRolloutValues(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.SchedulerMode != "serial" || cfg.SerialSwitchPercent != 98 || !cfg.SerialPreferActiveCycle || !cfg.WarmupEnabled {
+	if cfg.SchedulerMode != "serial" || cfg.SerialSwitchPercent != 98 || cfg.SerialHandoffMode != "threshold_only" || !cfg.SerialPreferActiveCycle || !cfg.WarmupEnabled {
 		t.Fatalf("unsafe serial example: mode=%q threshold=%v active_cycle=%v warmup=%v", cfg.SchedulerMode, cfg.SerialSwitchPercent, cfg.SerialPreferActiveCycle, cfg.WarmupEnabled)
 	}
 	if cfg.WarmupExecutionMode != "management" || cfg.WarmupModel != "gpt-5.6-luna" || strings.Join(cfg.WindowOrder, ",") != "5h,weekly,monthly" {

@@ -71,6 +71,32 @@ func TestWarmupWindowPrefersFiveHourOverWeekly(t *testing.T) {
 	}
 }
 
+func TestWarmupFindsFiveHourWindowWhenWeeklyAlreadyStarted(t *testing.T) {
+	now := time.Now()
+	window, ok := unstartedWarmupWindow(quotaSnapshot{RefreshedAt: now, Windows: []quotaWindow{
+		{Class: "weekly", UsedPercent: 25, Allowed: true, ResetAt: now.Add(6 * 24 * time.Hour), ObservedAt: now},
+		{Class: "5h", UsedPercent: 0, Allowed: true, WindowSeconds: 5 * 60 * 60,
+			ResetAfterSeconds: 5 * 60 * 60, ResetAfterSecondsKnown: true,
+			ResetAt: now.Add(5 * time.Hour), ObservedAt: now},
+	}}, now)
+	if !ok || window.Class != "5h" {
+		t.Fatalf("window = %#v, ok=%v; want fresh 5h despite started weekly", window, ok)
+	}
+}
+
+func TestWarmupFindsFiveHourWindowWhenMonthlyAlreadyStarted(t *testing.T) {
+	now := time.Now()
+	window, ok := unstartedWarmupWindow(quotaSnapshot{RefreshedAt: now, Windows: []quotaWindow{
+		{Class: "monthly", UsedPercent: 12, Allowed: true, ResetAt: now.Add(29 * 24 * time.Hour), ObservedAt: now},
+		{Class: "5h", UsedPercent: 0, Allowed: true, WindowSeconds: 5 * 60 * 60,
+			ResetAfterSeconds: 5 * 60 * 60, ResetAfterSecondsKnown: true,
+			ResetAt: now.Add(5 * time.Hour), ObservedAt: now},
+	}}, now)
+	if !ok || window.Class != "5h" {
+		t.Fatalf("window = %#v, ok=%v; want fresh 5h despite started monthly", window, ok)
+	}
+}
+
 func TestUnstartedWarmupIgnoresUnknownKeeperRows(t *testing.T) {
 	now := time.Now()
 	window, ok := unstartedWarmupWindow(quotaSnapshot{Windows: []quotaWindow{
@@ -882,6 +908,157 @@ func TestCompletedWarmupWithoutHeadersStaysPendingWithoutFakeReset(t *testing.T)
 	entry := state.warmups[warmupKey("acct", "weekly")]
 	if entry.CompletedAt.IsZero() || !entry.ActivatedAt.IsZero() || !entry.ResetAt.IsZero() || entry.SuppressUntil.IsZero() {
 		t.Fatalf("pending warmup entry = %#v", entry)
+	}
+}
+
+func TestWarmupSuccessSuppressesUnstartedSiblingWindows(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	state := schedulerRuntimeState{cfg: defaultPluginConfig(), warmups: make(map[string]warmupEntry)}
+	state.cfg.StatePath = ""
+	snapshot := quotaSnapshot{
+		AuthID: "acct", AuthIndex: "idx-acct", RefreshedAt: now,
+		Windows: []quotaWindow{
+			{
+				Class: "5h", WindowSeconds: int64((5 * time.Hour).Seconds()),
+				ResetAfterSeconds: int64((5 * time.Hour).Seconds()), ResetAfterSecondsKnown: true,
+				UsedPercent: 0, Allowed: true, ResetAt: now.Add(5 * time.Hour), ObservedAt: now,
+				WindowUsageCreditsKnown: true,
+			},
+			{
+				Class: "weekly", WindowSeconds: int64((7 * 24 * time.Hour).Seconds()),
+				ResetAfterSeconds: int64((7 * 24 * time.Hour).Seconds()), ResetAfterSecondsKnown: true,
+				UsedPercent: 0, Allowed: true, ResetAt: now.Add(7 * 24 * time.Hour), ObservedAt: now,
+				WindowUsageCreditsKnown: true,
+			},
+		},
+	}
+	candidate := warmupCandidate{Snapshot: snapshot, Window: snapshot.Windows[0]}
+	state.recordWarmupOutcome(candidate, http.StatusOK, nil, nil)
+
+	for _, class := range []string{"5h", "weekly"} {
+		entry, ok := state.warmups[warmupKey("acct", class)]
+		if !ok {
+			t.Fatalf("missing sibling warmup entry for %s", class)
+		}
+		if entry.CompletedAt.IsZero() || entry.SuppressUntil.IsZero() {
+			t.Fatalf("warmup entry for %s is not pending: %#v", class, entry)
+		}
+		if !entry.ActivatedAt.IsZero() || !entry.ResetAt.IsZero() {
+			t.Fatalf("warmup entry for %s fabricated a reset anchor: %#v", class, entry)
+		}
+	}
+
+	state.quotas = map[string]quotaSnapshot{"acct": snapshot}
+	candidates := state.findWarmupCandidates(map[string]warmupAuthBinding{
+		"acct":     {AuthID: "acct", AuthIndex: "idx-acct"},
+		"idx-acct": {AuthID: "acct", AuthIndex: "idx-acct"},
+	}, nil, now)
+	state.warmupMu.Lock()
+	_, _, ok := state.nextWarmupCandidateLocked(candidates, now, time.Minute)
+	state.warmupMu.Unlock()
+	if ok {
+		t.Fatalf("sibling placeholder was immediately eligible for a duplicate warmup: %#v", candidates)
+	}
+}
+
+func TestWarmupSiblingWindowConfirmsFromKeeper(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	state := schedulerRuntimeState{warmups: map[string]warmupEntry{
+		warmupKey("acct", "5h"): {
+			AuthID: "acct", AuthIndex: "idx-acct", Window: "5h",
+			AttemptedAt: now.Add(-2 * time.Minute), CompletedAt: now.Add(-2 * time.Minute),
+			SuppressUntil: now.Add(5 * time.Hour), Status: http.StatusOK,
+		},
+		warmupKey("acct", "weekly"): {
+			AuthID: "acct", AuthIndex: "idx-acct", Window: "weekly",
+			AttemptedAt: now.Add(-2 * time.Minute), CompletedAt: now.Add(-2 * time.Minute),
+			SuppressUntil: now.Add(7 * 24 * time.Hour), Status: http.StatusOK,
+		},
+	}}
+	reset5h := now.Add(4 * time.Hour)
+	resetWeekly := now.Add(6 * 24 * time.Hour)
+	quotas := map[string]quotaSnapshot{"acct": {
+		AuthID: "acct", AuthIndex: "idx-acct", RefreshedAt: now,
+		Windows: []quotaWindow{
+			{
+				Class: "5h", WindowSeconds: int64((5 * time.Hour).Seconds()),
+				ResetAfterSeconds: int64((4 * time.Hour).Seconds()), ResetAfterSecondsKnown: true,
+				UsedPercent: 0, Allowed: true, ResetAt: reset5h, ObservedAt: now,
+			},
+			{
+				Class: "weekly", WindowSeconds: int64((7 * 24 * time.Hour).Seconds()),
+				ResetAfterSeconds: int64((6 * 24 * time.Hour).Seconds()), ResetAfterSecondsKnown: true,
+				UsedPercent: 0, Allowed: true, ResetAt: resetWeekly, ObservedAt: now,
+			},
+		},
+	}}
+	if !state.confirmPendingWarmups(quotas, now) {
+		t.Fatal("fresh Keeper anchors did not confirm sibling warmups")
+	}
+	for _, test := range []struct {
+		class string
+		reset time.Time
+	}{
+		{class: "5h", reset: reset5h},
+		{class: "weekly", reset: resetWeekly},
+	} {
+		entry := state.warmups[warmupKey("acct", test.class)]
+		if entry.ActivatedAt.IsZero() || !entry.ResetAt.Equal(test.reset) || !entry.SuppressUntil.Equal(test.reset) {
+			t.Fatalf("confirmed %s warmup = %#v", test.class, entry)
+		}
+	}
+}
+
+func TestWarmupSiblingPlaceholderCanRetryAfterStaleGrace(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	completedAt := now.Add(-2 * time.Hour)
+	state := schedulerRuntimeState{warmups: map[string]warmupEntry{
+		warmupKey("acct", "weekly"): {
+			AuthID: "acct", AuthIndex: "idx-acct", Window: "weekly",
+			AttemptedAt: completedAt, CompletedAt: completedAt,
+			SuppressUntil: now.Add(5 * 24 * time.Hour), Status: http.StatusOK,
+		},
+	}}
+	observedAt := now.Add(-time.Minute)
+	candidate := warmupCandidate{
+		Snapshot: quotaSnapshot{AuthID: "acct", AuthIndex: "idx-acct", RefreshedAt: observedAt},
+		Window: quotaWindow{
+			Class: "weekly", WindowSeconds: int64((7 * 24 * time.Hour).Seconds()),
+			ResetAfterSeconds: int64((7 * 24 * time.Hour).Seconds()), ResetAfterSecondsKnown: true,
+			UsedPercent: 0, Allowed: true, ResetAt: observedAt.Add(7 * 24 * time.Hour), ObservedAt: observedAt,
+		},
+	}
+	state.warmupMu.Lock()
+	got, _, ok := state.nextWarmupCandidateLocked([]warmupCandidate{candidate}, now, time.Minute)
+	state.warmupMu.Unlock()
+	if !ok || got.Window.Class != "weekly" {
+		t.Fatalf("stale placeholder warmup was not retried: %#v, ok=%v", got, ok)
+	}
+	if _, exists := state.warmups[warmupKey("acct", "weekly")]; exists {
+		t.Fatal("stale sibling warmup state was not discarded before retry")
+	}
+}
+
+func TestWarmupSuccessDoesNotClearBlockedSibling(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	state := schedulerRuntimeState{cfg: defaultPluginConfig(), warmups: map[string]warmupEntry{
+		warmupKey("acct", "weekly"): {
+			AuthID: "acct", AuthIndex: "idx-acct", Window: "weekly", Blocked: true,
+			Error: "cyber_policy", AttemptedAt: now.Add(-time.Minute), Status: http.StatusForbidden,
+		},
+	}}
+	state.cfg.StatePath = ""
+	candidate := warmupCandidate{
+		Snapshot: quotaSnapshot{AuthID: "acct", AuthIndex: "idx-acct", RefreshedAt: now, Windows: []quotaWindow{
+			{Class: "5h", UsedPercent: 0, Allowed: true},
+			{Class: "weekly", UsedPercent: 0, Allowed: true},
+		}},
+		Window: quotaWindow{Class: "5h", UsedPercent: 0, Allowed: true},
+	}
+	state.recordWarmupOutcome(candidate, http.StatusOK, nil, nil)
+	entry := state.warmups[warmupKey("acct", "weekly")]
+	if !entry.Blocked || entry.Error != "cyber_policy" {
+		t.Fatalf("blocked sibling was cleared by successful 5h warmup: %#v", entry)
 	}
 }
 

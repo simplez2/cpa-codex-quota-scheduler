@@ -1722,6 +1722,10 @@ type runtimeStatus struct {
 	Enabled                  bool                     `json:"enabled"`
 	SchedulerMode            string                   `json:"scheduler_mode"`
 	SerialSwitchPercent      float64                  `json:"serial_switch_percent"`
+	SerialHandoffMode        string                   `json:"serial_handoff_mode"`
+	Serial5hHandoffMode      string                   `json:"serial_5h_handoff_mode"`
+	Serial5hSwitchPercent    float64                  `json:"serial_5h_switch_percent"`
+	Reserve5hPercent         float64                  `json:"reserve_5h_percent"`
 	DrainWindowHours         float64                  `json:"drain_window_hours"`
 	WarmupModel              string                   `json:"warmup_model"`
 	SerialSelectionSource    string                   `json:"serial_selection_source"`
@@ -2203,6 +2207,10 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 		Enabled:                  cfg.Enabled,
 		SchedulerMode:            cfg.SchedulerMode,
 		SerialSwitchPercent:      cfg.SerialSwitchPercent,
+		SerialHandoffMode:        normalizeSerialHandoffMode(cfg.SerialHandoffMode),
+		Serial5hHandoffMode:      normalizeSerial5hHandoffMode(cfg.Serial5hHandoffMode),
+		Serial5hSwitchPercent:    cfg.Serial5hSwitchPercent,
+		Reserve5hPercent:         cfg.Reserve5hPercent,
 		DrainWindowHours:         cfg.DrainWindowHours,
 		WarmupModel:              cfg.WarmupModel,
 		SerialActiveAuthID:       serialActiveAuthID,

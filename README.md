@@ -11,7 +11,7 @@
   </p>
 </div>
 
-> **Version note:** the source and registry declare plugin version **v0.1.20**. A build is a published release only after the matching `v0.1.20` tag and release assets are available.
+> **Version note:** the source and registry declare plugin version **v0.1.23**. A build is a published release only after the matching `v0.1.23` tag and release assets are available.
 
 > **Upgrade exception:** the first upgrade from **v0.1.19 or earlier** to **v0.1.20** changes the generation-lock protocol and requires one controlled quick restart of CPA. Do not hot-load old and new DSOs together. Later v0.1.20-compatible reloads use the stable lock protocol normally.
 
@@ -93,6 +93,9 @@ plugins:
       priority: 2000
       scheduler_mode: serial
       serial_switch_percent: 98
+      serial_handoff_mode: threshold_only # or reserve_aware
+      serial_5h_handoff_mode: inherit_global # custom_threshold, reserve_aware, 429_only
+      serial_5h_switch_percent: 98
       serial_prefer_active_cycle: true
 
       keeper_url: http://cpa-usage-keeper:8080/keeper
@@ -100,6 +103,8 @@ plugins:
       refresh_interval: 30s
       stale_after: 15m
       state_path: /var/lib/codex-quota-scheduler/state.json
+
+      reserve_5h_percent: 15
 
       prefer_reset_credits: true
       window_order: [5h, weekly, monthly]
@@ -112,6 +117,22 @@ plugins:
       cpa_management_url: http://127.0.0.1:8317/v0/management/api-call
       cpa_management_key_file: /run/secrets/management_key
 ```
+
+`serial_handoff_mode` is user-selectable in CPA Management. `threshold_only`
+preserves the legacy behavior and switches at `serial_switch_percent`.
+`reserve_aware` also treats the configured reserve for the active window as an
+early handoff boundary: `reserve_5h_percent` for 5h, `reserve_weekly_percent`
+for weekly, and `reserve_monthly_percent` for monthly. This keeps the handoff
+logic consistent across all recognized Codex windows. Hard limits and 429
+quarantine remain authoritative in either mode.
+
+The 5h window also has an explicit override in CPA Management. The default
+`serial_5h_handoff_mode: inherit_global` keeps the existing global behavior.
+`custom_threshold` uses `serial_5h_switch_percent`, `reserve_aware` uses only
+the 5h reserve, and `429_only` disables soft 5h handoff while retaining hard
+limit, disallowed, and 429 failover. This lets an operator choose between the
+legacy 98% threshold, a custom 5h threshold, a protected reserve, or hard
+failover only without changing weekly/monthly policy.
 
 `warmup_model` applies only to the pinned activation request. It does not change CPA's default channel, official model list, or the model used by normal traffic.
 
