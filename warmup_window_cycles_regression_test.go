@@ -152,12 +152,34 @@ func TestPendingWarmupRequestsFreshKeeperConfirmation(t *testing.T) {
 func TestPostWarmupKeeperObservationDoesNotRequestRedundantConfirmation(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	completedAt := now.Add(-time.Minute)
+	observedAt := completedAt.Add(time.Second)
 	state := schedulerRuntimeState{warmups: map[string]warmupEntry{
 		"acct|5h": {AuthID: "acct", AuthIndex: "idx", Window: "5h", CompletedAt: completedAt},
 	}}
-	current := map[string]quotaSnapshot{"idx": {AuthID: "acct", AuthIndex: "idx", RefreshedAt: completedAt.Add(time.Second)}}
+	current := map[string]quotaSnapshot{"idx": {
+		AuthID: "acct", AuthIndex: "idx", RefreshedAt: observedAt,
+		Windows: []quotaWindow{{Class: "5h", ObservedAt: observedAt}},
+	}}
 	if targets := state.pendingWarmupKeeperRefreshTargets([]string{"idx"}, current); len(targets) != 0 {
 		t.Fatalf("post-warmup Keeper observation requested redundant refresh: %#v", targets)
+	}
+}
+
+func TestPostWarmupFiveHourObservationDoesNotConfirmMissingWeeklySibling(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	completedAt := now.Add(-time.Minute)
+	observedAt := completedAt.Add(time.Second)
+	state := schedulerRuntimeState{warmups: map[string]warmupEntry{
+		"acct|5h":     {AuthID: "acct", AuthIndex: "idx", Window: "5h", CompletedAt: completedAt},
+		"acct|weekly": {AuthID: "acct", AuthIndex: "idx", Window: "weekly", CompletedAt: completedAt},
+	}}
+	current := map[string]quotaSnapshot{"idx": {
+		AuthID: "acct", AuthIndex: "idx", RefreshedAt: observedAt,
+		Windows: []quotaWindow{{Class: "5h", ObservedAt: observedAt}},
+	}}
+	targets := state.pendingWarmupKeeperRefreshTargets([]string{"idx"}, current)
+	if len(targets) != 1 || targets[0].AuthIndex != "idx" || targets[0].Reason != "warmup_pending_confirmation" {
+		t.Fatalf("fresh 5h incorrectly confirmed missing weekly sibling: %#v", targets)
 	}
 }
 
