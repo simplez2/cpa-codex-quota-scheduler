@@ -8,15 +8,15 @@ import (
 	"github.com/simplez2/cpa-codex-quota-scheduler/cpasdk/pluginapi"
 )
 
-func projectedFiveHourState(now time.Time, used, predicted float64) schedulerRuntimeState {
+func projectedFiveHourState(now time.Time, used, predicted float64) *schedulerRuntimeState {
 	cfg := defaultPluginConfig()
 	cfg.StatePath = ""
 	cfg.Serial5hHandoffMode = "custom_threshold"
 	cfg.Serial5hSwitchPercent = 95
 	cfg.SerialSwitchPercent = 98
-	state := schedulerRuntimeState{
-		cfg:                cfg,
-		serialActiveAuthID: "primary",
+	state := &schedulerRuntimeState{
+		cfg:                   cfg,
+		serialActiveAuthID:    "primary",
 		serialSelectionSource: "auto",
 		quotas: map[string]quotaSnapshot{
 			"primary": {
@@ -34,7 +34,7 @@ func projectedFiveHourState(now time.Time, used, predicted float64) schedulerRun
 				},
 			},
 		},
-		warmups: make(map[string]warmupEntry),
+		warmups:    make(map[string]warmupEntry),
 		costSamples: map[string][]float64{},
 		pacingAccounts: map[string]*accountPacingState{
 			"primary": {Capacities: map[string]capacityEstimate{"5h": {Credits: 100, Samples: 8}}, LastQuota: map[string]quotaCalibrationPoint{}},
