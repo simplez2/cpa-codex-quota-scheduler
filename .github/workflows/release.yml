@@ -1,16 +1,8 @@
 # Build and release Codex Quota Scheduler for all supported platforms.
 #
-# Triggered by pushing a tag named v<version> (e.g. v0.1.0). For each platform
-# it builds the CGO dynamic library with the host's native C toolchain, packs
-# it into the zip layout required by the CLIProxyAPI plugin store, and uploads
-# everything to the GitHub Release bound to that tag.
-#
-# Output assets (version = tag without the leading "v"):
-#   codex-quota-scheduler_<version>_linux_amd64.zip      -> codex-quota-scheduler.so
-#   codex-quota-scheduler_<version>_linux_arm64.zip      -> codex-quota-scheduler.so
-#   codex-quota-scheduler_<version>_darwin_arm64.zip     -> codex-quota-scheduler.dylib
-#   codex-quota-scheduler_<version>_windows_amd64.zip    -> codex-quota-scheduler.dll
-#   checksums.txt
+# Triggered by pushing a tag named v<version> (e.g. v0.1.0). Release assets
+# are published only after source verification, version-consistency checks,
+# and secret scanning succeed.
 name: Release Plugin
 
 on:
@@ -22,8 +14,75 @@ permissions:
   contents: write
 
 jobs:
+  verify:
+    name: Verify source before release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache: true
+
+      - name: Check tag matches source and registry versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          source_version="$(sed -n 's/^[[:space:]]*pluginVersion[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' main.go | head -n1)"
+          registry_version="$(python3 - <<'PY'
+          import json
+          with open('registry.json', 'r', encoding='utf-8') as fh:
+              data = json.load(fh)
+          plugins = data.get('plugins') or []
+          if not plugins:
+              raise SystemExit('registry.json has no plugins')
+          print(plugins[0].get('version', ''))
+          PY
+          )"
+          printf 'tag=%s source=%s registry=%s\n' "$tag_version" "$source_version" "$registry_version"
+          test -n "$source_version"
+          test -n "$registry_version"
+          test "$tag_version" = "$source_version"
+          test "$tag_version" = "$registry_version"
+
+      - name: Check formatting
+        shell: bash
+        run: |
+          files="$(gofmt -l .)"
+          if [ -n "$files" ]; then
+            echo "The following Go files need gofmt:"
+            printf '%s\n' "$files"
+            exit 1
+          fi
+
+      - name: Test
+        run: go test ./...
+
+      - name: Race test
+        run: go test -race ./...
+
+      - name: Vet
+        run: go vet ./...
+
+  secret-scan:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   build:
     name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: verify
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -77,7 +136,6 @@ jobs:
           New-Item -ItemType Directory -Force -Path staging | Out-Null
           Copy-Item codex-quota-scheduler.${{ matrix.ext }} staging/
           $asset = "codex-quota-scheduler_${{ steps.ver.outputs.version }}_${{ matrix.goos }}_${{ matrix.goarch }}.zip"
-          # Compress-Archive stores the file at the archive root when given a bare file path.
           Compress-Archive -Path "staging/codex-quota-scheduler.${{ matrix.ext }}" -DestinationPath $asset -Force
           "asset=$asset" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
@@ -90,7 +148,7 @@ jobs:
 
   release:
     name: Publish checksums and Release assets
-    needs: build
+    needs: [build, secret-scan]
     runs-on: ubuntu-latest
 
     steps:
