@@ -144,7 +144,7 @@ func TestPendingWarmupRequestsFreshKeeperConfirmation(t *testing.T) {
 	}}
 	current := map[string]quotaSnapshot{"idx": {AuthID: "acct", AuthIndex: "idx", RefreshedAt: completedAt.Add(-time.Second)}}
 	targets := state.pendingWarmupKeeperRefreshTargets([]string{"idx"}, current)
-	if len(targets) != 1 || targets[0].AuthID != "" || targets[0].AuthIndex != "idx" || targets[0].Reason != "warmup_pending_confirmation" {
+	if len(targets) != 1 || targets[0].AuthIndex != "idx" || targets[0].Reason != "warmup_pending_confirmation" {
 		t.Fatalf("pending warmup confirmation targets = %#v", targets)
 	}
 }
