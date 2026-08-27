@@ -120,6 +120,10 @@ func TestShadowAuditsDynamicChoiceWithoutTakingOver(t *testing.T) {
 	now := time.Now()
 	cfg := defaultPluginConfig()
 	cfg.SchedulerMode = "shadow"
+	// This unit test constructs an unmanaged runtime directly. Keep state_path
+	// empty so the production generation-ownership fence treats it as the
+	// intentional legacy/no-journal mode instead of an unclaimed DSO.
+	cfg.StatePath = ""
 	state := schedulerRuntimeState{
 		cfg: cfg,
 		quotas: map[string]quotaSnapshot{

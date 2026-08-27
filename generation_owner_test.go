@@ -12,6 +12,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/simplez2/cpa-codex-quota-scheduler/cpasdk/pluginapi"
 )
 
 func newManagedRuntimeForTest(t *testing.T, statePath string) *schedulerRuntimeState {
@@ -386,6 +388,90 @@ func TestManagedUnclaimedStateCannotPersist(t *testing.T) {
 	}
 }
 
+func TestPersistProbeAdmissionRollsBackAfterGenerationTakeover(t *testing.T) {
+	resetBanStoreForTest()
+	t.Cleanup(resetBanStoreForTest)
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	oldOwner := newManagedRuntimeForTest(t, statePath)
+	claimManagedRuntimeForTest(t, oldOwner)
+	banStore.set("acct", banEntry{
+		ResetAt: now.Add(-time.Minute), BannedAt: now.Add(-time.Hour),
+		Window: "5h", Kind: banKindQuota,
+	})
+	if !oldOwner.persistBanState() {
+		t.Fatal("failed to persist the probe-ready baseline")
+	}
+	if allowed, started := banStore.tryStartProbe("acct", now, 10*time.Minute); !allowed || !started {
+		t.Fatal("failed to reserve half-open probe before takeover")
+	}
+	halfOpen, ok := banStore.lookup("acct")
+	if !ok || halfOpen.Phase != banPhaseHalfOpen {
+		t.Fatalf("half-open reservation missing: entry=%#v ok=%v", halfOpen, ok)
+	}
+
+	newOwner := newManagedRuntimeForTest(t, statePath)
+	claimManagedRuntimeForTest(t, newOwner)
+	t.Cleanup(func() {
+		oldOwner.stop()
+		newOwner.stop()
+	})
+	if oldOwner.persistProbeAdmission("acct", halfOpen.BannedAt, halfOpen.ProbeStartedAt) {
+		t.Fatal("retired generation committed a half-open admission")
+	}
+	rolledBack, ok := banStore.lookup("acct")
+	if !ok || rolledBack.Phase != banPhaseCooldown || rolledBack.ProbeAttempts != 0 ||
+		banEntryDisposition(rolledBack, now) != banDispositionProbeReady {
+		t.Fatalf("failed admission was not rolled back exactly: entry=%#v ok=%v", rolledBack, ok)
+	}
+}
+
+func TestSchedulerDoesNotReturnUnpersistedHalfOpenProbe(t *testing.T) {
+	resetBanStoreForTest()
+	t.Cleanup(resetBanStoreForTest)
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	state := newManagedRuntimeForTest(t, statePath)
+	claimManagedRuntimeForTest(t, state)
+	t.Cleanup(func() {
+		state.mu.Lock()
+		state.cfg.StatePath = statePath
+		state.mu.Unlock()
+		state.stop()
+	})
+	now := time.Now().UTC()
+	state.mu.Lock()
+	state.cfg.SchedulerMode = "legacy"
+	// Renaming a state snapshot onto an existing directory fails after the
+	// generation fence is checked, which exercises admission rollback without
+	// dispatching any account request.
+	state.cfg.StatePath = t.TempDir()
+	state.quotas = map[string]quotaSnapshot{
+		"acct": {
+			AuthID: "acct", RefreshedAt: now,
+			Windows: []quotaWindow{{Class: "5h", UsedPercent: 1, Allowed: true, ResetAt: now.Add(4 * time.Hour), ObservedAt: now}},
+		},
+	}
+	state.mu.Unlock()
+	banStore.set("acct", banEntry{
+		ResetAt: now.Add(-time.Minute), BannedAt: now.Add(-time.Hour),
+		Window: "5h", Kind: banKindQuota,
+	})
+	response, err := state.schedulerPick(pluginapi.SchedulerPickRequest{
+		Provider:   providerCodex,
+		Candidates: []pluginapi.SchedulerAuthCandidate{{ID: "acct", Provider: providerCodex}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Handled {
+		t.Fatalf("scheduler returned an unpersisted half-open auth: %#v", response)
+	}
+	entry, ok := banStore.lookup("acct")
+	if !ok || entry.Phase != banPhaseCooldown || entry.ProbeAttempts != 0 || banEntryDisposition(entry, now) != banDispositionProbeReady {
+		t.Fatalf("failed persisted admission did not roll back: entry=%#v ok=%v", entry, ok)
+	}
+}
+
 func TestManagedUnclaimedRuntimeFailsClosed(t *testing.T) {
 	resetBanStoreForTest()
 	t.Cleanup(resetBanStoreForTest)
@@ -466,6 +552,53 @@ func TestOwnerShutdownPersistsAndAppendsTombstone(t *testing.T) {
 	}
 	if record.Active || record.ActiveGeneration == 0 || record.ReleasedAt.IsZero() {
 		t.Fatalf("owner shutdown did not append tombstone: %#v", record)
+	}
+}
+
+func TestBlockedQuarantineSurvivesPersistAndReload(t *testing.T) {
+	resetBanStoreForTest()
+	t.Cleanup(resetBanStoreForTest)
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	writer := newManagedRuntimeForTest(t, statePath)
+	claimManagedRuntimeForTest(t, writer)
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	bannedAt := now.Add(-time.Hour)
+	banStore.set("acct", banEntry{
+		ResetAt: now.Add(-time.Minute), BannedAt: bannedAt,
+		Window: "5h", Kind: banKindQuota,
+	})
+	if allowed, started := banStore.tryStartProbe("acct", now, 10*time.Minute); !allowed || !started {
+		t.Fatal("failed to reserve recovery probe")
+	}
+	if !banStore.blockProbe("acct", bannedAt, now, "deactivated_workspace", now.Add(time.Second)) {
+		t.Fatal("failed to create terminal quarantine")
+	}
+	if !writer.persistBanState() {
+		t.Fatal("failed to persist terminal quarantine")
+	}
+	writer.stop()
+
+	resetBanStoreForTest()
+	// A retryable in-memory cooldown must not win over the persisted terminal
+	// result when a new generation loads the shared state.
+	banStore.set("acct", banEntry{
+		ResetAt: now.Add(2 * time.Hour), BannedAt: now,
+		Window: "5h", Kind: banKindQuota,
+	})
+	reader := &schedulerRuntimeState{}
+	reader.loadBanState(statePath)
+	loaded, ok := banStore.lookup("acct")
+	if !ok || loaded.Kind != banKindBlocked || !loaded.ResetAt.IsZero() ||
+		banStore.schedulable("acct", now.Add(365*24*time.Hour)) {
+		t.Fatalf("terminal quarantine was lost on reload: entry=%#v ok=%v", loaded, ok)
+	}
+	banStore.set("acct", banEntry{
+		ResetAt: now.Add(3 * time.Hour), BannedAt: now.Add(2 * time.Second),
+		Window: "weekly", Kind: banKindQuota,
+	})
+	stillBlocked, _ := banStore.lookup("acct")
+	if stillBlocked.Kind != banKindBlocked || !stillBlocked.ResetAt.IsZero() {
+		t.Fatalf("later snapshot load weakened terminal quarantine: %#v", stillBlocked)
 	}
 }
 

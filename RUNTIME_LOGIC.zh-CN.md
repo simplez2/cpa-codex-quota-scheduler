@@ -1,6 +1,6 @@
 # Codex Quota Scheduler 运行逻辑与状态机
 
-本文描述 v0.1.20 源码的真实运行逻辑，供代码审查、生产验收和故障定位使用。只有匹配 tag 与 Release 资产均存在时，才视为正式发布。
+本文描述 v0.1.26 源码的真实运行逻辑，供代码审查、生产验收和故障定位使用。只有匹配 tag 与 Release 资产均存在时，才视为正式发布。
 
 ## 1. 数据来源与可信度
 
@@ -90,6 +90,7 @@ stateDiagram-v2
 - 无可信配额头的 429 使用 fallback_ban，并受 max_ban 上限约束。
 - cooldown 到期不代表立即全量放行；只有一个并发请求能取得 half_open_probe_timeout 租约。
 - 匹配该 probe 的成功结果才清除隔离；失败会回到 cooldown 或 probation。
+- 对于已经到期的权威 quota cooldown，如果 Keeper 同时证明所有可识别窗口均为全 0%、允许、未触限且 usage credits 明确为 0，最低成本预热可以充当唯一一次 half-open 恢复 probe。普通 probation、未到期 cooldown 和正在进行的 half-open 仍然禁止预热绕过。
 - cyber_policy、cyber_abuse、认证错误和 workspace 停用不是普通 quota cooldown，不能被外部额度重置对账自动清除。
 
 ## 4. 预热候选的完整条件
@@ -102,7 +103,7 @@ stateDiagram-v2
 4. reset 缺失、已经到期，或呈现随观察时间移动的完整周期占位值；
 5. CPA 当前存在可用的 Codex auth binding，并能稳定解析 auth ID 与 auth index；
 6. Agent Identity 场景的 sidecar 标记和绑定匹配；
-7. auth 未被禁用、不可用或隔离；
+7. auth 未被禁用或不可用；普通预热要求无隔离，只有满足上一节严格全 0 条件的 probe-ready quota cooldown 可以进入恢复预热；
 8. 没有该窗口的 pending、confirmed、blocked 或尚未到重试时间的结果；
 9. 当前 plugin generation 仍是 owner；
 10. 当前进程取得跨实例 warmup lease。
@@ -123,15 +124,15 @@ warmup_candidates=0 只说明当前轮没有可执行候选，不等于功能关
 
 ## 6. 最低成本预热请求
 
-生产默认 warmup_execution_mode=management：
+生产默认 warmup_execution_mode=management。Management 路径使用与 Codex Responses 兼容的最小流式请求；native 路径使用等价的非流式最小请求。两者都固定目标 auth、`store=false`、低 reasoning effort，且不会消费 reset credit：
 
 ~~~json
 {
   "model": "<warmup_model>",
   "input": "hello",
-  "stream": false,
+  "stream": true,
   "store": false,
-  "max_output_tokens": 16
+  "reasoning": {"effort": "low"}
 }
 ~~~
 
@@ -171,14 +172,16 @@ Keeper 的 usage identity 清单会保留 disabled 历史行。v0.1.20 首先按
 
 ## 8. 热加载与 generation ownership
 
-CPA 热重载可能让新旧动态库 generation 短时间同时存在。v0.1.20 使用两层互斥：
+CPA 热重载可能让新旧动态库 generation 短时间同时存在。v0.1.26 使用两层互斥：
 
 - Generation lock 与 record：`state_path.generation.lock` 是永不替换的 OS 锁文件；`state_path.generation` 记录当前 owner。journal 达到 768 KiB 后，会在下一次 generation I/O callback 前自动压缩；旧版遗留的 1–16 MiB journal 会在有界校验后压缩到最后一条有效单调记录。超过 16 MiB 继续 fail closed。
 - Warmup instance lease：state_path.warmup.lock 使用 OS 文件锁，保证跨进程同时只有一个预热执行者。
 
 从 v0.1.19 的“锁 journal 本身”协议首次迁移到独立 lock 文件时，必须受控重启 CPA，确保旧 DSO 句柄全部退出；迁移后同协议版本才可继续使用 generation 热替换。
 
-新 generation 启动后有 15 秒预热宽限，用于合并旧实例刚完成的 outcome journal，避免同一账号在热替换边界被重复请求。被替代实例唯一允许的尾部写入是自己已经持有租约的 warmup outcome，且写到单独 journal；新 owner 合并后清空 journal。
+新 generation 启动后有 15 秒预热宽限，用于合并旧实例刚完成的 outcome journal，避免同一账号在热替换边界被重复请求。被替代实例唯一允许的尾部写入是自己已经持有租约的 warmup outcome，且写到单独 journal；新 owner 会先合并 journal，再判断候选，最后清空 journal。
+
+恢复预热的 journal 额外携带原始 `BannedAt`、精确 `ProbeStartedAt`、终态 ban/clear 以及同一次请求覆盖的 5h/weekly/monthly sibling outcomes。新 owner 只会对完全匹配的 half-open，或在 probe 开始前已经到期的同一旧 cooldown，执行 CAS 更新；已被新 429、另一个 probe、未来 cooldown 或人工清除替换的状态绝不会被旧结果覆盖或复活。
 
 ## 9. 持久化状态
 

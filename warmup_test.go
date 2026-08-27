@@ -1138,6 +1138,68 @@ func TestFindWarmupCandidateSkipsQuarantinedAuth(t *testing.T) {
 	}
 }
 
+func TestFindWarmupCandidateAdmitsExpiredQuotaRecoveryProbe(t *testing.T) {
+	resetBanStoreForTest()
+	t.Cleanup(resetBanStoreForTest)
+	now := time.Now().UTC().Truncate(time.Second)
+	cfg := defaultPluginConfig()
+	cfg.StatePath = ""
+	const fiveHours = int64(5 * 60 * 60)
+	state := schedulerRuntimeState{
+		cfg: cfg,
+		quotas: map[string]quotaSnapshot{
+			"acct": {
+				AuthID: "acct", AuthIndex: "idx-acct", RefreshedAt: now,
+				Windows: []quotaWindow{{
+					Class: "5h", UsedPercentKnown: true, Allowed: true, AllowedKnown: true,
+					LimitReachedKnown: true, ObservedAt: now,
+					WindowSeconds: fiveHours, ResetAfterSeconds: fiveHours, ResetAfterSecondsKnown: true,
+					ResetAt: now.Add(5 * time.Hour), WindowUsageCreditsKnown: true,
+				}},
+			},
+		},
+	}
+	banStore.set("acct", banEntry{
+		ResetAt:  now.Add(-time.Minute),
+		BannedAt: now.Add(-6 * time.Hour),
+		Window:   "5h",
+		Kind:     banKindQuota,
+		Phase:    banPhaseCooldown,
+	})
+
+	candidate, ok := state.findWarmupCandidate(map[string]warmupAuthBinding{
+		"acct":     {AuthID: "acct", AuthIndex: "idx-acct"},
+		"idx-acct": {AuthID: "acct", AuthIndex: "idx-acct"},
+	}, now)
+	if !ok || candidate.Snapshot.AuthID != "acct" || !candidate.RecoveryProbe {
+		t.Fatalf("recovery candidate = %#v, ok=%v; want probe-ready quota warmup", candidate, ok)
+	}
+
+	snapshot := state.quotas["acct"]
+	snapshot.Windows = append(snapshot.Windows, quotaWindow{
+		Class: "weekly", UsedPercent: 1, UsedPercentKnown: true, Allowed: true, AllowedKnown: true,
+		LimitReachedKnown: true, ObservedAt: now, WindowUsageCreditsKnown: true,
+	})
+	state.quotas["acct"] = snapshot
+	if candidate, ok := state.findWarmupCandidate(map[string]warmupAuthBinding{
+		"acct":     {AuthID: "acct", AuthIndex: "idx-acct"},
+		"idx-acct": {AuthID: "acct", AuthIndex: "idx-acct"},
+	}, now); ok {
+		t.Fatalf("mixed-used recovery snapshot was admitted: %#v", candidate)
+	}
+
+	snapshot = state.quotas["acct"]
+	snapshot.Windows = snapshot.Windows[:1]
+	snapshot.Windows[0].WindowUsageCreditsKnown = false
+	state.quotas["acct"] = snapshot
+	if candidate, ok := state.findWarmupCandidate(map[string]warmupAuthBinding{
+		"acct":     {AuthID: "acct", AuthIndex: "idx-acct"},
+		"idx-acct": {AuthID: "acct", AuthIndex: "idx-acct"},
+	}, now); ok {
+		t.Fatalf("unknown-credit recovery snapshot was admitted: %#v", candidate)
+	}
+}
+
 func TestFindWarmupCandidateRejectsCarriedStaleRecognizedWindow(t *testing.T) {
 	resetBanStoreForTest()
 	now := time.Now().UTC().Truncate(time.Second)
@@ -1168,6 +1230,37 @@ func TestFindWarmupCandidateRejectsCarriedStaleRecognizedWindow(t *testing.T) {
 	}
 	if state.warmupSkippedStaleLast != 1 {
 		t.Fatalf("stale warmup diagnostics = %d; want 1", state.warmupSkippedStaleLast)
+	}
+}
+
+func TestQuotaSnapshotSafeForRecoveryWarmupRequiresExplicitKeeperSafetyFields(t *testing.T) {
+	base := quotaWindow{
+		Class: "5h", UsedPercentKnown: true,
+		Allowed: true, AllowedKnown: true,
+		LimitReachedKnown:       true,
+		WindowUsageCreditsKnown: true,
+	}
+	if !quotaSnapshotSafeForRecoveryWarmup(quotaSnapshot{Windows: []quotaWindow{base}}) {
+		t.Fatal("fully explicit safe Keeper window was rejected")
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*quotaWindow)
+	}{
+		{name: "used percent missing", mutate: func(window *quotaWindow) { window.UsedPercentKnown = false }},
+		{name: "allowed missing", mutate: func(window *quotaWindow) { window.AllowedKnown = false }},
+		{name: "limit reached missing", mutate: func(window *quotaWindow) { window.LimitReachedKnown = false }},
+		{name: "usage credits missing", mutate: func(window *quotaWindow) { window.WindowUsageCreditsKnown = false }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			window := base
+			test.mutate(&window)
+			if quotaSnapshotSafeForRecoveryWarmup(quotaSnapshot{Windows: []quotaWindow{window}}) {
+				t.Fatalf("recovery accepted a window with %s", test.name)
+			}
+		})
 	}
 }
 

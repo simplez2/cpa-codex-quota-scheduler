@@ -42,7 +42,8 @@ func TestWarmupRetryManagementRouteClearsOnlyBlockedTarget(t *testing.T) {
 	resetBanStoreForTest()
 	defer resetBanStoreForTest()
 	now := time.Now().UTC()
-	banStore.set("first", banEntry{ResetAt: now.Add(time.Hour), Window: "weekly", Kind: banKindQuota, Phase: banPhaseCooldown})
+	banStore.set("first", banEntry{BannedAt: now, Window: "recovery blocked: cyber_policy", Kind: banKindBlocked, Phase: banPhaseCooldown})
+	banStore.set("quota", banEntry{ResetAt: now.Add(time.Hour), Window: "weekly", Kind: banKindQuota, Phase: banPhaseCooldown})
 	withWarmupManagementState(t, map[string]warmupEntry{
 		warmupKey("first", "weekly"):  {AuthID: "first", Window: "weekly", Blocked: true, Error: "cyber_policy"},
 		warmupKey("second", "weekly"): {AuthID: "second", Window: "weekly", Blocked: true, Error: "http_403"},
@@ -58,7 +59,7 @@ func TestWarmupRetryManagementRouteClearsOnlyBlockedTarget(t *testing.T) {
 		t.Fatalf("status=%d body=%s", response.StatusCode, response.Body)
 	}
 	payload := managementResponseJSON(t, response)
-	if payload["removed"] != float64(1) || payload["auth_id"] != "first" || payload["all"] != false {
+	if payload["removed"] != float64(2) || payload["auth_id"] != "first" || payload["all"] != false {
 		t.Fatalf("unexpected response: %v", payload)
 	}
 	schedulerRuntime.warmupMu.Lock()
@@ -69,8 +70,11 @@ func TestWarmupRetryManagementRouteClearsOnlyBlockedTarget(t *testing.T) {
 	if firstExists || !secondExists || !retryExists {
 		t.Fatalf("blocked-only target clear failed: first=%v second=%v retry=%v", firstExists, secondExists, retryExists)
 	}
-	if _, ok := banStore.lookup("first"); !ok {
-		t.Fatal("warmup retry route must not clear quota quarantine")
+	if _, ok := banStore.lookup("first"); ok {
+		t.Fatal("warmup retry route left the target terminal quarantine active")
+	}
+	if _, ok := banStore.lookup("quota"); !ok {
+		t.Fatal("warmup retry route cleared an unrelated quota quarantine")
 	}
 }
 

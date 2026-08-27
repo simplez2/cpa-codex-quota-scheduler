@@ -46,8 +46,11 @@ type quotaWindow struct {
 	ResetAfterSeconds       int64
 	ResetAfterSecondsKnown  bool
 	UsedPercent             float64
+	UsedPercentKnown        bool
 	Allowed                 bool
+	AllowedKnown            bool
 	LimitReached            bool
+	LimitReachedKnown       bool
 	ResetAt                 time.Time
 	Source                  quotaSource
 	ObservedAt              time.Time
@@ -659,14 +662,17 @@ func normalizeQuotaSnapshot(index, fileName string, response keeperCheckResponse
 			resetAt = now.Add(time.Duration(*row.ResetAfterSeconds) * time.Second)
 		}
 		window := quotaWindow{
-			Class:         class,
-			WindowSeconds: seconds,
-			UsedPercent:   used,
-			Allowed:       allowed,
-			LimitReached:  limitReached || used >= usedPercentThreshold,
-			ResetAt:       resetAt,
-			Source:        quotaSourceKeeper,
-			ObservedAt:    refreshedAt,
+			Class:             class,
+			WindowSeconds:     seconds,
+			UsedPercent:       used,
+			UsedPercentKnown:  row.UsedPercent != nil,
+			Allowed:           allowed,
+			AllowedKnown:      row.Allowed != nil,
+			LimitReached:      limitReached || used >= usedPercentThreshold,
+			LimitReachedKnown: row.LimitReached != nil,
+			ResetAt:           resetAt,
+			Source:            quotaSourceKeeper,
+			ObservedAt:        refreshedAt,
 		}
 		if row.ResetAfterSeconds != nil && *row.ResetAfterSeconds >= 0 {
 			window.ResetAfterSeconds = *row.ResetAfterSeconds
@@ -1011,6 +1017,7 @@ func mergeQuotaWindows(existing []quotaWindow, patches []quotaWindowPatch, obser
 			}
 			if patch.UsedPercent != nil {
 				window.UsedPercent = *patch.UsedPercent
+				window.UsedPercentKnown = true
 				window.LimitReached = window.UsedPercent >= usedPercentThreshold
 			}
 			if patch.ResetAt != nil {
@@ -1028,8 +1035,9 @@ func mergeQuotaWindows(existing []quotaWindow, patches []quotaWindowPatch, obser
 		}
 		if patch.UsedPercent != nil {
 			limitReached := *patch.UsedPercent >= usedPercentThreshold
-			if window.UsedPercent != *patch.UsedPercent || window.LimitReached != limitReached {
+			if window.UsedPercent != *patch.UsedPercent || window.LimitReached != limitReached || !window.UsedPercentKnown {
 				window.UsedPercent = *patch.UsedPercent
+				window.UsedPercentKnown = true
 				window.LimitReached = limitReached
 				windowChanged = true
 			}
@@ -1109,14 +1117,22 @@ func codexOnlySchedulerRequest(req pluginapi.SchedulerPickRequest) bool {
 func (s *schedulerRuntimeState) schedulerPick(req pluginapi.SchedulerPickRequest) (pluginapi.SchedulerPickResponse, error) {
 	if nonce := schedulerOptionHeader(req.Options.Headers, warmupRequestHeader); nonce != "" {
 		now := time.Now()
-		targetAuthID, validLease := s.consumeWarmupLease(nonce, now)
+		lease, validLease := s.consumeWarmupLease(nonce, now)
 		if !validLease {
 			return pluginapi.SchedulerPickResponse{}, fmt.Errorf("invalid or expired internal warmup lease")
 		}
+		targetAuthID := strings.TrimSpace(lease.AuthID)
 		if len(req.Candidates) == 0 || !codexOnlySchedulerRequest(req) {
 			return pluginapi.SchedulerPickResponse{}, fmt.Errorf("internal warmup target has no Codex candidates")
 		}
-		if _, quarantined := banStore.lookup(targetAuthID); quarantined {
+		entry, quarantined := banStore.lookup(targetAuthID)
+		if lease.RecoveryProbe {
+			if !quarantined || banEntryDisposition(entry, now) != banDispositionHalfOpen ||
+				lease.RecoveryBannedAt.IsZero() || lease.ProbeStartedAt.IsZero() ||
+				!entry.BannedAt.Equal(lease.RecoveryBannedAt) || !entry.ProbeStartedAt.Equal(lease.ProbeStartedAt) {
+				return pluginapi.SchedulerPickResponse{}, fmt.Errorf("internal recovery warmup target does not own the half-open lease")
+			}
+		} else if quarantined {
 			return pluginapi.SchedulerPickResponse{}, fmt.Errorf("internal warmup target is quarantined")
 		}
 		for _, candidate := range req.Candidates {
@@ -1127,6 +1143,13 @@ func (s *schedulerRuntimeState) schedulerPick(req pluginapi.SchedulerPickRequest
 		return pluginapi.SchedulerPickResponse{}, fmt.Errorf("internal warmup target is unavailable")
 	}
 	if schedulerRequestGenerationDisabled(req) {
+		return pluginapi.SchedulerPickResponse{Handled: false}, nil
+	}
+	// An old DSO may still have an in-flight callback after a new generation
+	// claims the shared state. Warmup nonces are handled above because their
+	// exact half-open lease is already durable; ordinary traffic must fail over
+	// to the active generation instead of making a stale scheduling decision.
+	if !s.generationOwnerActive() {
 		return pluginapi.SchedulerPickResponse{Handled: false}, nil
 	}
 	if len(req.Candidates) == 0 || !codexOnlySchedulerRequest(req) {
@@ -1147,6 +1170,12 @@ func (s *schedulerRuntimeState) schedulerPick(req pluginapi.SchedulerPickRequest
 	var lastDynamic pluginapi.SchedulerPickResponse
 	var lastCandidates []pacingCandidate
 	for len(remaining) > 0 {
+		// A newer hot-loaded DSO can claim the shared generation while this
+		// callback is retrying candidates. Stop immediately instead of allowing
+		// the retired instance to make a second scheduling decision.
+		if !s.generationOwnerActive() {
+			return pluginapi.SchedulerPickResponse{Handled: false}, nil
+		}
 		now := time.Now()
 		attempt := req
 		attempt.Candidates = remaining
@@ -1185,7 +1214,15 @@ func (s *schedulerRuntimeState) schedulerPick(req pluginapi.SchedulerPickRequest
 			continue
 		}
 		if probeStarted {
-			s.persistAfterBanChange()
+			entry, stillOwned := banStore.lookup(returned.AuthID)
+			if !stillOwned || entry.Phase != banPhaseHalfOpen || !entry.ProbeStartedAt.Equal(now) ||
+				!s.persistProbeAdmission(returned.AuthID, entry.BannedAt, entry.ProbeStartedAt) {
+				if !s.generationOwnerActive() {
+					return pluginapi.SchedulerPickResponse{Handled: false}, nil
+				}
+				remaining = schedulerCandidatesWithout(remaining, returned.AuthID)
+				continue
+			}
 			slog.Info("codex-quota-scheduler: half-open probe admitted", "auth_id", returned.AuthID, "lease_until", now.Add(probeLease).Format(time.RFC3339))
 		}
 		s.recordDecisionAudit(attempt, mode, legacy, dynamic, returned, candidates, now)
@@ -1515,7 +1552,8 @@ func (s *schedulerRuntimeState) loadBanStateWithConfirmationMode(path string, re
 		return
 	}
 	for authID, entry := range state.Bans {
-		if strings.TrimSpace(authID) == "" || entry.ResetAt.IsZero() {
+		entry = normalizeBanEntry(entry)
+		if strings.TrimSpace(authID) == "" || (entry.Kind != banKindBlocked && entry.ResetAt.IsZero()) {
 			continue
 		}
 		banStore.set(authID, entry)
@@ -2354,6 +2392,24 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 
 func (s *schedulerRuntimeState) persistAfterBanChange() {
 	s.persistBanState()
+}
+
+// persistProbeAdmission is the cross-DSO admission fence for a half-open
+// request. With a durable state_path, the exact reservation must be committed
+// while this DSO still owns the generation before any request is dispatched or
+// returned to CPA. Failure rolls back only the reservation we just created.
+func (s *schedulerRuntimeState) persistProbeAdmission(authID string, bannedAt, probeStartedAt time.Time) bool {
+	if s.runtimeStatePath() == "" {
+		return s.generationOwnerActive()
+	}
+	if s.persistBanState() {
+		return true
+	}
+	rolledBack := banStore.rollbackProbe(authID, bannedAt, probeStartedAt)
+	slog.Warn("codex-quota-scheduler: half-open probe cancelled because the generation fence was not committed",
+		"auth_id", strings.TrimSpace(authID),
+		"rolled_back", rolledBack)
+	return false
 }
 
 func (s *schedulerRuntimeState) banDurations() (fallback, max time.Duration) {

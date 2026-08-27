@@ -39,8 +39,11 @@ type warmupEntry struct {
 }
 
 type warmupCandidate struct {
-	Snapshot quotaSnapshot
-	Window   quotaWindow
+	Snapshot         quotaSnapshot
+	Window           quotaWindow
+	RecoveryProbe    bool
+	RecoveryBannedAt time.Time
+	ProbeStartedAt   time.Time
 }
 
 type warmupAuthBinding struct {
@@ -49,8 +52,11 @@ type warmupAuthBinding struct {
 }
 
 type warmupLease struct {
-	AuthID    string
-	ExpiresAt time.Time
+	AuthID           string
+	ExpiresAt        time.Time
+	RecoveryProbe    bool
+	RecoveryBannedAt time.Time
+	ProbeStartedAt   time.Time
 }
 
 type cpaAPICallRequest struct {
@@ -173,11 +179,6 @@ func (s *schedulerRuntimeState) scheduleWarmup(parent context.Context, skipAuthI
 	if !s.generationOwnerActive() {
 		return
 	}
-	candidates := s.findWarmupCandidates(eligible, skipAuthIDs, time.Now())
-	if len(candidates) == 0 {
-		return
-	}
-
 	now = time.Now()
 	s.warmupMu.Lock()
 	if s.warmupRunning {
@@ -203,7 +204,7 @@ func (s *schedulerRuntimeState) scheduleWarmup(parent context.Context, skipAuthI
 			slog.Warn("codex-quota-scheduler: could not release warmup instance lease", "error", err)
 		}
 	}
-	journalBans, mergedJournal, err := s.mergePersistedWarmupsLocked(cfg.StatePath)
+	journalBanMutations, mergedJournal, err := s.mergePersistedWarmupsLocked(cfg.StatePath)
 	if err != nil {
 		s.warmupMu.Unlock()
 		releaseInstanceLease()
@@ -213,9 +214,7 @@ func (s *schedulerRuntimeState) scheduleWarmup(parent context.Context, skipAuthI
 	// Apply narrow outcomes from a superseded request only after releasing
 	// warmupMu, preserving the banStore -> warmupMu lock order used elsewhere.
 	s.warmupMu.Unlock()
-	for authID, entry := range journalBans {
-		banStore.set(authID, entry)
-	}
+	s.applyWarmupJournalBanMutations(journalBanMutations)
 	if !s.generationOwnerActive() {
 		releaseInstanceLease()
 		return
@@ -224,6 +223,16 @@ func (s *schedulerRuntimeState) scheduleWarmup(parent context.Context, skipAuthI
 		if err := clearWarmupOutcomeJournal(cfg.StatePath); err != nil {
 			slog.Warn("codex-quota-scheduler: could not compact merged warmup outcome journal", "error", err)
 		}
+	}
+	// A retiring generation may have completed the only half-open recovery
+	// request. Merge and apply its exact outcome before candidate discovery;
+	// otherwise the persisted half-open entry would make the target look
+	// ineligible and the journal would never be consumed.
+	now = time.Now()
+	candidates := s.findWarmupCandidates(eligible, skipAuthIDs, now)
+	if len(candidates) == 0 {
+		releaseInstanceLease()
+		return
 	}
 	s.warmupMu.Lock()
 	if s.warmupRunning {
@@ -261,15 +270,16 @@ func (s *schedulerRuntimeState) scheduleWarmup(parent context.Context, skipAuthI
 			s.warmupMu.Unlock()
 		}()
 		executed := false
+		executedCandidate := candidate
 		if s.generationOwnerActive() {
 			executed = true
-			s.executeWarmup(parent, cfg, candidate)
+			executedCandidate = s.executeWarmup(parent, cfg, candidate)
 		}
 		// A request admitted by the previous generation may finish after
 		// takeover. Transfer only that lease-protected outcome so the new owner
 		// does not repeat the activation; never persist the old full snapshot.
 		if executed && !s.generationOwnerActive() {
-			if err := s.persistWarmupLeaseOutcome(instanceLease, candidate); err != nil {
+			if err := s.persistWarmupLeaseOutcome(instanceLease, executedCandidate); err != nil {
 				slog.Warn("codex-quota-scheduler: could not persist warmup lease outcome", "error", err)
 			}
 		}
@@ -330,17 +340,34 @@ func (s *schedulerRuntimeState) findWarmupCandidates(eligible map[string]warmupA
 		// an older index after Agent Identity replaces a Team workspace auth file.
 		snapshot.AuthID = binding.AuthID
 		snapshot.AuthIndex = binding.AuthIndex
-		// Quarantined credentials recover only through the serialized half-open
-		// scheduler path. Warmup must never bypass that lease with a second probe.
-		if _, quarantined := banStore.lookup(binding.AuthID); quarantined {
-			skippedBanned++
+		window, needsActivation := unstartedWarmupWindow(snapshot, now)
+		if !needsActivation {
+			skippedNotNeeded++
 			continue
 		}
-		if window, ok := unstartedWarmupWindow(snapshot, now); ok {
-			candidates = append(candidates, warmupCandidate{Snapshot: snapshot, Window: window})
-		} else {
-			skippedNotNeeded++
+		recoveryProbe := false
+		recoveryBannedAt := time.Time{}
+		if entry, quarantined := banStore.lookup(binding.AuthID); quarantined {
+			// An expired authoritative quota cooldown is already probe-ready. A
+			// full, fresh placeholder snapshot gives us a safe opportunity to use
+			// the single low-cost activation request as that serialized half-open
+			// probe. Probation, active cooldowns, and in-flight probes remain hard
+			// exclusions and can only recover through normal request scheduling.
+			if entry.Kind != banKindQuota || entry.BannedAt.IsZero() ||
+				banEntryDisposition(entry, now) != banDispositionProbeReady ||
+				!quotaSnapshotSafeForRecoveryWarmup(snapshot) {
+				skippedBanned++
+				continue
+			}
+			recoveryProbe = true
+			recoveryBannedAt = entry.BannedAt
 		}
+		candidates = append(candidates, warmupCandidate{
+			Snapshot:         snapshot,
+			Window:           window,
+			RecoveryProbe:    recoveryProbe,
+			RecoveryBannedAt: recoveryBannedAt,
+		})
 	}
 	if len(candidates) == 0 {
 		s.mu.Lock()
@@ -478,6 +505,30 @@ func unstartedWarmupWindow(snapshot quotaSnapshot, now time.Time) (quotaWindow, 
 	return selected, foundUnstarted
 }
 
+func quotaSnapshotSafeForRecoveryWarmup(snapshot quotaSnapshot) bool {
+	recognized := 0
+	for _, window := range snapshot.Windows {
+		if normalizeWindowClass(window.Class) == "" {
+			continue
+		}
+		recognized++
+		// Recovery is the only path allowed to reserve a quarantined credential,
+		// so Keeper must have explicitly supplied every safety field. Defaults
+		// used for ordinary scheduling are not proof that a 100%-available window
+		// is actually allowed and below its hard limit.
+		if !window.UsedPercentKnown || !window.AllowedKnown || !window.LimitReachedKnown {
+			return false
+		}
+		if window.UsedPercent > warmupMinimumAvailablePercent || window.LimitReached || !window.Allowed {
+			return false
+		}
+		if !window.WindowUsageCreditsKnown || window.WindowUsageCredits > warmupMinimumUsageCredits {
+			return false
+		}
+	}
+	return recognized > 0
+}
+
 func warmupWindowRank(class string) int {
 	switch class {
 	case "5h":
@@ -551,10 +602,27 @@ func warmupKey(authID, window string) string {
 }
 
 func (s *schedulerRuntimeState) registerWarmupLease(authID string, now time.Time) (string, error) {
-	authID = strings.TrimSpace(authID)
+	return s.registerWarmupLeaseRecord(warmupLease{AuthID: authID}, now)
+}
+
+func (s *schedulerRuntimeState) registerRecoveryWarmupLease(authID string, bannedAt, probeStartedAt, now time.Time) (string, error) {
+	return s.registerWarmupLeaseRecord(warmupLease{
+		AuthID:           authID,
+		RecoveryProbe:    true,
+		RecoveryBannedAt: bannedAt,
+		ProbeStartedAt:   probeStartedAt,
+	}, now)
+}
+
+func (s *schedulerRuntimeState) registerWarmupLeaseRecord(lease warmupLease, now time.Time) (string, error) {
+	authID := strings.TrimSpace(lease.AuthID)
 	if authID == "" {
 		return "", errors.New("warmup auth id is empty")
 	}
+	if lease.RecoveryProbe && (lease.RecoveryBannedAt.IsZero() || lease.ProbeStartedAt.IsZero()) {
+		return "", errors.New("recovery warmup identity is incomplete")
+	}
+	lease.AuthID = authID
 	raw := make([]byte, 32)
 	if _, err := rand.Read(raw); err != nil {
 		return "", fmt.Errorf("generate warmup lease: %w", err)
@@ -569,24 +637,25 @@ func (s *schedulerRuntimeState) registerWarmupLease(authID string, now time.Time
 			delete(s.warmupLeases, key)
 		}
 	}
-	s.warmupLeases[nonce] = warmupLease{AuthID: authID, ExpiresAt: now.Add(warmupRequestTimeout)}
+	lease.ExpiresAt = now.Add(warmupRequestTimeout)
+	s.warmupLeases[nonce] = lease
 	s.warmupMu.Unlock()
 	return nonce, nil
 }
 
-func (s *schedulerRuntimeState) consumeWarmupLease(nonce string, now time.Time) (string, bool) {
+func (s *schedulerRuntimeState) consumeWarmupLease(nonce string, now time.Time) (warmupLease, bool) {
 	nonce = strings.TrimSpace(nonce)
 	if nonce == "" {
-		return "", false
+		return warmupLease{}, false
 	}
 	s.warmupMu.Lock()
 	defer s.warmupMu.Unlock()
 	lease, ok := s.warmupLeases[nonce]
 	delete(s.warmupLeases, nonce)
 	if !ok || !now.Before(lease.ExpiresAt) {
-		return "", false
+		return warmupLease{}, false
 	}
-	return lease.AuthID, true
+	return lease, true
 }
 
 func (s *schedulerRuntimeState) releaseWarmupLease(nonce string) {
@@ -779,18 +848,86 @@ func retryableWarmupFromPriorGeneration(entry warmupEntry, generationClaimedAt t
 	return errorCode == "" || errorCode == "cancelled"
 }
 
-func (s *schedulerRuntimeState) executeWarmup(parent context.Context, cfg pluginConfig, candidate warmupCandidate) {
+func (s *schedulerRuntimeState) executeWarmup(parent context.Context, cfg pluginConfig, candidate warmupCandidate) warmupCandidate {
 	model, err := validateWarmupModel(cfg.WarmupModel)
 	if err != nil {
 		s.recordWarmupError(candidate, 0, err)
-		return
+		return candidate
 	}
 	cfg.WarmupModel = model
+	if candidate.RecoveryProbe {
+		var claimed bool
+		candidate, claimed = s.claimWarmupRecoveryProbe(cfg, candidate)
+		if !claimed {
+			return candidate
+		}
+	}
 	if nativeWarmupRequested(cfg) {
 		s.executeNativeWarmup(parent, cfg, candidate)
-		return
+		return candidate
 	}
 	s.executeManagementWarmup(parent, cfg, candidate)
+	return candidate
+}
+
+func (s *schedulerRuntimeState) claimWarmupRecoveryProbe(cfg pluginConfig, candidate warmupCandidate) (warmupCandidate, bool) {
+	now := time.Now()
+	probeLease := cfg.HalfOpenProbeTimeout
+	if probeLease <= 0 {
+		probeLease = 15 * time.Minute
+	}
+	allowed, started := banStore.tryStartProbeMatching(candidate.Snapshot.AuthID, candidate.RecoveryBannedAt, now, probeLease)
+	if !allowed || !started {
+		s.discardAdmittedWarmup(candidate)
+		slog.Info("codex-quota-scheduler: recovery warmup skipped because the half-open lease changed",
+			"auth_id", candidate.Snapshot.AuthID,
+			"allowed", allowed,
+			"probe_started", started)
+		return candidate, false
+	}
+	entry, stillOwned := banStore.lookup(candidate.Snapshot.AuthID)
+	if !stillOwned || banEntryDisposition(entry, now) != banDispositionHalfOpen ||
+		!entry.BannedAt.Equal(candidate.RecoveryBannedAt) || !entry.ProbeStartedAt.Equal(now) {
+		s.discardAdmittedWarmup(candidate)
+		return candidate, false
+	}
+	candidate.RecoveryBannedAt = entry.BannedAt
+	candidate.ProbeStartedAt = entry.ProbeStartedAt
+	if !s.persistProbeAdmission(candidate.Snapshot.AuthID, candidate.RecoveryBannedAt, candidate.ProbeStartedAt) {
+		s.discardAdmittedWarmup(candidate)
+		return candidate, false
+	}
+	slog.Info("codex-quota-scheduler: recovery warmup half-open probe admitted",
+		"auth_id", candidate.Snapshot.AuthID,
+		"lease_until", now.Add(probeLease).Format(time.RFC3339))
+	return candidate, true
+}
+
+func (s *schedulerRuntimeState) recoveryWarmupProbeActive(candidate warmupCandidate, now time.Time) bool {
+	if !candidate.RecoveryProbe {
+		return true
+	}
+	if candidate.RecoveryBannedAt.IsZero() || candidate.ProbeStartedAt.IsZero() {
+		return false
+	}
+	entry, ok := banStore.lookup(candidate.Snapshot.AuthID)
+	return ok && banEntryDisposition(entry, now) == banDispositionHalfOpen &&
+		entry.BannedAt.Equal(candidate.RecoveryBannedAt) &&
+		entry.ProbeStartedAt.Equal(candidate.ProbeStartedAt)
+}
+
+func (s *schedulerRuntimeState) discardAdmittedWarmup(candidate warmupCandidate) {
+	key := warmupKey(candidate.Snapshot.AuthID, candidate.Window.Class)
+	changed := false
+	s.warmupMu.Lock()
+	if entry, ok := s.warmups[key]; ok && entry.CompletedAt.IsZero() && entry.ActivatedAt.IsZero() {
+		delete(s.warmups, key)
+		changed = true
+	}
+	s.warmupMu.Unlock()
+	if changed {
+		s.persistBanState()
+	}
 }
 
 func (s *schedulerRuntimeState) executeNativeWarmup(parent context.Context, cfg pluginConfig, candidate warmupCandidate) {
@@ -798,7 +935,13 @@ func (s *schedulerRuntimeState) executeNativeWarmup(parent context.Context, cfg 
 		s.recordWarmupError(candidate, 0, err)
 		return
 	}
-	nonce, err := s.registerWarmupLease(candidate.Snapshot.AuthID, time.Now())
+	nonce := ""
+	var err error
+	if candidate.RecoveryProbe {
+		nonce, err = s.registerRecoveryWarmupLease(candidate.Snapshot.AuthID, candidate.RecoveryBannedAt, candidate.ProbeStartedAt, time.Now())
+	} else {
+		nonce, err = s.registerWarmupLease(candidate.Snapshot.AuthID, time.Now())
+	}
 	if err != nil {
 		s.recordWarmupError(candidate, 0, err)
 		return
@@ -896,6 +1039,12 @@ func (s *schedulerRuntimeState) executeManagementWarmup(parent context.Context, 
 		return
 	}
 	candidate.Snapshot.AuthIndex = strings.TrimSpace(binding.AuthIndex)
+	if !s.recoveryWarmupProbeActive(candidate, time.Now()) {
+		s.discardAdmittedWarmup(candidate)
+		slog.Info("codex-quota-scheduler: recovery warmup cancelled before management dispatch because the half-open lease changed",
+			"auth_id", candidate.Snapshot.AuthID)
+		return
+	}
 
 	payload, err := json.Marshal(map[string]any{
 		"model": cfg.WarmupModel,
@@ -961,6 +1110,12 @@ func (s *schedulerRuntimeState) executeManagementWarmup(parent context.Context, 
 	}
 	req.Header.Set("Authorization", "Bearer "+managementKey)
 	req.Header.Set("Content-Type", "application/json")
+	if !s.recoveryWarmupProbeActive(candidate, time.Now()) {
+		s.discardAdmittedWarmup(candidate)
+		slog.Info("codex-quota-scheduler: recovery warmup cancelled at management dispatch because the half-open lease changed",
+			"auth_id", candidate.Snapshot.AuthID)
+		return
+	}
 	requestedAt := time.Now()
 	resp, err := (&http.Client{Timeout: warmupRequestTimeout}).Do(req)
 	if err != nil {
@@ -1125,7 +1280,52 @@ func (s *schedulerRuntimeState) recordWarmupOutcome(candidate warmupCandidate, s
 	// fresh Keeper snapshot supplies the real reset anchor shown in status.
 	s.warmups[targetKey] = target
 	s.warmupMu.Unlock()
+	s.completeRecoveryWarmupProbe(candidate, status, err, now)
 	s.persistBanState()
+}
+
+func (s *schedulerRuntimeState) completeRecoveryWarmupProbe(candidate warmupCandidate, status int, err error, now time.Time) {
+	if !candidate.RecoveryProbe || candidate.ProbeStartedAt.IsZero() {
+		return
+	}
+	if err != nil {
+		code, blocked := classifyWarmupFailure(status, err)
+		if blocked {
+			if banStore.blockProbe(candidate.Snapshot.AuthID, candidate.RecoveryBannedAt, candidate.ProbeStartedAt, code, now) {
+				s.dropBanResetConfirmation(candidate.Snapshot.AuthID)
+				slog.Warn("codex-quota-scheduler: recovery warmup entered terminal quarantine",
+					"auth_id", candidate.Snapshot.AuthID,
+					"window", candidate.Window.Class,
+					"error_code", code)
+			}
+			return
+		}
+	}
+	success := err == nil && status >= 200 && status < 300
+	_, cleared, changed := banStore.completeProbe(
+		candidate.Snapshot.AuthID,
+		candidate.ProbeStartedAt,
+		now,
+		success,
+		s.halfOpenRetryAfter(),
+	)
+	if !changed {
+		// A 429 replaces the half-open lease with its authoritative cooldown in
+		// recordWarmup429 before this method runs. That transition is already the
+		// correct terminal state for this attempt.
+		return
+	}
+	if cleared {
+		s.dropBanResetConfirmation(candidate.Snapshot.AuthID)
+		slog.Info("codex-quota-scheduler: recovery warmup probe succeeded; credential re-enabled",
+			"auth_id", candidate.Snapshot.AuthID,
+			"window", candidate.Window.Class)
+		return
+	}
+	slog.Warn("codex-quota-scheduler: recovery warmup probe failed without 429; retry delayed",
+		"auth_id", candidate.Snapshot.AuthID,
+		"window", candidate.Window.Class,
+		"status", status)
 }
 
 // warmupActivationWindows returns every recognized window that the admitted
@@ -1434,7 +1634,50 @@ func nativeWarmupRequested(cfg pluginConfig) bool {
 }
 
 func (s *schedulerRuntimeState) clearBlockedWarmupState(authID string, all bool) int {
+	removed, _ := s.clearBlockedWarmupStateSafe(authID, all)
+	return removed
+}
+
+// clearBlockedWarmupStateSafe serializes an explicit retry with the same
+// cross-instance lease used by warmup execution. An older generation can only
+// append its outcome journal while holding that lease; merging and compacting
+// the journal before removing the target therefore prevents a late blocked
+// outcome from resurrecting after an administrator has retried the account.
+func (s *schedulerRuntimeState) clearBlockedWarmupStateSafe(authID string, all bool) (int, error) {
 	authID = strings.TrimSpace(authID)
+	statePath := s.runtimeStatePath()
+	var instanceLease *warmupInstanceLease
+	if statePath != "" {
+		if !s.generationOwnerActive() {
+			return 0, errors.New("generation_not_active")
+		}
+		lease, acquired, err := acquireWarmupInstanceLease(statePath, time.Now().UTC())
+		if err != nil {
+			return 0, fmt.Errorf("acquire warmup instance lease: %w", err)
+		}
+		if !acquired || lease == nil {
+			return 0, errors.New("warmup_instance_busy")
+		}
+		instanceLease = lease
+		defer func() {
+			if err := instanceLease.release(); err != nil {
+				slog.Warn("codex-quota-scheduler: could not release warmup instance lease after management retry", "error", err)
+			}
+		}()
+
+		s.warmupMu.Lock()
+		mutations, merged, err := s.mergePersistedWarmupsLocked(statePath)
+		s.warmupMu.Unlock()
+		if err != nil {
+			return 0, fmt.Errorf("merge warmup outcome journal: %w", err)
+		}
+		s.applyWarmupJournalBanMutations(mutations)
+		if merged {
+			if err := clearWarmupOutcomeJournal(statePath); err != nil {
+				return 0, fmt.Errorf("compact warmup outcome journal: %w", err)
+			}
+		}
+	}
 	removed := 0
 	s.warmupMu.Lock()
 	for key, entry := range s.warmups {
@@ -1445,7 +1688,11 @@ func (s *schedulerRuntimeState) clearBlockedWarmupState(authID string, all bool)
 		removed++
 	}
 	s.warmupMu.Unlock()
-	return removed
+	removed += banStore.clearBlocked(authID, all)
+	if statePath != "" && !s.persistBanState() {
+		return removed, errors.New("persist_management_retry_failed")
+	}
+	return removed, nil
 }
 
 func warmupEligibleAuths(files []cpaAuthFileEntry) map[string]warmupAuthBinding {

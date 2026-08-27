@@ -490,10 +490,10 @@ func TestCollectExpiredQuotaBanRefreshTargetsIncludesElapsedFiveHourBan(t *testi
 	resetBanStoreForTest()
 	now := time.Now().UTC()
 	banStore.set("auth-a", banEntry{
-		Kind:   banKindQuota,
-		Phase:  banPhaseCooldown,
-		Window: "5h",
-		ResetAt: now.Add(-time.Minute),
+		Kind:     banKindQuota,
+		Phase:    banPhaseCooldown,
+		Window:   "5h",
+		ResetAt:  now.Add(-time.Minute),
 		BannedAt: now.Add(-2 * time.Hour),
 	})
 	defer resetBanStoreForTest()

@@ -105,7 +105,7 @@ import (
 
 const (
 	pluginName    = "codex-quota-scheduler"
-	pluginVersion = "0.1.24"
+	pluginVersion = "0.1.26"
 
 	// providerCodex is the CPA provider key for OpenAI Codex (ChatGPT backend).
 	providerCodex = "codex"
@@ -136,6 +136,9 @@ var banStore banState
 const (
 	banKindQuota     = "quota"
 	banKindProbation = "probation"
+	// banKindBlocked is a terminal recovery quarantine. It has no automatic
+	// reset deadline and can only be cleared by an explicit management action.
+	banKindBlocked = "blocked"
 
 	banPhaseCooldown = "cooldown"
 	banPhaseHalfOpen = "half_open"
@@ -190,7 +193,7 @@ type banStateStats struct {
 }
 
 func normalizeBanEntry(entry banEntry) banEntry {
-	if entry.Kind != banKindQuota && entry.Kind != banKindProbation {
+	if entry.Kind != banKindQuota && entry.Kind != banKindProbation && entry.Kind != banKindBlocked {
 		if strings.Contains(strings.ToLower(entry.Window), "temporary fallback") ||
 			strings.Contains(strings.ToLower(entry.Window), "probation") {
 			entry.Kind = banKindProbation
@@ -225,11 +228,14 @@ func probeRequestMatches(entry banEntry, requestedAt time.Time) bool {
 		return false
 	}
 	if requestedAt.IsZero() {
-		return true
+		return false
 	}
-	// RequestedAt is host-generated, but tolerate small clock/serialization
-	// differences while excluding requests that clearly predate the probe.
-	return !requestedAt.Before(entry.ProbeStartedAt.Add(-time.Second))
+	// CPA creates the Codex executor usage reporter after SchedulerPick has
+	// selected the auth, so both timestamps use the same process clock and the
+	// reporter timestamp is at or after the half-open reservation. A missing or
+	// earlier timestamp belongs to an uncorrelated/older request and must never
+	// clear the new quarantine.
+	return !requestedAt.Before(entry.ProbeStartedAt)
 }
 
 // lookup returns the normalized quarantine entry for the given auth ID.
@@ -254,6 +260,12 @@ func (s *banState) setCooldownLocked(authID string, entry banEntry) {
 	entry.ProbeLeaseUntil = time.Time{}
 	if previous, ok := s.bans[authID]; ok {
 		previous = normalizeBanEntry(previous)
+		// A terminal recovery failure must never be weakened by a delayed 429 or
+		// an older persisted cooldown. Only an explicit management retry/unban may
+		// remove this quarantine.
+		if previous.Kind == banKindBlocked && entry.Kind != banKindBlocked {
+			return
+		}
 		// A repeated 429 must never shorten an already known cooldown.
 		if previous.ResetAt.After(entry.ResetAt) {
 			entry.ResetAt = previous.ResetAt
@@ -284,6 +296,16 @@ func (s *banState) set(authID string, entry banEntry) {
 	}
 	if previous, ok := s.bans[authID]; ok {
 		previous = normalizeBanEntry(previous)
+		// Loading an older disk snapshot must not weaken an in-memory terminal
+		// quarantine, while a persisted terminal quarantine must supersede a
+		// retryable cooldown regardless of its intentionally empty ResetAt.
+		if previous.Kind == banKindBlocked && entry.Kind != banKindBlocked {
+			return
+		}
+		if entry.Kind == banKindBlocked {
+			s.bans[authID] = entry
+			return
+		}
 		// Hot reload may read a slightly older on-disk snapshot. Preserve the
 		// later cooldown or currently active half-open lease already in memory.
 		if previous.ResetAt.After(entry.ResetAt) ||
@@ -331,6 +353,13 @@ func (s *banState) schedulable(authID string, now time.Time) bool {
 // tryStartProbe validates the final scheduler choice and atomically reserves a
 // single half-open request. It returns allowed=true for a healthy credential.
 func (s *banState) tryStartProbe(authID string, now time.Time, lease time.Duration) (allowed, probeStarted bool) {
+	return s.tryStartProbeMatching(authID, time.Time{}, now, lease)
+}
+
+// tryStartProbeMatching is the recovery-warmup CAS variant. A candidate can sit
+// in the warmup queue while a newer 429 replaces its cooldown, so the original
+// BannedAt identity must still match when the half-open lease is reserved.
+func (s *banState) tryStartProbeMatching(authID string, expectedBannedAt, now time.Time, lease time.Duration) (allowed, probeStarted bool) {
 	authID = strings.TrimSpace(authID)
 	if authID == "" {
 		return false, false
@@ -345,6 +374,9 @@ func (s *banState) tryStartProbe(authID string, now time.Time, lease time.Durati
 		return true, false
 	}
 	entry = normalizeBanEntry(entry)
+	if !expectedBannedAt.IsZero() && !entry.BannedAt.Equal(expectedBannedAt) {
+		return false, false
+	}
 	if banEntryDisposition(entry, now) != banDispositionProbeReady {
 		return false, false
 	}
@@ -355,6 +387,125 @@ func (s *banState) tryStartProbe(authID string, now time.Time, lease time.Durati
 	s.bans[authID] = entry
 	s.probeStarts++
 	return true, true
+}
+
+// rollbackProbe restores an exact, not-yet-dispatched half-open reservation to
+// probe-ready cooldown state. It is used when the generation ownership fence
+// cannot durably commit the reservation during a hot replacement.
+func (s *banState) rollbackProbe(authID string, expectedBannedAt, expectedProbeStartedAt time.Time) bool {
+	authID = strings.TrimSpace(authID)
+	if authID == "" || expectedBannedAt.IsZero() || expectedProbeStartedAt.IsZero() {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry, ok := s.bans[authID]
+	if !ok {
+		return false
+	}
+	entry = normalizeBanEntry(entry)
+	if entry.Phase != banPhaseHalfOpen || !entry.BannedAt.Equal(expectedBannedAt) ||
+		!entry.ProbeStartedAt.Equal(expectedProbeStartedAt) {
+		return false
+	}
+	entry.Phase = banPhaseCooldown
+	entry.ProbeStartedAt = time.Time{}
+	entry.ProbeLeaseUntil = time.Time{}
+	if entry.ProbeAttempts > 0 {
+		entry.ProbeAttempts--
+	}
+	if s.probeStarts > 0 {
+		s.probeStarts--
+	}
+	s.bans[authID] = entry
+	return true
+}
+
+// blockProbe converts the exact recovery half-open lease into a persistent
+// terminal quarantine. Cyber-policy, auth, and deactivated-workspace failures
+// must not be retried automatically by ordinary traffic after a short delay.
+func (s *banState) blockProbe(authID string, expectedBannedAt, expectedProbeStartedAt time.Time, code string, now time.Time) bool {
+	authID = strings.TrimSpace(authID)
+	if authID == "" || expectedBannedAt.IsZero() || expectedProbeStartedAt.IsZero() {
+		return false
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	code = sanitizeWarmupCode(code)
+	if code == "" {
+		code = "terminal_recovery_failure"
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry, ok := s.bans[authID]
+	if !ok {
+		return false
+	}
+	entry = normalizeBanEntry(entry)
+	if entry.Phase != banPhaseHalfOpen || !entry.BannedAt.Equal(expectedBannedAt) ||
+		!entry.ProbeStartedAt.Equal(expectedProbeStartedAt) {
+		return false
+	}
+	entry.Kind = banKindBlocked
+	entry.Window = "recovery blocked: " + code
+	entry.BannedAt = now
+	entry.ResetAt = time.Time{}
+	entry.Phase = banPhaseCooldown
+	entry.ProbeStartedAt = time.Time{}
+	entry.ProbeLeaseUntil = time.Time{}
+	s.bans[authID] = entry
+	s.probeFailures++
+	return true
+}
+
+// applyRecoveryProbeOutcome applies a retiring generation's terminal recovery
+// result only to the exact cooldown/probe it owned. This prevents an old
+// success tombstone from clearing a newer 429 and lets a matching 429 or
+// non-429 cooldown replace a persisted half-open entry during hot takeover.
+func (s *banState) applyRecoveryProbeOutcome(authID string, expectedBannedAt, expectedProbeStartedAt time.Time, replacement *banEntry, clear bool) bool {
+	authID = strings.TrimSpace(authID)
+	if authID == "" || expectedBannedAt.IsZero() || expectedProbeStartedAt.IsZero() || (!clear && replacement == nil) {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current, ok := s.bans[authID]
+	if !ok {
+		// Conditional journal mutations are compare-and-swap operations. An
+		// absent entry may have been cleared deliberately after takeover, so an
+		// older retiring generation must not resurrect its cooldown.
+		return false
+	}
+	current = normalizeBanEntry(current)
+	if !current.BannedAt.Equal(expectedBannedAt) {
+		return false
+	}
+	ownedHalfOpen := current.Phase == banPhaseHalfOpen && current.ProbeStartedAt.Equal(expectedProbeStartedAt)
+	// A newly loaded DSO can have read the last persisted probe-ready cooldown
+	// just before the retiring owner saved its half-open reservation. That
+	// snapshot is still safe to reconcile only when its reset was already due by
+	// the exact probe start. A later/future cooldown is a terminal result and
+	// must never be overwritten by an older journal record.
+	staleProbeReadyCooldown := current.Phase == banPhaseCooldown &&
+		!current.ResetAt.IsZero() && !current.ResetAt.After(expectedProbeStartedAt)
+	if !ownedHalfOpen && !staleProbeReadyCooldown {
+		return false
+	}
+	if replacement != nil {
+		incoming := normalizeBanEntry(*replacement)
+		if current.BannedAt.After(incoming.BannedAt) ||
+			(current.BannedAt.Equal(incoming.BannedAt) && current.ResetAt.After(incoming.ResetAt)) {
+			return false
+		}
+		s.bans[authID] = incoming
+		return true
+	}
+	if clear {
+		delete(s.bans, authID)
+		return true
+	}
+	return false
 }
 
 // completeProbe clears a successful half-open entry or returns a non-429
@@ -414,6 +565,24 @@ func (s *banState) clearAll() int {
 	n := len(s.bans)
 	s.bans = make(map[string]banEntry)
 	return n
+}
+
+// clearBlocked removes only terminal recovery quarantines. This is paired with
+// the explicit warmup-retry management action and never runs automatically.
+func (s *banState) clearBlocked(authID string, all bool) int {
+	authID = strings.TrimSpace(authID)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	removed := 0
+	for id, entry := range s.bans {
+		entry = normalizeBanEntry(entry)
+		if entry.Kind != banKindBlocked || (!all && id != authID) {
+			continue
+		}
+		delete(s.bans, id)
+		removed++
+	}
+	return removed
 }
 
 // snapshot returns a normalized copy without deleting probe-ready entries.
@@ -1046,9 +1215,15 @@ func handleManagementWarmupRetry(req pluginapi.ManagementRequest) pluginapi.Mana
 			"message": "provide auth_id or explicitly set all=true",
 		})
 	}
-	removed := schedulerRuntime.clearBlockedWarmupState(authID, all)
-	if removed > 0 {
-		schedulerRuntime.persistBanState()
+	removed, err := schedulerRuntime.clearBlockedWarmupStateSafe(authID, all)
+	if err != nil {
+		status := http.StatusServiceUnavailable
+		if strings.Contains(err.Error(), "warmup_instance_busy") {
+			status = http.StatusConflict
+		}
+		return jsonManagementResponse(status, map[string]any{
+			"ok": false, "error": err.Error(), "auth_id": authID, "all": all,
+		})
 	}
 	return jsonManagementResponse(http.StatusOK, map[string]any{
 		"ok": true, "auth_id": authID, "all": all, "removed": removed,

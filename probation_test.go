@@ -118,6 +118,118 @@ func TestHalfOpenSuccessClearsProbation(t *testing.T) {
 	}
 }
 
+func TestHalfOpenCompletionRejectsRequestPredatingProbe(t *testing.T) {
+	resetBanStoreForTest()
+	now := time.Date(2026, time.July, 21, 12, 0, 0, 0, time.UTC)
+	bannedAt := now.Add(-time.Hour)
+	banStore.set("acct", banEntry{
+		ResetAt: now.Add(-time.Minute), BannedAt: bannedAt,
+		Window: "5h", Kind: banKindQuota,
+	})
+	if allowed, started := banStore.tryStartProbe("acct", now, 10*time.Minute); !allowed || !started {
+		t.Fatal("failed to start half-open probe")
+	}
+	_, cleared, changed := banStore.completeProbe(
+		"acct",
+		now.Add(-500*time.Millisecond),
+		now.Add(time.Second),
+		true,
+		time.Minute,
+	)
+	if changed || cleared {
+		t.Fatalf("pre-probe completion changed quarantine: changed=%v cleared=%v", changed, cleared)
+	}
+	entry, ok := banStore.lookup("acct")
+	if !ok || entry.Phase != banPhaseHalfOpen || !entry.BannedAt.Equal(bannedAt) || !entry.ProbeStartedAt.Equal(now) {
+		t.Fatalf("pre-probe completion disturbed half-open identity: entry=%#v ok=%v", entry, ok)
+	}
+}
+
+func TestHalfOpenCompletionRejectsMissingRequestedAt(t *testing.T) {
+	resetBanStoreForTest()
+	now := time.Date(2026, time.July, 21, 12, 0, 0, 0, time.UTC)
+	bannedAt := now.Add(-time.Hour)
+	banStore.set("acct", banEntry{
+		ResetAt: now.Add(-time.Minute), BannedAt: bannedAt,
+		Window: "5h", Kind: banKindQuota,
+	})
+	if allowed, started := banStore.tryStartProbe("acct", now, 10*time.Minute); !allowed || !started {
+		t.Fatal("failed to start half-open probe")
+	}
+	_, cleared, changed := banStore.completeProbe("acct", time.Time{}, now.Add(time.Second), true, time.Minute)
+	if changed || cleared {
+		t.Fatalf("missing RequestedAt changed quarantine: changed=%v cleared=%v", changed, cleared)
+	}
+	entry, ok := banStore.lookup("acct")
+	if !ok || entry.Phase != banPhaseHalfOpen || !entry.BannedAt.Equal(bannedAt) || !entry.ProbeStartedAt.Equal(now) {
+		t.Fatalf("missing RequestedAt disturbed half-open identity: entry=%#v ok=%v", entry, ok)
+	}
+}
+
+func TestRollbackProbeRequiresExactHalfOpenIdentity(t *testing.T) {
+	resetBanStoreForTest()
+	now := time.Date(2026, time.July, 21, 12, 0, 0, 0, time.UTC)
+	bannedAt := now.Add(-time.Hour)
+	banStore.set("acct", banEntry{
+		ResetAt: now.Add(-time.Minute), BannedAt: bannedAt,
+		Window: "5h", Kind: banKindQuota,
+	})
+	if allowed, started := banStore.tryStartProbe("acct", now, 10*time.Minute); !allowed || !started {
+		t.Fatal("failed to start half-open probe")
+	}
+	if banStore.rollbackProbe("acct", bannedAt.Add(time.Second), now) {
+		t.Fatal("rollback accepted a different ban identity")
+	}
+	if banStore.rollbackProbe("acct", bannedAt, now.Add(time.Second)) {
+		t.Fatal("rollback accepted a different probe identity")
+	}
+	if !banStore.rollbackProbe("acct", bannedAt, now) {
+		t.Fatal("exact half-open identity was not rolled back")
+	}
+	entry, ok := banStore.lookup("acct")
+	if !ok || entry.Phase != banPhaseCooldown || entry.ProbeAttempts != 0 || banEntryDisposition(entry, now) != banDispositionProbeReady {
+		t.Fatalf("rollback state = %#v ok=%v; want original probe-ready cooldown", entry, ok)
+	}
+	if stats := banStore.stats(); stats.ProbeStarts != 0 {
+		t.Fatalf("rolled-back probe remained counted: %#v", stats)
+	}
+}
+
+func TestBlockedProbeCannotAutoRecoverOrBeWeakenedByDelayed429(t *testing.T) {
+	resetBanStoreForTest()
+	now := time.Date(2026, time.July, 21, 12, 0, 0, 0, time.UTC)
+	bannedAt := now.Add(-time.Hour)
+	banStore.set("acct", banEntry{
+		ResetAt: now.Add(-time.Minute), BannedAt: bannedAt,
+		Window: "5h", Kind: banKindQuota,
+	})
+	if allowed, started := banStore.tryStartProbe("acct", now, 10*time.Minute); !allowed || !started {
+		t.Fatal("failed to start half-open probe")
+	}
+	if !banStore.blockProbe("acct", bannedAt, now, "cyber_policy", now.Add(time.Second)) {
+		t.Fatal("terminal failure did not block the exact probe")
+	}
+	blocked, ok := banStore.lookup("acct")
+	if !ok || blocked.Kind != banKindBlocked || !blocked.ResetAt.IsZero() || banStore.schedulable("acct", now.Add(365*24*time.Hour)) {
+		t.Fatalf("terminal quarantine is not permanent: entry=%#v ok=%v", blocked, ok)
+	}
+	if allowed, started := banStore.tryStartProbe("acct", now.Add(365*24*time.Hour), time.Minute); allowed || started {
+		t.Fatalf("terminal quarantine entered half-open automatically: allowed=%v started=%v", allowed, started)
+	}
+
+	banStore.record429("acct", banEntry{
+		ResetAt: now.Add(2 * time.Hour), BannedAt: now.Add(2 * time.Second),
+		Window: "5h", Kind: banKindQuota,
+	}, now.Add(2*time.Second))
+	after429, ok := banStore.lookup("acct")
+	if !ok || after429.Kind != banKindBlocked || !after429.ResetAt.IsZero() || !after429.BannedAt.Equal(blocked.BannedAt) {
+		t.Fatalf("delayed 429 weakened terminal quarantine: before=%#v after=%#v ok=%v", blocked, after429, ok)
+	}
+	if removed := banStore.clearBlocked("acct", false); removed != 1 || !banStore.schedulable("acct", now) {
+		t.Fatalf("explicit retry did not clear terminal quarantine: removed=%d", removed)
+	}
+}
+
 func TestHalfOpenNon429FailureReturnsToShortCooldown(t *testing.T) {
 	resetBanStoreForTest()
 	now := time.Date(2026, time.July, 21, 12, 0, 0, 0, time.UTC)

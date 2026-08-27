@@ -36,11 +36,23 @@ const (
 )
 
 type warmupOutcomeJournalRecord struct {
-	Version    int         `json:"version"`
-	Key        string      `json:"key"`
-	Entry      warmupEntry `json:"entry"`
-	Ban        *banEntry   `json:"ban,omitempty"`
-	RecordedAt time.Time   `json:"recorded_at"`
+	Version            int                    `json:"version"`
+	Key                string                 `json:"key"`
+	Entry              warmupEntry            `json:"entry"`
+	Entries            map[string]warmupEntry `json:"entries,omitempty"`
+	Ban                *banEntry              `json:"ban,omitempty"`
+	BanCleared         bool                   `json:"ban_cleared,omitempty"`
+	RecoveryBannedAt   time.Time              `json:"recovery_banned_at,omitempty"`
+	RecoveryProbeStart time.Time              `json:"recovery_probe_started_at,omitempty"`
+	RecordedAt         time.Time              `json:"recorded_at"`
+}
+
+type warmupJournalBanMutation struct {
+	Ban                *banEntry
+	Clear              bool
+	Conditional        bool
+	ExpectedBannedAt   time.Time
+	ExpectedProbeStart time.Time
 }
 
 // acquireWarmupInstanceLease serializes warmup across independently loaded
@@ -90,7 +102,7 @@ func acquireWarmupInstanceLease(statePath string, now time.Time) (*warmupInstanc
 // cross-instance lease. This closes the hot-reload race where another plugin
 // instance finishes and persists a warmup after this instance loaded its
 // initial state but before its next refresh. The caller must hold warmupMu.
-func (s *schedulerRuntimeState) mergePersistedWarmupsLocked(statePath string) (map[string]banEntry, bool, error) {
+func (s *schedulerRuntimeState) mergePersistedWarmupsLocked(statePath string) (map[string]warmupJournalBanMutation, bool, error) {
 	statePath = strings.TrimSpace(statePath)
 	if statePath == "" {
 		return nil, false, nil
@@ -113,14 +125,54 @@ func (s *schedulerRuntimeState) mergePersistedWarmupsLocked(statePath string) (m
 	if err != nil {
 		return nil, false, err
 	}
-	bans := make(map[string]banEntry)
+	banMutations := make(map[string]warmupJournalBanMutation)
 	for _, record := range records {
 		s.mergeWarmupEntriesLocked(map[string]warmupEntry{record.Key: record.Entry})
-		if record.Ban != nil && strings.TrimSpace(record.Entry.AuthID) != "" {
-			bans[record.Entry.AuthID] = *record.Ban
+		s.mergeWarmupEntriesLocked(record.Entries)
+		authID := strings.TrimSpace(record.Entry.AuthID)
+		if authID == "" {
+			continue
+		}
+		if record.Ban == nil && !record.BanCleared {
+			continue
+		}
+		mutation := warmupJournalBanMutation{
+			Clear:              record.BanCleared && record.Ban == nil,
+			Conditional:        !record.RecoveryBannedAt.IsZero() && !record.RecoveryProbeStart.IsZero(),
+			ExpectedBannedAt:   record.RecoveryBannedAt,
+			ExpectedProbeStart: record.RecoveryProbeStart,
+		}
+		if record.Ban != nil {
+			copy := *record.Ban
+			mutation.Ban = &copy
+		}
+		// Records are appended in completion order; the last terminal outcome
+		// for one auth is authoritative, but a conditional recovery mutation is
+		// still CAS-checked against the active generation when applied.
+		banMutations[authID] = mutation
+	}
+	return banMutations, len(records) > 0, nil
+}
+
+func (s *schedulerRuntimeState) applyWarmupJournalBanMutations(mutations map[string]warmupJournalBanMutation) {
+	for authID, mutation := range mutations {
+		if mutation.Conditional {
+			changed := banStore.applyRecoveryProbeOutcome(
+				authID,
+				mutation.ExpectedBannedAt,
+				mutation.ExpectedProbeStart,
+				mutation.Ban,
+				mutation.Clear,
+			)
+			if changed && mutation.Clear {
+				s.dropBanResetConfirmation(authID)
+			}
+			continue
+		}
+		if mutation.Ban != nil {
+			banStore.set(authID, *mutation.Ban)
 		}
 	}
-	return bans, len(records) > 0, nil
 }
 
 func (s *schedulerRuntimeState) mergeWarmupEntriesLocked(entries map[string]warmupEntry) {
@@ -177,17 +229,40 @@ func (s *schedulerRuntimeState) persistWarmupLeaseOutcome(lease *warmupInstanceL
 	key := warmupKey(candidate.Snapshot.AuthID, candidate.Window.Class)
 	s.warmupMu.Lock()
 	entry, ok := s.warmups[key]
+	entries := make(map[string]warmupEntry)
+	if ok && !entry.AttemptedAt.IsZero() {
+		for siblingKey, sibling := range s.warmups {
+			if strings.TrimSpace(sibling.AuthID) == strings.TrimSpace(candidate.Snapshot.AuthID) &&
+				sibling.AttemptedAt.Equal(entry.AttemptedAt) {
+				entries[siblingKey] = sibling
+			}
+		}
+	}
 	s.warmupMu.Unlock()
 	if !ok || entry.AttemptedAt.IsZero() {
 		return nil
 	}
 	record := warmupOutcomeJournalRecord{
-		Version:    warmupOutcomeJournalVersion,
-		Key:        key,
-		Entry:      entry,
-		RecordedAt: time.Now().UTC(),
+		Version:            warmupOutcomeJournalVersion,
+		Key:                key,
+		Entry:              entry,
+		Entries:            entries,
+		RecoveryBannedAt:   candidate.RecoveryBannedAt,
+		RecoveryProbeStart: candidate.ProbeStartedAt,
+		RecordedAt:         time.Now().UTC(),
 	}
-	if ban, found := banStore.lookup(candidate.Snapshot.AuthID); found &&
+	if candidate.RecoveryProbe && !candidate.RecoveryBannedAt.IsZero() && !candidate.ProbeStartedAt.IsZero() {
+		if ban, found := banStore.lookup(candidate.Snapshot.AuthID); found {
+			copy := ban
+			record.Ban = &copy
+		} else if entry.Status >= 200 && entry.Status < 300 && entry.Error == "" && !entry.CompletedAt.IsZero() {
+			// A superseded generation cannot commit the shared state file after
+			// its successful half-open request clears quarantine. Carry an exact
+			// CAS tombstone so the active generation cannot resurrect the old ban
+			// or accidentally clear a newer 429.
+			record.BanCleared = true
+		}
+	} else if ban, found := banStore.lookup(candidate.Snapshot.AuthID); found &&
 		!ban.BannedAt.Before(entry.AttemptedAt.Add(-time.Second)) {
 		copy := ban
 		record.Ban = &copy

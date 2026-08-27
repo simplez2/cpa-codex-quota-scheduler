@@ -12,26 +12,25 @@ import (
 )
 
 func TestSerialSchedulerFollowsConfiguredWindowOrder(t *testing.T) {
+	resetBanStoreForTest()
+	t.Cleanup(resetBanStoreForTest)
 	now := time.Now()
 	cfg := defaultPluginConfig()
 	cfg.StatePath = ""
-	schedulerRuntime.mu.Lock()
-	schedulerRuntime.cfg = cfg
-	schedulerRuntime.serialActiveAuthID = ""
-	schedulerRuntime.mu.Unlock()
+	state := schedulerRuntimeState{
+		cfg: cfg,
+		quotas: map[string]quotaSnapshot{
+			"weekly":         {AuthID: "weekly", RefreshedAt: now, Windows: []quotaWindow{{Class: "weekly", UsedPercent: 1, Allowed: true}}},
+			"five-hour":      {AuthID: "five-hour", RefreshedAt: now, Windows: []quotaWindow{{Class: "5h", UsedPercent: 90, Allowed: true}}},
+			"monthly-credit": {AuthID: "monthly-credit", ResetCredits: 1, RefreshedAt: now, Windows: []quotaWindow{{Class: "monthly", UsedPercent: 1, Allowed: true}}},
+		},
+	}
 	request := pluginapi.SchedulerPickRequest{Candidates: []pluginapi.SchedulerAuthCandidate{
 		{ID: "weekly", Provider: providerCodex},
 		{ID: "five-hour", Provider: providerCodex},
 		{ID: "monthly-credit", Provider: providerCodex},
 	}}
-	schedulerRuntime.mu.Lock()
-	schedulerRuntime.quotas = map[string]quotaSnapshot{
-		"weekly":         {AuthID: "weekly", RefreshedAt: now, Windows: []quotaWindow{{Class: "weekly", UsedPercent: 1, Allowed: true}}},
-		"five-hour":      {AuthID: "five-hour", RefreshedAt: now, Windows: []quotaWindow{{Class: "5h", UsedPercent: 90, Allowed: true}}},
-		"monthly-credit": {AuthID: "monthly-credit", ResetCredits: 1, RefreshedAt: now, Windows: []quotaWindow{{Class: "monthly", UsedPercent: 1, Allowed: true}}},
-	}
-	schedulerRuntime.mu.Unlock()
-	got, err := schedulerRuntime.schedulerPick(request)
+	got, err := state.schedulerPick(request)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -41,14 +40,13 @@ func TestSerialSchedulerFollowsConfiguredWindowOrder(t *testing.T) {
 }
 
 func TestSchedulerFallsBackWhenQuotaIsStale(t *testing.T) {
+	resetBanStoreForTest()
+	t.Cleanup(resetBanStoreForTest)
 	cfg := defaultPluginConfig()
 	cfg.SchedulerMode = "legacy"
 	cfg.StatePath = ""
-	schedulerRuntime.mu.Lock()
-	schedulerRuntime.cfg = cfg
-	schedulerRuntime.quotas = map[string]quotaSnapshot{}
-	schedulerRuntime.mu.Unlock()
-	got, err := schedulerRuntime.schedulerPick(pluginapi.SchedulerPickRequest{Candidates: []pluginapi.SchedulerAuthCandidate{{ID: "a", Provider: providerCodex}}})
+	state := schedulerRuntimeState{cfg: cfg, quotas: map[string]quotaSnapshot{}}
+	got, err := state.schedulerPick(pluginapi.SchedulerPickRequest{Candidates: []pluginapi.SchedulerAuthCandidate{{ID: "a", Provider: providerCodex}}})
 	if err != nil {
 		t.Fatal(err)
 	}

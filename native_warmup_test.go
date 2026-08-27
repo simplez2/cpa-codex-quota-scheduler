@@ -46,6 +46,114 @@ func TestWarmupNonceSelectsExactAuthOnce(t *testing.T) {
 	}
 }
 
+func TestRecoveryWarmupNonceSelectsOnlyOwnedHalfOpenAuth(t *testing.T) {
+	resetBanStoreForTest()
+	t.Cleanup(resetBanStoreForTest)
+	now := time.Now()
+	banStore.set("target", banEntry{
+		ResetAt:  now.Add(-time.Minute),
+		BannedAt: now.Add(-2 * time.Hour),
+		Window:   "5h",
+		Kind:     banKindQuota,
+		Phase:    banPhaseCooldown,
+	})
+	allowed, started := banStore.tryStartProbe("target", now, 10*time.Minute)
+	if !allowed || !started {
+		t.Fatal("failed to reserve the recovery half-open probe")
+	}
+
+	state := schedulerRuntimeState{
+		cfg:          defaultPluginConfig(),
+		warmupLeases: make(map[string]warmupLease),
+	}
+	entry, ok := banStore.lookup("target")
+	if !ok {
+		t.Fatal("half-open recovery entry disappeared")
+	}
+	nonce, err := state.registerRecoveryWarmupLease("target", entry.BannedAt, entry.ProbeStartedAt, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := state.schedulerPick(warmupSchedulerRequest(nonce, "other", "target"))
+	if err != nil || !response.Handled || response.AuthID != "target" {
+		t.Fatalf("recovery warmup pick = %#v, err=%v; want the owned half-open auth", response, err)
+	}
+
+	normalNonce, err := state.registerWarmupLease("target", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err = state.schedulerPick(warmupSchedulerRequest(normalNonce, "target"))
+	if err == nil || response.Handled {
+		t.Fatalf("ordinary warmup bypassed half-open quarantine: response=%#v err=%v", response, err)
+	}
+}
+
+func TestRecoveryWarmupNonceRejectsDifferentHalfOpenGeneration(t *testing.T) {
+	resetBanStoreForTest()
+	t.Cleanup(resetBanStoreForTest)
+	now := time.Now()
+	banStore.set("target", banEntry{
+		ResetAt:  now.Add(-time.Minute),
+		BannedAt: now.Add(-2 * time.Hour),
+		Window:   "5h",
+		Kind:     banKindQuota,
+		Phase:    banPhaseCooldown,
+	})
+	allowed, started := banStore.tryStartProbe("target", now, 10*time.Minute)
+	if !allowed || !started {
+		t.Fatal("failed to reserve the current half-open probe")
+	}
+
+	state := schedulerRuntimeState{
+		cfg:          defaultPluginConfig(),
+		warmupLeases: make(map[string]warmupLease),
+	}
+	entry, ok := banStore.lookup("target")
+	if !ok {
+		t.Fatal("half-open recovery entry disappeared")
+	}
+	staleNonce, err := state.registerRecoveryWarmupLease("target", entry.BannedAt, now.Add(500*time.Millisecond), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := state.schedulerPick(warmupSchedulerRequest(staleNonce, "target"))
+	if err == nil || response.Handled {
+		t.Fatalf("mismatched recovery generation selected quarantined auth: response=%#v err=%v", response, err)
+	}
+	if _, err := state.registerRecoveryWarmupLease("target", time.Time{}, time.Time{}, now); err == nil {
+		t.Fatal("recovery lease accepted an incomplete identity")
+	}
+}
+
+func TestRecoveryWarmupNonceRequiresLiveHalfOpenBan(t *testing.T) {
+	resetBanStoreForTest()
+	t.Cleanup(resetBanStoreForTest)
+	now := time.Now()
+	banStore.set("target", banEntry{
+		ResetAt: now.Add(-time.Minute), BannedAt: now.Add(-2 * time.Hour),
+		Window: "5h", Kind: banKindQuota, Phase: banPhaseCooldown,
+	})
+	allowed, started := banStore.tryStartProbe("target", now, 10*time.Minute)
+	if !allowed || !started {
+		t.Fatal("failed to reserve the recovery half-open probe")
+	}
+	entry, ok := banStore.lookup("target")
+	if !ok {
+		t.Fatal("half-open recovery entry disappeared")
+	}
+	state := schedulerRuntimeState{cfg: defaultPluginConfig(), warmupLeases: make(map[string]warmupLease)}
+	nonce, err := state.registerRecoveryWarmupLease("target", entry.BannedAt, entry.ProbeStartedAt, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	banStore.clear("target")
+	response, err := state.schedulerPick(warmupSchedulerRequest(nonce, "target"))
+	if err == nil || response.Handled {
+		t.Fatalf("stale recovery nonce selected an already-cleared auth: response=%#v err=%v", response, err)
+	}
+}
+
 func TestWarmupFakeNonceIsRejectedWithoutFallback(t *testing.T) {
 	resetBanStoreForTest()
 	state := schedulerRuntimeState{

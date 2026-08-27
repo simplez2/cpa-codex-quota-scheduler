@@ -20,7 +20,7 @@
 | Git tag / GitHub Release | 对外正式发布版本。 |
 | Draft PR | 尚未发布、供审查的功能分支。 |
 
-当前源码与 registry 为 v0.1.20。正式发布时必须同时校验 pluginVersion、registry、tag、资产名和 Release 说明；未生成匹配 Release 资产前，只能称为测试构建。
+当前源码与 registry 为 v0.1.26。正式发布时必须同时校验 pluginVersion、registry、tag、资产名和 Release 说明；未生成匹配 Release 资产前，只能称为测试构建。
 
 ## 3. 推荐生产挂载
 
@@ -140,6 +140,8 @@ v0.1.19 把锁附着在 `state.json.generation` 本身；v0.1.20 改为稳定的
 5. 定向 Keeper refresh 或后续常规刷新得到新 reset anchor；
 6. outcome 变为 confirmed/activated，且设置 suppress；
 7. 普通流量主账号未变化。
+
+若候选同时处于已到期的权威 quota cooldown，预热会成为唯一的 half-open 恢复 probe。验收还必须确认：日志只出现一次 `recovery warmup half-open probe admitted`；发出请求前 auth binding 与 probe identity 仍完全匹配；成功只清除该旧 ban；新 429 或新 probe 不被旧 generation 的完成结果覆盖；5h 与同次启动的 weekly/monthly sibling outcome 一起持久化，热替换后不再重复请求。
 
 ## 7. 日常巡检
 
