@@ -2,7 +2,7 @@
 
 Standalone CPA plugin for balanced concurrent or serial Codex account selection, native quota polling,
 5h/weekly/monthly windows, persistent 429 quarantine and optional warmup.
-Source version: **0.3.0**. Local builds are not a published release.
+Source version: **0.3.1**. Local builds are not a published release.
 
 ## CPA dashboard
 
@@ -159,10 +159,18 @@ restores the earlier session continuation past a soft handoff.
 
 Plan priors default to `team_standard`. `plus` and `team_standard` use 1;
 `pro_5x` and `team_premium` use 5; `pro_20x` uses 20. Set per-auth overrides in
-`quota_account_plans`. Ambiguous native plan names are not guessed. Multipliers
-only compare 5h available capacity within the same 5% weekly budget band: multiplying them
-into the weekly score would prematurely exhaust large accounts. They do not
-establish fixed weekly capacity. See the official sources, experiments and
+`quota_account_plans` (highest priority). Otherwise the existing CPA quota poll
+automatically maps `team` to Standard (1x), `self_serve_business_prolite` to
+Premium (5x), and `plus` to Plus (1x). Missing usage metadata falls back to CPA
+`id_token.plan_type`; unknown or stale labels use `quota_default_plan`. Native
+`business`, usage-based plans and ambiguous `pro` never imply a fixed tier.
+The panel shows the raw upstream SKU, observation source and override status.
+See [Codex SKU display mapping](https://github.com/openai/codex/blob/d6489472f3c15e87d2d7763a5fde033545c530f8/codex-rs/tui/src/status/helpers.rs#L99)
+and [official pricing](https://developers.openai.com/codex/pricing/). In serial
+mode these multipliers compare 5h capacity within a 5% weekly budget band. In
+balanced mode they scale each account's share, constrained by both remaining
+5h quota and normalized weekly budget. They do not establish fixed weekly
+capacity. See the official sources, experiments and
 limitations in [the allocation study](research/ALLOCATION_RESEARCH.zh-CN.md).
 
 Polling adds no model requests. An entire refresh, including inventory, has a
@@ -181,9 +189,17 @@ predict demand or establish equal absolute capacity across different plans.
 require two strictly newer observations. Generation ownership and warmup leases
 prevent superseded instances from committing state or running model warmups.
 
-Optional warmup defaults to native CPA HostModel and is disabled by default.
-Explicit legacy management warmup remains optional and is never required for
-quota polling. A native warmup callback must finish before its worker can exit.
+Optional warmup is disabled by default. It uses only CPA's native
+`/v0/management/api-call` with an exact `auth_index` and `$TOKEN$` substitution.
+The upstream `/backend-api/codex/responses` path is built in. It reuses the quota
+connection settings; no additional plugin, model-router pin, credential-note
+marker, or configurable warmup endpoint is required. The call has a 45s bound.
+Removed `warmup_execution_mode` and `warmup_sidecar_url` keys are ignored when
+reading older configurations and no longer appear in the panel.
+Local failures before dispatch use ordinary backoff and are labeled “not sent”.
+Timeouts and truncated responses retain uncertain-outcome suppression. An
+operator can reschedule an exact failed account in the panel; this preserves
+the global attempt ledger and does not clear account bans or successful cycles.
 
 Warmup uses conservative admission controls, separate from client failover:
 

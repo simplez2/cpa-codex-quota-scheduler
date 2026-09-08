@@ -36,7 +36,6 @@ func TestReconcileExternalResetClearsOnlyAfterTwoFreshSnapshots(t *testing.T) {
 	state := schedulerRuntimeState{
 		cfg:                   defaultPluginConfig(),
 		warmups:               make(map[string]warmupEntry),
-		warmupLeases:          make(map[string]warmupLease),
 		banResetConfirmations: make(map[string]banResetConfirmation),
 	}
 	state.cfg.StatePath = ""
@@ -75,8 +74,7 @@ func TestReconcileExternalResetClearsObsoleteMonthlyBanAfterWeeklyOnlyPlanChange
 	resetBanStoreForTest()
 	now := time.Date(2026, time.August, 12, 10, 0, 0, 0, time.UTC)
 	state := schedulerRuntimeState{
-		cfg: defaultPluginConfig(), warmups: make(map[string]warmupEntry),
-		warmupLeases: make(map[string]warmupLease), banResetConfirmations: make(map[string]banResetConfirmation),
+		cfg: defaultPluginConfig(), warmups: make(map[string]warmupEntry), banResetConfirmations: make(map[string]banResetConfirmation),
 	}
 	state.cfg.StatePath = ""
 	state.cfg.StaleAfter = time.Hour
@@ -118,8 +116,7 @@ func TestPlatformResetRepairsMisclassifiedCooldownAndAdmitsSameCycleWarmup(t *te
 	location := time.FixedZone("UTC+8", 8*60*60)
 	now := time.Date(2026, time.August, 12, 18, 50, 30, 0, location)
 	state := schedulerRuntimeState{
-		cfg: defaultPluginConfig(), warmups: make(map[string]warmupEntry),
-		warmupLeases: make(map[string]warmupLease), banResetConfirmations: make(map[string]banResetConfirmation),
+		cfg: defaultPluginConfig(), warmups: make(map[string]warmupEntry), banResetConfirmations: make(map[string]banResetConfirmation),
 		quotas: make(map[string]quotaSnapshot),
 	}
 	state.cfg.StatePath = ""
@@ -199,8 +196,7 @@ func TestReconcileExternalResetWindowSetReplacementFailsClosed(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			resetBanStoreForTest()
 			state := schedulerRuntimeState{
-				cfg: defaultPluginConfig(), warmups: make(map[string]warmupEntry),
-				warmupLeases: make(map[string]warmupLease), banResetConfirmations: make(map[string]banResetConfirmation),
+				cfg: defaultPluginConfig(), warmups: make(map[string]warmupEntry), banResetConfirmations: make(map[string]banResetConfirmation),
 			}
 			state.cfg.StatePath = ""
 			state.cfg.StaleAfter = time.Hour
@@ -230,7 +226,6 @@ func TestReconcileExternalResetNeverClearsProbation(t *testing.T) {
 	state := schedulerRuntimeState{
 		cfg:                   defaultPluginConfig(),
 		warmups:               make(map[string]warmupEntry),
-		warmupLeases:          make(map[string]warmupLease),
 		banResetConfirmations: make(map[string]banResetConfirmation),
 	}
 	state.cfg.StatePath = ""
@@ -263,8 +258,7 @@ func TestReconcileExternalResetRequiresDistinctIncreasingSnapshots(t *testing.T)
 	resetBanStoreForTest()
 	now := time.Now().UTC()
 	state := schedulerRuntimeState{
-		cfg: defaultPluginConfig(), warmups: make(map[string]warmupEntry),
-		warmupLeases: make(map[string]warmupLease), banResetConfirmations: make(map[string]banResetConfirmation),
+		cfg: defaultPluginConfig(), warmups: make(map[string]warmupEntry), banResetConfirmations: make(map[string]banResetConfirmation),
 	}
 	state.cfg.StatePath = ""
 	state.cfg.StaleAfter = time.Hour
@@ -285,8 +279,7 @@ func TestReconcileExternalResetDoesNotCombineExpiredFirstConfirmation(t *testing
 	resetBanStoreForTest()
 	now := time.Now().UTC().Truncate(time.Second)
 	state := schedulerRuntimeState{
-		cfg: defaultPluginConfig(), warmups: make(map[string]warmupEntry),
-		warmupLeases: make(map[string]warmupLease), banResetConfirmations: make(map[string]banResetConfirmation),
+		cfg: defaultPluginConfig(), warmups: make(map[string]warmupEntry), banResetConfirmations: make(map[string]banResetConfirmation),
 	}
 	state.cfg.StatePath = ""
 	state.cfg.StaleAfter = 15 * time.Minute
@@ -337,8 +330,7 @@ func TestReconcileExternalResetRejectsUnsafeSnapshotsAndHalfOpen(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			resetBanStoreForTest()
 			state := schedulerRuntimeState{
-				cfg: defaultPluginConfig(), warmups: make(map[string]warmupEntry),
-				warmupLeases: make(map[string]warmupLease), banResetConfirmations: make(map[string]banResetConfirmation),
+				cfg: defaultPluginConfig(), warmups: make(map[string]warmupEntry), banResetConfirmations: make(map[string]banResetConfirmation),
 			}
 			state.cfg.StatePath = ""
 			state.cfg.StaleAfter = 3 * time.Hour
@@ -356,8 +348,7 @@ func TestReconcileExternalResetRejectsUnsafeSnapshotsAndHalfOpen(t *testing.T) {
 
 	resetBanStoreForTest()
 	state := schedulerRuntimeState{
-		cfg: defaultPluginConfig(), warmups: make(map[string]warmupEntry),
-		warmupLeases: make(map[string]warmupLease), banResetConfirmations: make(map[string]banResetConfirmation),
+		cfg: defaultPluginConfig(), warmups: make(map[string]warmupEntry), banResetConfirmations: make(map[string]banResetConfirmation),
 	}
 	state.cfg.StatePath = ""
 	state.cfg.StaleAfter = time.Hour
@@ -378,8 +369,7 @@ func TestReconcileExternalResetDoesNotCountReusedWindowTwice(t *testing.T) {
 	resetBanStoreForTest()
 	now := time.Now().UTC()
 	state := schedulerRuntimeState{
-		cfg: defaultPluginConfig(), warmups: make(map[string]warmupEntry),
-		warmupLeases: make(map[string]warmupLease), banResetConfirmations: make(map[string]banResetConfirmation),
+		cfg: defaultPluginConfig(), warmups: make(map[string]warmupEntry), banResetConfirmations: make(map[string]banResetConfirmation),
 	}
 	state.cfg.StatePath = ""
 	state.cfg.StaleAfter = time.Hour
@@ -406,8 +396,7 @@ func TestReconcileExternalResetClearsHistoricalMonthlyBanAfterNewCycleHasUsage(t
 	resetBanStoreForTest()
 	now := time.Date(2026, time.August, 9, 16, 0, 0, 0, time.UTC)
 	state := schedulerRuntimeState{
-		cfg: defaultPluginConfig(), warmups: make(map[string]warmupEntry),
-		warmupLeases: make(map[string]warmupLease), banResetConfirmations: make(map[string]banResetConfirmation),
+		cfg: defaultPluginConfig(), warmups: make(map[string]warmupEntry), banResetConfirmations: make(map[string]banResetConfirmation),
 		quotas: make(map[string]quotaSnapshot),
 	}
 	state.cfg.StatePath = ""
@@ -449,8 +438,7 @@ func TestReconcileExternalResetPreservesCurrentWeeklyLimitAndIgnoresMonthlyAncho
 	resetBanStoreForTest()
 	now := time.Date(2026, time.August, 9, 16, 0, 0, 0, time.UTC)
 	state := schedulerRuntimeState{
-		cfg: defaultPluginConfig(), warmups: make(map[string]warmupEntry),
-		warmupLeases: make(map[string]warmupLease), banResetConfirmations: make(map[string]banResetConfirmation),
+		cfg: defaultPluginConfig(), warmups: make(map[string]warmupEntry), banResetConfirmations: make(map[string]banResetConfirmation),
 	}
 	state.cfg.StatePath = ""
 	state.cfg.StaleAfter = time.Hour
@@ -483,8 +471,7 @@ func TestReconcileExternalResetFailsClosedForNearEndMisclassifiedWeeklyBan(t *te
 	resetBanStoreForTest()
 	now := time.Now().UTC().Truncate(time.Second)
 	state := schedulerRuntimeState{
-		cfg: defaultPluginConfig(), warmups: make(map[string]warmupEntry),
-		warmupLeases: make(map[string]warmupLease), banResetConfirmations: make(map[string]banResetConfirmation),
+		cfg: defaultPluginConfig(), warmups: make(map[string]warmupEntry), banResetConfirmations: make(map[string]banResetConfirmation),
 	}
 	state.cfg.StatePath = ""
 	state.cfg.StaleAfter = time.Hour
@@ -526,8 +513,7 @@ func TestReconcileExternalResetDoesNotUseMonthlyAnchorForRealFiveHourBan(t *test
 	resetBanStoreForTest()
 	now := time.Now().UTC()
 	state := schedulerRuntimeState{
-		cfg: defaultPluginConfig(), warmups: make(map[string]warmupEntry),
-		warmupLeases: make(map[string]warmupLease), banResetConfirmations: make(map[string]banResetConfirmation),
+		cfg: defaultPluginConfig(), warmups: make(map[string]warmupEntry), banResetConfirmations: make(map[string]banResetConfirmation),
 	}
 	state.cfg.StatePath = ""
 	state.cfg.StaleAfter = time.Hour
@@ -557,8 +543,7 @@ func TestReconcileExternalResetDefersRecentWarmup429(t *testing.T) {
 		cfg: defaultPluginConfig(),
 		warmups: map[string]warmupEntry{
 			warmupKey("acct", "monthly"): {AuthID: "acct", Window: "monthly", AttemptedAt: now.Add(-5 * time.Minute), Status: statusTooManyRequests, Error: "http_429"},
-		},
-		warmupLeases: make(map[string]warmupLease), banResetConfirmations: make(map[string]banResetConfirmation),
+		}, banResetConfirmations: make(map[string]banResetConfirmation),
 	}
 	state.cfg.StatePath = ""
 	state.cfg.StaleAfter = time.Hour
@@ -583,8 +568,7 @@ func TestBanResetConfirmationSurvivesStateReload(t *testing.T) {
 	now := time.Now().UTC()
 	path := filepath.Join(t.TempDir(), "state.json")
 	state := schedulerRuntimeState{
-		cfg: defaultPluginConfig(), warmups: make(map[string]warmupEntry),
-		warmupLeases: make(map[string]warmupLease), banResetConfirmations: make(map[string]banResetConfirmation),
+		cfg: defaultPluginConfig(), warmups: make(map[string]warmupEntry), banResetConfirmations: make(map[string]banResetConfirmation),
 	}
 	state.cfg.StatePath = path
 	state.cfg.StaleAfter = time.Hour
@@ -608,7 +592,7 @@ func TestBanResetConfirmationSurvivesStateReload(t *testing.T) {
 		t.Fatalf("persisted confirmation = %#v ok=%v", confirmation, ok)
 	}
 	reloaded := schedulerRuntimeState{
-		cfg: state.cfg, warmups: make(map[string]warmupEntry), warmupLeases: make(map[string]warmupLease),
+		cfg: state.cfg, warmups: make(map[string]warmupEntry),
 		banResetConfirmations: persisted.BanResetConfirmations,
 	}
 	reloaded.reconcileExternallyResetQuotaBans(map[string]quotaSnapshot{"acct": fullResetSnapshot("acct", now.Add(-time.Minute))}, now)
@@ -621,8 +605,7 @@ func TestExternalResetClearMakesAccountImmediatelyWarmupEligible(t *testing.T) {
 	resetBanStoreForTest()
 	now := time.Now().UTC()
 	state := schedulerRuntimeState{
-		cfg: defaultPluginConfig(), warmups: make(map[string]warmupEntry),
-		warmupLeases: make(map[string]warmupLease), banResetConfirmations: make(map[string]banResetConfirmation),
+		cfg: defaultPluginConfig(), warmups: make(map[string]warmupEntry), banResetConfirmations: make(map[string]banResetConfirmation),
 		quotas: make(map[string]quotaSnapshot),
 	}
 	state.cfg.StatePath = ""

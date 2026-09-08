@@ -138,48 +138,29 @@ func TestCPAAuthFilesEndpoint(t *testing.T) {
 	}
 }
 
-func TestTrustedWarmupCredentialNote(t *testing.T) {
-	tests := map[string]bool{
-		"Agent Identity via sidecar":             true,
-		"Codex Access Token via sidecar":         true,
-		"Agent Identity via gateway":             true,
-		"Codex Access Token via gateway":         true,
-		"  cOdEx AcCeSs ToKeN vIa GaTeWaY\t\r\n": true,
-		"":                                       false,
-		"via sidecar":                            false,
-		"via gateway":                            false,
-		"Official OAuth":                         false,
-		"Agent Identity via gateway extra":       false,
-		"prefix Codex Access Token via sidecar":  false,
-	}
-	for note, want := range tests {
-		if got := trustedWarmupCredentialNote(note); got != want {
-			t.Errorf("trustedWarmupCredentialNote(%q)=%v want %v", note, got, want)
-		}
-	}
-}
-
-func TestWarmupEligibleAuthsRequiresActiveSidecarCredential(t *testing.T) {
+func TestWarmupEligibleAuthsRequiresActiveCPACredential(t *testing.T) {
 	files := []cpaAuthFileEntry{
-		{ID: "sidecar", AuthIndex: "idx-sidecar", Provider: "codex", Status: "active", Note: "Codex Access Token via sidecar"},
-		{ID: "gateway", AuthIndex: "idx-gateway", Provider: "codex", Status: "active", Note: "Agent Identity via gateway"},
+		{ID: "imported", AuthIndex: "idx-imported", Provider: "codex", Status: "active", Note: "imported account"},
+		{ID: "gateway", AuthIndex: "idx-gateway", Provider: "codex", Status: "active", Note: "imported account"},
 		{ID: "native", AuthIndex: "idx-native", Provider: "codex", Status: "active", Note: "Official OAuth"},
-		{ID: "disabled", AuthIndex: "idx-disabled", Provider: "codex", Status: "disabled", Disabled: true, Note: "Agent Identity via sidecar"},
-		{ID: "third-party", AuthIndex: "idx-third", Provider: "openai", Status: "active", Note: "via sidecar"},
+		{ID: "disabled", AuthIndex: "idx-disabled", Provider: "codex", Status: "disabled", Disabled: true, Note: "imported account"},
+		{ID: "third-party", AuthIndex: "idx-third", Provider: "openai", Status: "active", Note: "unrelated note"},
 	}
 	got := warmupEligibleAuths(files)
 	wantBindings := map[string]warmupAuthBinding{
-		"sidecar":     {AuthID: "sidecar", AuthIndex: "idx-sidecar"},
-		"idx-sidecar": {AuthID: "sidecar", AuthIndex: "idx-sidecar"},
-		"gateway":     {AuthID: "gateway", AuthIndex: "idx-gateway"},
-		"idx-gateway": {AuthID: "gateway", AuthIndex: "idx-gateway"},
+		"imported":     {AuthID: "imported", AuthIndex: "idx-imported"},
+		"idx-imported": {AuthID: "imported", AuthIndex: "idx-imported"},
+		"gateway":      {AuthID: "gateway", AuthIndex: "idx-gateway"},
+		"idx-gateway":  {AuthID: "gateway", AuthIndex: "idx-gateway"},
+		"native":       {AuthID: "native", AuthIndex: "idx-native"},
+		"idx-native":   {AuthID: "native", AuthIndex: "idx-native"},
 	}
 	for key, want := range wantBindings {
 		if binding, ok := got[key]; !ok || binding != want {
-			t.Fatalf("active Identity binding for %q = %#v, ok=%v want %#v", key, binding, ok, want)
+			t.Fatalf("active CPA binding for %q = %#v, ok=%v want %#v", key, binding, ok, want)
 		}
 	}
-	for _, key := range []string{"native", "idx-native", "disabled", "idx-disabled", "third-party", "idx-third"} {
+	for _, key := range []string{"disabled", "idx-disabled", "third-party", "idx-third"} {
 		if _, ok := got[key]; ok {
 			t.Fatalf("%q must not be warmup eligible", key)
 		}
@@ -188,25 +169,24 @@ func TestWarmupEligibleAuthsRequiresActiveSidecarCredential(t *testing.T) {
 
 func TestWarmupEligibilityDiagnosticsExplainRejectedAuths(t *testing.T) {
 	files := []cpaAuthFileEntry{
-		{ID: "sidecar", AuthIndex: "idx-sidecar", Provider: "codex", Status: "active", Note: "Codex Access Token via sidecar"},
+		{ID: "imported", AuthIndex: "idx-imported", Provider: "codex", Status: "active", Note: "imported account"},
 		{ID: "oauth", AuthIndex: "idx-oauth", Provider: "codex", Status: "active", Note: "Official OAuth"},
-		{ID: "disabled", AuthIndex: "idx-disabled", Provider: "codex", Disabled: true, Note: "via sidecar"},
-		{ID: "unavailable", AuthIndex: "idx-unavailable", Provider: "codex", Unavailable: true, Note: "via sidecar"},
-		{ID: "inactive", AuthIndex: "idx-inactive", Provider: "codex", Status: "error", Note: "via sidecar"},
-		{ID: "missing-index", Provider: "codex", Status: "active", Note: "via sidecar"},
-		{ID: "other", AuthIndex: "idx-other", Provider: "openai", Status: "active", Note: "via sidecar"},
+		{ID: "disabled", AuthIndex: "idx-disabled", Provider: "codex", Disabled: true, Note: "unrelated note"},
+		{ID: "unavailable", AuthIndex: "idx-unavailable", Provider: "codex", Unavailable: true, Note: "unrelated note"},
+		{ID: "inactive", AuthIndex: "idx-inactive", Provider: "codex", Status: "error", Note: "unrelated note"},
+		{ID: "missing-index", Provider: "codex", Status: "active", Note: "unrelated note"},
+		{ID: "other", AuthIndex: "idx-other", Provider: "openai", Status: "active", Note: "unrelated note"},
 	}
 	eligible, stats := warmupEligibleAuthsWithStats(files)
-	if len(eligible) != 2 || stats.Seen != len(files) || stats.Eligible != 1 {
+	if len(eligible) != 4 || stats.Seen != len(files) || stats.Eligible != 2 {
 		t.Fatalf("eligible=%#v stats=%#v", eligible, stats)
 	}
 	wantRejected := map[string]int{
-		"missing_sidecar_marker": 1,
-		"disabled":               1,
-		"unavailable":            1,
-		"inactive_status":        1,
-		"missing_auth_index":     1,
-		"provider_mismatch":      1,
+		"disabled":           1,
+		"unavailable":        1,
+		"inactive_status":    1,
+		"missing_auth_index": 1,
+		"provider_mismatch":  1,
 	}
 	for reason, want := range wantRejected {
 		if got := stats.Rejected[reason]; got != want {
@@ -215,25 +195,9 @@ func TestWarmupEligibilityDiagnosticsExplainRejectedAuths(t *testing.T) {
 	}
 }
 
-func TestHostAuthDiscoveryRequiresSidecarMarkerOnlyForManagement(t *testing.T) {
-	files := []pluginapi.HostAuthFileEntry{
-		{ID: "sidecar", AuthIndex: "idx-sidecar", Provider: "codex", Status: "active", Note: "Agent Identity via sidecar"},
-		{ID: "gateway", AuthIndex: "idx-gateway", Provider: "codex", Status: "active", Note: "Codex Access Token via gateway"},
-		{ID: "oauth", AuthIndex: "idx-oauth", Provider: "codex", Status: "active", Note: "Official OAuth"},
-	}
-	management, stats := warmupEligibleHostAuthsWithStats(files, true)
-	if _, ok := management["sidecar"]; !ok || stats.Eligible != 2 || stats.Rejected["missing_sidecar_marker"] != 1 {
-		t.Fatalf("management auth discovery = %#v stats=%#v", management, stats)
-	}
-	native, nativeStats := warmupEligibleHostAuthsWithStats(files, false)
-	if _, ok := native["oauth"]; !ok || nativeStats.Eligible != 3 {
-		t.Fatalf("native auth discovery = %#v stats=%#v", native, nativeStats)
-	}
-}
-
 func TestQuotaRefreshAuthIndexFiltersSupportPATAndOAuth(t *testing.T) {
 	management := activeCodexManagementAuthIndexes([]cpaAuthFileEntry{
-		{AuthIndex: "idx-pat", Provider: "codex", Status: "active", Note: "Agent Identity via sidecar"},
+		{AuthIndex: "idx-pat", Provider: "codex", Status: "active", Note: "imported account"},
 		{AuthIndex: "idx-oauth", Type: "codex", Status: "active", Note: "Official OAuth"},
 		{AuthIndex: "idx-disabled", Provider: "codex", Disabled: true},
 		{AuthIndex: "idx-unavailable", Provider: "codex", Unavailable: true},
@@ -251,7 +215,7 @@ func TestQuotaRefreshAuthIndexFiltersSupportPATAndOAuth(t *testing.T) {
 	}
 
 	host := activeCodexHostAuthIndexes([]pluginapi.HostAuthFileEntry{
-		{AuthIndex: "idx-pat", Provider: "codex", Status: "active", Note: "Agent Identity via sidecar"},
+		{AuthIndex: "idx-pat", Provider: "codex", Status: "active", Note: "imported account"},
 		{AuthIndex: "idx-oauth", Type: "codex", Status: "active", Note: "Official OAuth"},
 		{AuthIndex: "idx-disabled", Provider: "codex", Disabled: true},
 		{AuthIndex: "idx-unavailable", Provider: "codex", Unavailable: true},
@@ -267,7 +231,7 @@ func TestQuotaRefreshAuthIndexFiltersSupportPATAndOAuth(t *testing.T) {
 	}
 }
 
-func TestNativeWarmupDoesNotFallBackToManagementAuthDiscovery(t *testing.T) {
+func TestWarmupDiscoversAuthsThroughCPA(t *testing.T) {
 	hits := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits++
@@ -276,34 +240,32 @@ func TestNativeWarmupDoesNotFallBackToManagementAuthDiscovery(t *testing.T) {
 	}))
 	defer server.Close()
 	cfg := defaultPluginConfig()
-	cfg.WarmupExecutionMode = "management"
-	cfg.WarmupExecutionMode = "native"
+
 	cfg.CPAManagementURL = server.URL + "/v0/management/api-call"
 	cfg.CPAManagementKeyFile = filepath.Join(t.TempDir(), "management-key")
 	if err := os.WriteFile(cfg.CPAManagementKeyFile, []byte("test-key"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := (&schedulerRuntimeState{}).cpaWarmupEligibleAuths(context.Background(), cfg); err == nil {
-		t.Fatal("native mode without Host API must fail closed")
+	if _, err := (&schedulerRuntimeState{}).cpaWarmupEligibleAuths(context.Background(), cfg); err != nil {
+		t.Fatal(err)
 	}
-	if hits != 0 {
-		t.Fatalf("native auth discovery silently fell back to management: hits=%d", hits)
+	if hits != 1 {
+		t.Fatalf("CPA auth discovery hits=%d", hits)
 	}
 }
 
-func TestManagementWarmupUsesOnlyActiveIdentityProxyAuths(t *testing.T) {
+func TestCPAWarmupDoesNotDependOnCredentialNotes(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v0/management/auth-files" {
 			http.NotFound(w, r)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"files":[{"id":"gateway","auth_index":"idx-gateway","provider":"codex","status":"active","note":"Codex Access Token via gateway"},{"id":"native","auth_index":"idx-native","provider":"codex","status":"active","note":"official oauth"}]}`))
+		_, _ = w.Write([]byte(`{"files":[{"id":"gateway","auth_index":"idx-gateway","provider":"codex","status":"active","note":"imported account"},{"id":"native","auth_index":"idx-native","provider":"codex","status":"active","note":"official oauth"}]}`))
 	}))
 	defer server.Close()
 	cfg := defaultPluginConfig()
-	cfg.WarmupExecutionMode = "management"
-	cfg.WarmupExecutionMode = "management"
+
 	cfg.CPAManagementURL = server.URL + "/v0/management/api-call"
 	cfg.CPAManagementKeyFile = filepath.Join(t.TempDir(), "management-key")
 	if err := os.WriteFile(cfg.CPAManagementKeyFile, []byte("test-key"), 0600); err != nil {
@@ -316,8 +278,8 @@ func TestManagementWarmupUsesOnlyActiveIdentityProxyAuths(t *testing.T) {
 	if binding, ok := eligible["gateway"]; !ok || binding.AuthIndex != "idx-gateway" {
 		t.Fatalf("gateway binding = %#v ok=%v", binding, ok)
 	}
-	if _, ok := eligible["native"]; ok {
-		t.Fatal("management warmup must not send an official native credential to the sidecar endpoint")
+	if _, ok := eligible["native"]; !ok {
+		t.Fatal("native credential was excluded")
 	}
 }
 
@@ -360,13 +322,13 @@ func TestManagementWarmupRevalidatesAuthBindingBeforeAPICall(t *testing.T) {
 	}))
 	defer server.Close()
 	cfg := defaultPluginConfig()
-	cfg.WarmupExecutionMode = "management"
+
 	cfg.CPAManagementURL = server.URL + "/v0/management/api-call"
 	cfg.CPAManagementKeyFile = keyPath
 	cfg.StatePath = ""
 	state := schedulerRuntimeState{cfg: cfg, warmups: make(map[string]warmupEntry)}
 	candidate := warmupCandidate{Snapshot: quotaSnapshot{AuthID: "acct", AuthIndex: "stale"}, Window: quotaWindow{Class: "5h", Allowed: true}}
-	state.executeManagementWarmup(context.Background(), cfg, candidate)
+	state.executeCPAWarmup(context.Background(), cfg, candidate)
 	if apiCalls != 0 {
 		t.Fatalf("stale auth binding reached api-call: calls=%d", apiCalls)
 	}
@@ -386,7 +348,7 @@ func TestManagementWarmupUsesMinimalResponsesRequest(t *testing.T) {
 		switch r.URL.Path {
 		case "/v0/management/auth-files":
 			_ = json.NewEncoder(w).Encode(map[string]any{"files": []map[string]any{{
-				"id": "acct", "auth_index": "current", "provider": "codex", "status": "active", "note": "Codex Access Token via sidecar",
+				"id": "acct", "auth_index": "current", "provider": "codex", "status": "active", "note": "imported account",
 			}}})
 		case "/v0/management/api-call":
 			var call cpaAPICallRequest
@@ -399,11 +361,11 @@ func TestManagementWarmupUsesMinimalResponsesRequest(t *testing.T) {
 			if call.Header["Accept"] != "text/event-stream" {
 				t.Errorf("Accept=%q", call.Header["Accept"])
 			}
-			if call.Header["X-OpenAI-Internal-Codex-Responses-Lite"] != "true" {
-				t.Errorf("responses-lite=%q", call.Header["X-OpenAI-Internal-Codex-Responses-Lite"])
+			if call.URL != cpaWarmupResponsesURL || call.Method != "POST" || call.Header["Authorization"] != "Bearer $TOKEN$" {
+				t.Errorf("unexpected CPA call: %#v", call)
 			}
-			if call.Header["Originator"] != "codex_cli_rs" || call.Header["X-Codex-Routing-Hint"] != "model=gpt-5.6-luna" {
-				t.Errorf("Codex headers=%#v", call.Header)
+			if call.Header["X-Codex-Routing-Hint"] != "" || call.Header["X-OpenAI-Internal-Codex-Responses-Lite"] != "" {
+				t.Error("non-native compatibility headers sent")
 			}
 			var payload map[string]any
 			if err := json.Unmarshal([]byte(call.Data), &payload); err != nil {
@@ -411,43 +373,10 @@ func TestManagementWarmupUsesMinimalResponsesRequest(t *testing.T) {
 			}
 			reasoning, _ := payload["reasoning"].(map[string]any)
 			input, _ := payload["input"].([]any)
-			var additionalTools map[string]any
-			var developerMessage map[string]any
-			var userMessage map[string]any
-			var developerContent []any
-			var userContent []any
-			var developerText map[string]any
-			var userText map[string]any
-			if len(input) == 3 {
-				additionalTools, _ = input[0].(map[string]any)
-				developerMessage, _ = input[1].(map[string]any)
-				userMessage, _ = input[2].(map[string]any)
-				developerContent, _ = developerMessage["content"].([]any)
-				userContent, _ = userMessage["content"].([]any)
+			if len(input) != 1 || payload["instructions"] != "Reply with OK only." || payload["stream"] != true || payload["store"] != false || reasoning["effort"] != "low" {
+				t.Errorf("unexpected native warmup payload: %#v", payload)
 			}
-			if len(developerContent) == 1 {
-				developerText, _ = developerContent[0].(map[string]any)
-			}
-			if len(userContent) == 1 {
-				userText, _ = userContent[0].(map[string]any)
-			}
-			additionalToolsList, additionalToolsOK := additionalTools["tools"].([]any)
-			_, hasTopLevelTools := payload["tools"]
-			include, includeOK := payload["include"].([]any)
-			textControls, _ := payload["text"].(map[string]any)
-			_, hasMaxOutputTokens := payload["max_output_tokens"]
-			if payload["store"] != false || payload["stream"] != true || payload["tool_choice"] != "auto" ||
-				payload["parallel_tool_calls"] != false || reasoning["effort"] != "low" || reasoning["context"] != "all_turns" ||
-				additionalTools["type"] != "additional_tools" || additionalTools["role"] != "developer" ||
-				!additionalToolsOK || len(additionalToolsList) != 0 || hasTopLevelTools ||
-				developerMessage["type"] != "message" || developerMessage["role"] != "developer" ||
-				developerText["type"] != "input_text" || developerText["text"] != "Reply briefly." ||
-				userMessage["type"] != "message" || userMessage["role"] != "user" ||
-				userText["type"] != "input_text" || userText["text"] != "hello" ||
-				!includeOK || len(include) != 1 || include[0] != "reasoning.encrypted_content" ||
-				textControls["verbosity"] != "low" || hasMaxOutputTokens {
-				t.Errorf("non-minimal warmup payload: %#v", payload)
-			}
+
 			_ = json.NewEncoder(w).Encode(cpaAPICallResponse{StatusCode: http.StatusOK, Body: `{"status":"completed"}`})
 		default:
 			http.NotFound(w, r)
@@ -455,13 +384,13 @@ func TestManagementWarmupUsesMinimalResponsesRequest(t *testing.T) {
 	}))
 	defer server.Close()
 	cfg := defaultPluginConfig()
-	cfg.WarmupExecutionMode = "management"
+
 	cfg.CPAManagementURL = server.URL + "/v0/management/api-call"
 	cfg.CPAManagementKeyFile = keyPath
 	cfg.StatePath = ""
 	state := schedulerRuntimeState{cfg: cfg, warmups: make(map[string]warmupEntry)}
 	candidate := warmupCandidate{Snapshot: quotaSnapshot{AuthID: "acct", AuthIndex: "current"}, Window: quotaWindow{Class: "5h", Allowed: true}}
-	state.executeManagementWarmup(context.Background(), cfg, candidate)
+	state.executeCPAWarmup(context.Background(), cfg, candidate)
 	entry := state.warmups[warmupKey("acct", "5h")]
 	if entry.Status != http.StatusOK || entry.Error != "" {
 		t.Fatalf("warmup outcome=%#v", entry)
@@ -1035,7 +964,7 @@ func TestFindWarmupCandidateSkipsQuarantinedAuth(t *testing.T) {
 	resetBanStoreForTest()
 	now := time.Now()
 	cfg := defaultPluginConfig()
-	cfg.WarmupExecutionMode = "management"
+
 	cfg.StatePath = ""
 	state := schedulerRuntimeState{
 		cfg: cfg,
@@ -1068,7 +997,7 @@ func TestFindWarmupCandidateRejectsCarriedStaleRecognizedWindow(t *testing.T) {
 	resetBanStoreForTest()
 	now := time.Now().UTC().Truncate(time.Second)
 	cfg := defaultPluginConfig()
-	cfg.WarmupExecutionMode = "management"
+
 	cfg.StatePath = ""
 	cfg.StaleAfter = 15 * time.Minute
 
@@ -1118,7 +1047,7 @@ func TestWarmupSnapshotFreshRequiresOwnObservationForEveryRecognizedWindow(t *te
 
 func TestExecuteWarmupRejectsUnsafeModelBeforeTransport(t *testing.T) {
 	cfg := defaultPluginConfig()
-	cfg.WarmupExecutionMode = "management"
+
 	cfg.StatePath = ""
 	cfg.CPAManagementURL = "http://127.0.0.1:1/transport-must-not-run"
 	cfg.WarmupModel = "gpt-safe\r\nX-Injected: true"
@@ -1148,15 +1077,15 @@ func TestWarmupHeaderless429EntersProbation(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		if r.URL.Path == "/auth-files" {
-			_, _ = w.Write([]byte(`{"files":[{"id":"acct","auth_index":"idx","provider":"codex","status":"active","note":"Agent Identity via sidecar"}]}`))
+			_, _ = w.Write([]byte(`{"files":[{"id":"acct","auth_index":"idx","provider":"codex","status":"active","note":"imported account"}]}`))
 			return
 		}
 		var request cpaAPICallRequest
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 			t.Errorf("decode api-call request: %v", err)
 		} else {
-			if request.Header["X-Codex-Routing-Hint"] != "model="+futureModel {
-				t.Errorf("routing hint = %q", request.Header["X-Codex-Routing-Hint"])
+			if request.URL != cpaWarmupResponsesURL {
+				t.Errorf("warmup endpoint = %q", request.URL)
 			}
 			var payload map[string]any
 			if err := json.Unmarshal([]byte(request.Data), &payload); err != nil {
@@ -1172,7 +1101,7 @@ func TestWarmupHeaderless429EntersProbation(t *testing.T) {
 	defer server.Close()
 
 	cfg := defaultPluginConfig()
-	cfg.WarmupExecutionMode = "management"
+
 	cfg.CPAManagementURL = server.URL
 	cfg.CPAManagementKeyFile = keyPath
 	cfg.StatePath = ""

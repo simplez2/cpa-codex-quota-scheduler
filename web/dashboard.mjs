@@ -6,6 +6,7 @@ const base = resourceBase(location.href);
 const endpoint = base + '/v0/management/plugins/codex-quota-scheduler/quota';
 const bansEndpoint = base + '/v0/management/plugins/codex-quota-scheduler/bans';
 const plans = {team_standard:'Team Standard',team_premium:'Team Premium',plus:'Plus',pro_5x:'Pro 5x',pro_20x:'Pro 20x'};
+const upstreamPlans = {team:'Team Standard',self_serve_business_prolite:'Team Premium',plus:'Plus'};
 const reasons = {weekly_budget_rebalance:'按周日均预算重新平衡',weekly_remaining_rebalance:'按周余量重新平衡',manual:'手动选择',manual_selection:'手动选择',manual_cleared:'恢复自动调配',initial:'首次选择',active_missing:'当前账号已不可用',quota_exhausted:'额度已用尽'};
 const warmupStates = {confirmed:'已确认激活',pending_confirmation:'等待额度确认',attempted:'已尝试',blocked:'已停止重试',failed:'等待重试'};
 let state = null, key = '', manual = false, busy = false, timer = null, failures = 0, authEpoch = 0, operating = false;
@@ -116,7 +117,7 @@ function renderAccounts() {
   const body = $('accounts-body'); body.replaceChildren();
   const search = $('search').value.toLowerCase().trim();
   const accounts = [...(state.snapshots || [])].sort((a,b) => Number(b.auth_id === state.serial_active_auth_id) - Number(a.auth_id === state.serial_active_auth_id) || a.auth_id.localeCompare(b.auth_id));
-  const visible = accounts.filter(a => a.auth_id.toLowerCase().includes(search) || (plans[a.plan_prior] || a.plan_prior || '').toLowerCase().includes(search));
+  const visible = accounts.filter(a => [a.auth_id,plans[a.plan_prior]||a.plan_prior,a.upstream_plan_type].some(value=>String(value||'').toLowerCase().includes(search)));
   for (const account of visible) {
     const active = state.scheduler_mode==='serial' && account.auth_id === state.serial_active_auth_id;
     const row = element('tr', active ? 'is-active' : '');
@@ -127,8 +128,17 @@ function renderAccounts() {
     if (active) meta.append(element('span','badge active','当前'));
     const banLabels = {cooldown:'冷却中',probe_ready:'待恢复探测',half_open:'恢复探测中',probation:'恢复观察中'};
     meta.append(element('span','badge' + (usable(account) ? ' good' : ' warning'),ban ? banLabels[ban.state] || '恢复观察中' : !account.fresh ? '待更新' : account.eligible ? '可用' : '暂不可用'));
-    meta.append(element('span','',plans[account.plan_prior] || account.plan_prior || '套餐未知'));
+    const configuredPlan = plans[account.plan_prior] || account.plan_prior || '套餐未知';
+    const upstreamPlan = upstreamPlans[account.upstream_plan_type] || account.upstream_plan_type;
+    const automatic = ['cpa_usage','cpa_auth_files'].includes(account.plan_source);
+    const planLabel = element('span','',account.plan_source==='default' && upstreamPlan ? upstreamPlan : configuredPlan);
+    planLabel.title = account.upstream_plan_type ? '上游标签：'+account.upstream_plan_type+' · '+(account.upstream_plan_source==='cpa_usage'?'CPA 额度查询':'CPA 认证信息')+' · '+dateText(account.upstream_plan_observed_at) : '上游尚未返回可识别的套餐标签';
+    meta.append(planLabel);
     info.append(meta);
+    const capacity = (account.five_hour_capacity_weight_prior || 1)+'×';
+    const planStatus = automatic ? '自动识别 · 容量参考 '+capacity : account.plan_source==='account_override' ? '手动覆盖 · 容量参考 '+capacity : '默认档位 '+configuredPlan+' · 容量参考 '+capacity;
+    info.append(element('span','subtext',planStatus));
+    if (upstreamPlan && !automatic) info.append(element('span','subtext','上游：'+upstreamPlan+(account.upstream_plan_fresh?'':'（缓存已过期）')));
     if (ban) info.append(element('span','subtext','冷却到期 ' + dateText(ban.reset_at)));
     if (account.reason && account.reason!=='eligible') {
       const labels={not_allowed:'上游暂不可用',limit_reached:'额度已耗尽',serial_threshold:'达到设定阈值',quota_unknown:'等待额度确认'};
@@ -181,11 +191,16 @@ function renderWarmups() {
   for (const warmup of state.warmups || []) {
     const item = element('li');
     const line = element('div','warmup-line');
-    line.append(element('span','warmup-id',warmup.auth_id + ' · ' + warmup.window),element('span','badge' + (warmup.blocked ? ' warning' : ''),warmupStates[warmup.state] || warmup.state));
+    const outcomeLabel = warmup.state==='failed' && warmup.dispatch_state==='not_sent' ? '未发送 · 等待重试' : warmup.state==='failed' && warmup.dispatch_state==='uncertain' ? '结果未知 · 暂停重复请求' : warmupStates[warmup.state] || warmup.state;
+    line.append(element('span','warmup-id',warmup.auth_id + ' · ' + warmup.window),element('span','badge' + (warmup.blocked ? ' warning' : ''),outcomeLabel));
     item.append(line,element('div','subtext','记录于 ' + dateText(warmup.outcome_at || warmup.activated_at || warmup.completed_at || warmup.attempted_at)));
-    if (timestamp(warmup.suppress_until)) item.append(element('div','subtext','抑制重复预热至 ' + dateText(warmup.suppress_until)));
-    if (warmup.error) item.append(element('div','subtext error',warmup.error));
+    if (timestamp(warmup.suppress_until)) item.append(element('div','subtext',(warmup.dispatch_state==='not_sent'?'最早重试时间 ':'抑制重复预热至 ') + dateText(warmup.suppress_until)));
+    if (warmup.error) {
+      const errors={auth_binding_stale:'CPA 中的账号当前不可用，请求尚未发送。',auth_binding_changed:'CPA 账号绑定已变更，等待最新额度确认。',cpa_inventory_unavailable:'CPA 账号列表暂时不可用，请求尚未发送。',management_key_unavailable:'无法读取 CPA 管理密钥，请求尚未发送。',timeout:'请求超时，等待确认是否已执行。',warmup_failed:'旧版未保存具体原因，需核对 CPA 日志。'};
+      item.append(element('div','subtext error',errors[warmup.error]||warmup.error));
+    }
     if(warmup.blocked)item.append(action('允许再次重试',()=>mutate('/warmup-retry','POST',{auth_id:warmup.auth_id},'已解除预热重试阻止；仍遵循冷却、间隔和每日预算。')));
+    else if(warmup.error)item.append(action('重新安排预热',()=>confirmOperation('重新安排此账号的预热','仅在确认上次请求未执行或原因已修复后继续。仍遵循账号冷却、最小间隔和每日预算。',()=>mutate('/warmup-retry','POST',{auth_id:warmup.auth_id},'已重新安排；下一轮先检查周期是否已激活。'))));
     list.append(item);
   }
   if (!list.children.length) list.append(element('li','subtext','暂无预热记录'));

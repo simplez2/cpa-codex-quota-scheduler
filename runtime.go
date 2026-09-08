@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log/slog"
 	"math"
 	"net/http"
@@ -56,6 +55,8 @@ type quotaWindow struct {
 type quotaSnapshot struct {
 	AuthID           string
 	AuthIndex        string
+	AccountID        string
+	Plan             quotaPlanObservation
 	Windows          []quotaWindow
 	ResetCredits     int
 	RefreshedAt      time.Time
@@ -87,7 +88,6 @@ type schedulerRuntimeState struct {
 	warmupRunning               bool
 	warmups                     map[string]warmupEntry
 	warmupAttempts              []warmupAttempt
-	warmupLeases                map[string]warmupLease
 	warmupCandidatesLast        int
 	warmupSkippedBannedLast     int
 	warmupSkippedStaleLast      int
@@ -185,7 +185,6 @@ func configureSchedulerRuntime(raw []byte) {
 	schedulerRuntime.stopping = false
 	schedulerRuntime.warmups = make(map[string]warmupEntry)
 	schedulerRuntime.warmupAttempts = nil
-	schedulerRuntime.warmupLeases = make(map[string]warmupLease)
 	schedulerRuntime.warmupCandidatesLast = 0
 	schedulerRuntime.warmupSkippedBannedLast = 0
 	schedulerRuntime.warmupSkippedStaleLast = 0
@@ -270,7 +269,6 @@ func (s *schedulerRuntimeState) stopLocked() {
 	s.wg.Wait()
 	s.warmupMu.Lock()
 	s.warmupRunning = false
-	s.warmupLeases = make(map[string]warmupLease)
 	s.warmupMu.Unlock()
 	// Only the durable generation owner may commit or release shared state.
 	// A superseded retired DSO must never overwrite the active instance.
@@ -349,6 +347,7 @@ func (s *schedulerRuntimeState) recordRefreshError(err error) {
 }
 
 func mergePartialQuotaSnapshot(previous, current quotaSnapshot, now time.Time, staleAfter time.Duration) quotaSnapshot {
+	current.Plan = mergeQuotaPlanObservation(previous, current, now, staleAfter)
 	incomingSnapshotAt := current.RefreshedAt
 	current.Windows = append([]quotaWindow(nil), current.Windows...)
 	if previous.RefreshedAt.After(current.RefreshedAt) && !now.Before(previous.RefreshedAt) {
@@ -680,25 +679,6 @@ func codexOnlySchedulerRequest(req pluginapi.SchedulerPickRequest) bool {
 }
 
 func (s *schedulerRuntimeState) schedulerPick(req pluginapi.SchedulerPickRequest) (pluginapi.SchedulerPickResponse, error) {
-	if nonce := schedulerOptionHeader(req.Options.Headers, warmupRequestHeader); nonce != "" {
-		now := time.Now()
-		targetAuthID, validLease := s.consumeWarmupLease(nonce, now)
-		if !validLease {
-			return pluginapi.SchedulerPickResponse{}, fmt.Errorf("invalid or expired internal warmup lease")
-		}
-		if len(req.Candidates) == 0 || !codexOnlySchedulerRequest(req) {
-			return pluginapi.SchedulerPickResponse{}, fmt.Errorf("internal warmup target has no Codex candidates")
-		}
-		if _, quarantined := banStore.lookup(targetAuthID); quarantined {
-			return pluginapi.SchedulerPickResponse{}, fmt.Errorf("internal warmup target is quarantined")
-		}
-		for _, candidate := range req.Candidates {
-			if strings.TrimSpace(candidate.ID) == targetAuthID && strings.EqualFold(strings.TrimSpace(candidate.Provider), providerCodex) {
-				return pluginapi.SchedulerPickResponse{Handled: true, AuthID: targetAuthID}, nil
-			}
-		}
-		return pluginapi.SchedulerPickResponse{}, fmt.Errorf("internal warmup target is unavailable")
-	}
 	if schedulerRequestGenerationDisabled(req) {
 		return pluginapi.SchedulerPickResponse{Handled: false}, nil
 	}
@@ -1438,6 +1418,11 @@ type runtimeQuotaStatus struct {
 	Runway             []quotaRunwayWindowAssessment `json:"runway,omitempty"`
 	Plan               string                        `json:"plan_prior"`
 	PlanWeight         float64                       `json:"five_hour_capacity_weight_prior"`
+	PlanSource         string                        `json:"plan_source"`
+	UpstreamPlanType   string                        `json:"upstream_plan_type,omitempty"`
+	UpstreamPlanSource string                        `json:"upstream_plan_source,omitempty"`
+	UpstreamPlanAt     string                        `json:"upstream_plan_observed_at,omitempty"`
+	UpstreamPlanFresh  bool                          `json:"upstream_plan_fresh"`
 	WeeklyBudgetPerDay float64                       `json:"weekly_budget_percent_per_day"`
 	WeeklyBudgetKnown  bool                          `json:"weekly_budget_known"`
 	AuthID             string                        `json:"auth_id"`
@@ -1475,6 +1460,7 @@ type runtimeQuotaWindowStatus struct {
 }
 
 type runtimeWarmupStatus struct {
+	DispatchState string `json:"dispatch_state,omitempty"`
 	Failures      int    `json:"failures,omitempty"`
 	OutcomeAt     string `json:"outcome_at,omitempty"`
 	AuthID        string `json:"auth_id"`
@@ -1717,7 +1703,13 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 			Reason:        evaluation.Reason,
 		}
 		window := evaluation.Bottleneck
-		item.Plan, item.PlanWeight = quotaPlanForAuth(cfg, canonical)
+		item.Plan, item.PlanWeight, item.PlanSource = resolvedQuotaPlan(cfg, canonical, snapshot, now)
+		item.UpstreamPlanType = snapshot.Plan.Type
+		item.UpstreamPlanSource = snapshot.Plan.Source
+		item.UpstreamPlanFresh = snapshot.Plan.fresh(now, cfg.StaleAfter)
+		if snapshot.Plan.Type != "" && !snapshot.Plan.ObservedAt.IsZero() {
+			item.UpstreamPlanAt = snapshot.Plan.ObservedAt.Format(time.RFC3339)
+		}
 		item.Runway = runwayByAuth[canonical]
 		budgetChoice := inspectSerialCandidate(pluginapi.SchedulerAuthCandidate{ID: canonical}, snapshot, true, cfg, now)
 		item.WeeklyBudgetPerDay, item.WeeklyBudgetKnown = serialWeeklyBudget(budgetChoice, cfg, now)
@@ -1896,7 +1888,7 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 		CPAConfigured:                 strings.TrimSpace(cfg.CPAManagementURL) != "",
 		WarmupEnabled:                 cfg.WarmupEnabled,
 		WarmupTraffic:                 warmupTraffic,
-		WarmupExecutionMode:           normalizeWarmupExecutionMode(cfg.WarmupExecutionMode),
+		WarmupExecutionMode:           "cpa_api_call",
 		Refreshes:                     refreshes,
 		FreshSnapshots:                count,
 		WindowOrder:                   append([]string(nil), cfg.WindowOrder...),
@@ -1967,6 +1959,10 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 			state = "pending_confirmation"
 		}
 		item := runtimeWarmupStatus{AuthID: entry.AuthID, Window: entry.Window, State: state, Status: entry.Status, Error: entry.Error, Blocked: entry.Blocked}
+		item.DispatchState = entry.DispatchState
+		if entry.Error != "" && entry.Status == 0 && item.DispatchState == "" {
+			item.DispatchState = "uncertain"
+		}
 		item.Failures = entry.Failures
 		if !entry.OutcomeAt.IsZero() {
 			item.OutcomeAt = entry.OutcomeAt.Format(time.RFC3339)

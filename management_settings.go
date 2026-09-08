@@ -120,7 +120,7 @@ func validatePanelSettings(config, changes map[string]any) (map[string]any, map[
 			fields[name] = "此值与其他设置冲突，或需要修正后才能生效。"
 		}
 	}
-	for _, name := range []string{"cpa_management_url", "warmup_sidecar_url", "quota_url"} {
+	for _, name := range []string{"cpa_management_url", "quota_url"} {
 		value := fmt.Sprint(actual[name])
 		endpoint, err := url.Parse(value)
 		if err != nil || endpoint.Host == "" || endpoint.User != nil || endpoint.RawQuery != "" || endpoint.Fragment != "" || (endpoint.Scheme != "http" && endpoint.Scheme != "https") {

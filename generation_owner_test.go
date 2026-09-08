@@ -26,7 +26,6 @@ func newManagedRuntimeForTest(t *testing.T, statePath string) *schedulerRuntimeS
 		pacingAccounts:        make(map[string]*accountPacingState),
 		stickyBindings:        make(map[string]stickyBinding),
 		warmups:               make(map[string]warmupEntry),
-		warmupLeases:          make(map[string]warmupLease),
 		banResetConfirmations: make(map[string]banResetConfirmation),
 	}
 	state.initializeGenerationOwnership(statePath)
@@ -382,10 +381,9 @@ func TestManagedUnclaimedRuntimeFailsClosed(t *testing.T) {
 
 	state := newManagedRuntimeForTest(t, statePath)
 	state.cfg.WarmupEnabled = true
-	state.cfg.WarmupExecutionMode = "management"
+
 	state.cfg.CPAManagementURL = server.URL + "/v0/management/api-call"
 	state.cfg.CPAManagementKeyFile = filepath.Join(t.TempDir(), "management-key")
-	state.cfg.WarmupSidecarURL = server.URL + "/backend-api/codex"
 
 	status := state.generationStatus()
 	if status.Active || status.Claimed || !status.Managed {

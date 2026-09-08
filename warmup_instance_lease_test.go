@@ -157,7 +157,7 @@ func TestManagementWarmupTakeoverMergesRetiredOutcomeWithoutDuplicate(t *testing
 		switch r.URL.Path {
 		case "/v0/management/auth-files":
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"files":[{"id":"acct","auth_index":"idx-acct","provider":"codex","status":"active","note":"Agent Identity via sidecar"}]}`))
+			_, _ = w.Write([]byte(`{"files":[{"id":"acct","auth_index":"idx-acct","provider":"codex","status":"active","note":"imported account"}]}`))
 		case "/v0/management/api-call":
 			var request cpaAPICallRequest
 			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
@@ -172,10 +172,9 @@ func TestManagementWarmupTakeoverMergesRetiredOutcomeWithoutDuplicate(t *testing
 			} else {
 				input, _ := upstream["input"].([]any)
 				_, hasTopLevelTools := upstream["tools"]
-				additionalTools, _ := input[0].(map[string]any)
 				if _, hasMaxOutputTokens := upstream["max_output_tokens"]; hasMaxOutputTokens ||
-					upstream["stream"] != true || len(input) != 3 || hasTopLevelTools ||
-					additionalTools["type"] != "additional_tools" {
+					upstream["stream"] != true || len(input) != 1 || hasTopLevelTools ||
+					upstream["instructions"] != "Reply with OK only." {
 					t.Errorf("unexpected Codex warmup request: %#v", upstream)
 				}
 			}
@@ -196,10 +195,10 @@ func TestManagementWarmupTakeoverMergesRetiredOutcomeWithoutDuplicate(t *testing
 
 	cfg := defaultPluginConfig()
 	cfg.WarmupEnabled = true
-	cfg.WarmupExecutionMode = "management"
+
 	cfg.CPAManagementURL = server.URL + "/v0/management/api-call"
 	cfg.CPAManagementKeyFile = keyPath
-	cfg.WarmupSidecarURL = server.URL + "/backend-api/codex"
+
 	cfg.StatePath = filepath.Join(t.TempDir(), "state.json")
 	now := time.Now()
 	newState := func() *schedulerRuntimeState {

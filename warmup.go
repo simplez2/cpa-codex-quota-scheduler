@@ -3,8 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -37,6 +35,7 @@ type warmupEntry struct {
 	SuppressUntil time.Time `json:"suppress_until,omitempty"`
 	Status        int       `json:"status,omitempty"`
 	Error         string    `json:"error,omitempty"`
+	DispatchState string    `json:"dispatch_state,omitempty"`
 	Blocked       bool      `json:"blocked,omitempty"`
 }
 
@@ -49,11 +48,7 @@ type warmupCandidate struct {
 type warmupAuthBinding struct {
 	AuthID    string
 	AuthIndex string
-}
-
-type warmupLease struct {
-	AuthID    string
-	ExpiresAt time.Time
+	AccountID string
 }
 
 type cpaAPICallRequest struct {
@@ -73,6 +68,7 @@ type cpaAPICallResponse struct {
 type cpaAuthFileEntry struct {
 	IDToken struct {
 		AccountID string `json:"chatgpt_account_id"`
+		PlanType  string `json:"plan_type"`
 	} `json:"id_token"`
 	ID          string `json:"id"`
 	AuthIndex   string `json:"auth_index"`
@@ -102,22 +98,8 @@ func (stats *warmupAuthEligibilityStats) reject(reason string) {
 	stats.Rejected[reason]++
 }
 
-// trustedWarmupCredentialNote accepts only the canonical notes emitted by
-// Codex Agent Identity. Exact matching keeps official/native credentials and
-// lookalike notes from being routed through the privileged sidecar gateway.
-func trustedWarmupCredentialNote(note string) bool {
-	switch strings.ToLower(strings.TrimSpace(note)) {
-	case "agent identity via sidecar",
-		"codex access token via sidecar",
-		"agent identity via gateway",
-		"codex access token via gateway":
-		return true
-	default:
-		return false
-	}
-}
-
 const (
+	cpaWarmupResponsesURL         = "https://chatgpt.com/backend-api/codex/responses"
 	warmupMinimumAvailablePercent = 0.000001
 	warmupMinimumUsageCredits     = 0.000001
 	warmupResetPlaceholderSkew    = 3 * time.Second
@@ -129,8 +111,7 @@ const (
 
 // warmupStartupReady keeps activation traffic away from CPA while a newly
 // claimed plugin generation is still starting. The next quota probe refresh will
-// retry after CPA's API server, auth registry, and Agent Identity proxy have
-// had time to settle.
+// retry after CPA's API server and auth registry have had time to settle.
 func (s *schedulerRuntimeState) warmupStartupReady(now time.Time) bool {
 	ownership := s.generationSnapshot()
 	if !ownership.Managed || ownership.ClaimedAt.IsZero() {
@@ -172,13 +153,7 @@ func (s *schedulerRuntimeState) scheduleWarmup(parent context.Context, skipAuthI
 		return
 	}
 	generationClaimedAt := s.generationSnapshot().ClaimedAt
-	if nativeWarmupRequested(cfg) {
-		if !hostAPIAvailable() {
-			slog.Warn("codex-quota-scheduler: native warmup skipped because CPA HostModel is unavailable")
-			return
-		}
-	} else if strings.TrimSpace(cfg.CPAManagementURL) == "" ||
-		strings.TrimSpace(cfg.CPAManagementKeyFile) == "" || strings.TrimSpace(cfg.WarmupSidecarURL) == "" {
+	if strings.TrimSpace(cfg.CPAManagementURL) == "" || strings.TrimSpace(cfg.CPAManagementKeyFile) == "" {
 		return
 	}
 	now = time.Now()
@@ -608,51 +583,6 @@ func warmupKey(authID, window string) string {
 	return strings.TrimSpace(authID) + "|" + strings.TrimSpace(window)
 }
 
-func (s *schedulerRuntimeState) registerWarmupLease(authID string, now time.Time) (string, error) {
-	authID = strings.TrimSpace(authID)
-	if authID == "" {
-		return "", errors.New("warmup auth id is empty")
-	}
-	raw := make([]byte, 32)
-	if _, err := rand.Read(raw); err != nil {
-		return "", fmt.Errorf("generate warmup lease: %w", err)
-	}
-	nonce := base64.RawURLEncoding.EncodeToString(raw)
-	s.warmupMu.Lock()
-	if s.warmupLeases == nil {
-		s.warmupLeases = make(map[string]warmupLease)
-	}
-	for key, lease := range s.warmupLeases {
-		if !now.Before(lease.ExpiresAt) {
-			delete(s.warmupLeases, key)
-		}
-	}
-	s.warmupLeases[nonce] = warmupLease{AuthID: authID, ExpiresAt: now.Add(warmupRequestTimeout)}
-	s.warmupMu.Unlock()
-	return nonce, nil
-}
-
-func (s *schedulerRuntimeState) consumeWarmupLease(nonce string, now time.Time) (string, bool) {
-	nonce = strings.TrimSpace(nonce)
-	if nonce == "" {
-		return "", false
-	}
-	s.warmupMu.Lock()
-	defer s.warmupMu.Unlock()
-	lease, ok := s.warmupLeases[nonce]
-	delete(s.warmupLeases, nonce)
-	if !ok || !now.Before(lease.ExpiresAt) {
-		return "", false
-	}
-	return lease.AuthID, true
-}
-
-func (s *schedulerRuntimeState) releaseWarmupLease(nonce string) {
-	s.warmupMu.Lock()
-	delete(s.warmupLeases, strings.TrimSpace(nonce))
-	s.warmupMu.Unlock()
-}
-
 // nextWarmupCandidateLocked skips accounts already activated or recently
 // attempted, allowing later full accounts to make progress on the next refresh.
 // The caller must hold warmupMu.
@@ -795,99 +725,29 @@ func (s *schedulerRuntimeState) warmupSuppressedForGenerationLocked(key string, 
 func (s *schedulerRuntimeState) executeWarmup(parent context.Context, cfg pluginConfig, candidate warmupCandidate) {
 	model, err := validateWarmupModel(cfg.WarmupModel)
 	if err != nil {
-		s.recordWarmupError(candidate, 0, err)
+		s.recordWarmupNotSent(candidate, "invalid_warmup_model")
 		return
 	}
 	cfg.WarmupModel = model
-	if nativeWarmupRequested(cfg) {
-		s.executeNativeWarmup(parent, cfg, candidate)
-		return
-	}
-	s.executeManagementWarmup(parent, cfg, candidate)
+	s.executeCPAWarmup(parent, cfg, candidate)
 }
 
-func (s *schedulerRuntimeState) executeNativeWarmup(parent context.Context, cfg pluginConfig, candidate warmupCandidate) {
-	if err := parent.Err(); err != nil {
-		s.recordWarmupError(candidate, 0, err)
-		return
-	}
-	nonce, err := s.registerWarmupLease(candidate.Snapshot.AuthID, time.Now())
-	if err != nil {
-		s.recordWarmupError(candidate, 0, err)
-		return
-	}
-	defer s.releaseWarmupLease(nonce)
-
-	body, err := json.Marshal(map[string]any{
-		"model":             cfg.WarmupModel,
-		"input":             "Reply with OK.",
-		"stream":            false,
-		"store":             false,
-		"max_output_tokens": 16,
-		"reasoning":         map[string]any{"effort": "low"},
-		"text":              map[string]any{"verbosity": "low"},
-	})
-	if err != nil {
-		s.recordWarmupError(candidate, 0, fmt.Errorf("encode native warmup request: %w", err))
-		return
-	}
-	requestedAt := time.Now()
-	result, err := callHost(pluginabi.MethodHostModelExecute, pluginapi.HostModelExecutionRequest{
-		EntryProtocol: "openai-response",
-		ExitProtocol:  "openai-response",
-		Model:         cfg.WarmupModel,
-		Stream:        false,
-		Body:          body,
-		Headers: http.Header{
-			warmupRequestHeader: []string{nonce},
-		},
-	})
-	if err != nil {
-		s.recordWarmupError(candidate, 0, fmt.Errorf("native CPA warmup failed: %w", err))
-		return
-	}
-	var response pluginapi.HostModelExecutionResponse
-	if err := json.Unmarshal(result, &response); err != nil {
-		s.recordWarmupError(candidate, 0, fmt.Errorf("decode native CPA warmup response: %w", err))
-		return
-	}
-	windows := quotaWindowsFromHeaders(response.Headers, time.Now())
-	candidate.RetryAt = warmupRetryDeadline(response.Headers, time.Now())
-	if response.StatusCode == statusTooManyRequests {
-		s.recordWarmup429(candidate, cfg, response.Headers, requestedAt, "native")
-	}
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		s.recordWarmupError(candidate, response.StatusCode, warmupHTTPStatusError(response.StatusCode, response.Body, "native CPA warmup"))
-		return
-	}
-	if _, err := parseWarmupResponse(response.Body); err != nil {
-		s.recordWarmupStreamError(candidate, cfg, response.StatusCode, response.Headers, requestedAt, "native", err)
-		return
-	}
-	s.recordWarmupOutcome(candidate, response.StatusCode, windows, nil)
-	slog.Info("codex-quota-scheduler: native CPA Codex warmup completed",
-		"auth_id", candidate.Snapshot.AuthID,
-		"window", candidate.Window.Class,
-		"status", response.StatusCode,
-		"activated_windows", len(windows))
-}
-
-func (s *schedulerRuntimeState) executeManagementWarmup(parent context.Context, cfg pluginConfig, candidate warmupCandidate) {
+func (s *schedulerRuntimeState) executeCPAWarmup(parent context.Context, cfg pluginConfig, candidate warmupCandidate) {
 	ctx, cancel := context.WithTimeout(parent, warmupRequestTimeout)
 	defer cancel()
 	if err := ctx.Err(); err != nil {
-		s.recordWarmupError(candidate, 0, err)
+		s.recordWarmupNotSent(candidate, "cancelled_before_dispatch")
 		return
 	}
 
 	keyRaw, err := os.ReadFile(cfg.CPAManagementKeyFile)
 	if err != nil {
-		s.recordWarmupError(candidate, 0, fmt.Errorf("read CPA management key: %w", err))
+		s.recordWarmupNotSent(candidate, "management_key_unavailable")
 		return
 	}
 	managementKey := strings.TrimSpace(string(keyRaw))
 	if managementKey == "" {
-		s.recordWarmupError(candidate, 0, errors.New("CPA management key is empty"))
+		s.recordWarmupNotSent(candidate, "management_key_unavailable")
 		return
 	}
 	// Auth files can be atomically replaced while a warmup worker is waiting
@@ -896,7 +756,7 @@ func (s *schedulerRuntimeState) executeManagementWarmup(parent context.Context, 
 	// the instance lease and persisted warmup key were admitted for that ID.
 	bindings, err := s.cpaWarmupEligibleAuths(ctx, cfg)
 	if err != nil {
-		s.recordWarmupError(candidate, 0, fmt.Errorf("refresh warmup auth binding: %w", err))
+		s.recordWarmupNotSent(candidate, "cpa_inventory_unavailable")
 		return
 	}
 	binding := bindings[strings.TrimSpace(candidate.Snapshot.AuthID)]
@@ -904,75 +764,56 @@ func (s *schedulerRuntimeState) executeManagementWarmup(parent context.Context, 
 		binding = bindings[strings.TrimSpace(candidate.Snapshot.AuthIndex)]
 	}
 	if strings.TrimSpace(binding.AuthID) == "" || strings.TrimSpace(binding.AuthIndex) == "" {
-		s.recordWarmupError(candidate, 0, errors.New("auth_binding_stale"))
+		s.recordWarmupNotSent(candidate, "auth_binding_stale")
 		return
 	}
 	if strings.TrimSpace(binding.AuthID) != strings.TrimSpace(candidate.Snapshot.AuthID) ||
 		strings.TrimSpace(binding.AuthIndex) != strings.TrimSpace(candidate.Snapshot.AuthIndex) {
-		s.recordWarmupError(candidate, 0, errors.New("auth_binding_changed"))
+		s.recordWarmupNotSent(candidate, "auth_binding_changed")
 		return
 	}
 
+	// Use the native Codex Responses shape; CPA owns credential substitution,
+	// account proxy selection, and the outbound request. No model-router lease.
 	payload, err := json.Marshal(map[string]any{
-		"model": cfg.WarmupModel,
-		"input": []map[string]any{
-			{
-				"type":  "additional_tools",
-				"role":  "developer",
-				"tools": []any{},
-			},
-			{
-				"type": "message",
-				"role": "developer",
-				"content": []map[string]any{{
-					"type": "input_text",
-					"text": "Reply briefly.",
-				}},
-			},
-			{
-				"type": "message",
-				"role": "user",
-				"content": []map[string]any{{
-					"type": "input_text",
-					"text": "hello",
-				}},
-			},
-		},
-		"tool_choice":         "auto",
-		"parallel_tool_calls": false,
-		"reasoning":           map[string]any{"effort": "low", "context": "all_turns"},
-		"store":               false,
-		"stream":              true,
-		"include":             []string{"reasoning.encrypted_content"},
-		"text":                map[string]any{"verbosity": "low"},
+		"model":        cfg.WarmupModel,
+		"instructions": "Reply with OK only.",
+		"input":        []map[string]any{{"role": "user", "content": []map[string]any{{"type": "input_text", "text": "Ping"}}}},
+		"stream":       true,
+		"store":        false,
+		"reasoning":    map[string]any{"effort": "low"},
+		"text":         map[string]any{"verbosity": "low"},
 	})
 	if err != nil {
-		s.recordWarmupError(candidate, 0, fmt.Errorf("encode warmup request: %w", err))
+		s.recordWarmupNotSent(candidate, "invalid_warmup_request")
 		return
+	}
+	headers := map[string]string{
+		"Authorization": "Bearer $TOKEN$", "Accept": "text/event-stream",
+		"Content-Type": "application/json", "User-Agent": "codex_cli_rs/cpa-quota-scheduler",
+	}
+	accountID := binding.AccountID
+	if accountID == "" {
+		accountID = candidate.Snapshot.AccountID
+	}
+	if accountID != "" {
+		headers["ChatGPT-Account-Id"] = accountID
 	}
 	callBody, err := json.Marshal(cpaAPICallRequest{
 		AuthIndex: candidate.Snapshot.AuthIndex,
 		Method:    http.MethodPost,
-		URL:       strings.TrimRight(cfg.WarmupSidecarURL, "/") + "/responses",
-		Header: map[string]string{
-			"Authorization":                          "Bearer $TOKEN$",
-			"Accept":                                 "text/event-stream",
-			"Content-Type":                           "application/json",
-			"Originator":                             "codex_cli_rs",
-			"User-Agent":                             "codex_cli_rs/cpa-quota-scheduler",
-			"X-Codex-Routing-Hint":                   "model=" + cfg.WarmupModel,
-			"X-OpenAI-Internal-Codex-Responses-Lite": "true",
-		},
-		Data: string(payload),
+		URL:       cpaWarmupResponsesURL,
+		Header:    headers,
+		Data:      string(payload),
 	})
 	if err != nil {
-		s.recordWarmupError(candidate, 0, fmt.Errorf("encode CPA api-call: %w", err))
+		s.recordWarmupNotSent(candidate, "invalid_warmup_request")
 		return
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.CPAManagementURL, bytes.NewReader(callBody))
 	if err != nil {
-		s.recordWarmupError(candidate, 0, fmt.Errorf("build CPA api-call: %w", err))
+		s.recordWarmupNotSent(candidate, "invalid_management_url")
 		return
 	}
 	req.Header.Set("Authorization", "Bearer "+managementKey)
@@ -994,7 +835,13 @@ func (s *schedulerRuntimeState) executeManagementWarmup(parent context.Context, 
 		return
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		s.recordWarmupError(candidate, resp.StatusCode, warmupHTTPStatusError(resp.StatusCode, raw, "CPA api-call"))
+		if resp.StatusCode >= 500 || resp.StatusCode == http.StatusRequestTimeout {
+			// CPA reports both transport and response-read failures as 502. The
+			// model may already have run even though no api-call envelope arrived.
+			s.recordWarmupError(candidate, resp.StatusCode, errWarmupStreamIncomplete)
+		} else {
+			s.recordWarmupError(candidate, resp.StatusCode, warmupHTTPStatusError(resp.StatusCode, raw, "CPA api-call"))
+		}
 		return
 	}
 	var result cpaAPICallResponse
@@ -1002,25 +849,25 @@ func (s *schedulerRuntimeState) executeManagementWarmup(parent context.Context, 
 		s.recordWarmupError(candidate, 0, fmt.Errorf("decode CPA api-call response: %w", err))
 		return
 	}
-	headers := make(http.Header, len(result.Header))
+	responseHeaders := make(http.Header, len(result.Header))
 	for key, values := range result.Header {
 		for _, value := range values {
-			headers.Add(key, value)
+			responseHeaders.Add(key, value)
 		}
 	}
-	windows := quotaWindowsFromHeaders(headers, time.Now())
-	if retryAt := warmupRetryDeadline(headers, time.Now()); retryAt.After(candidate.RetryAt) {
+	windows := quotaWindowsFromHeaders(responseHeaders, time.Now())
+	if retryAt := warmupRetryDeadline(responseHeaders, time.Now()); retryAt.After(candidate.RetryAt) {
 		candidate.RetryAt = retryAt
 	}
 	if result.StatusCode == statusTooManyRequests {
-		s.recordWarmup429(candidate, cfg, headers, requestedAt, "management")
+		s.recordWarmup429(candidate, cfg, responseHeaders, requestedAt, "cpa_api_call")
 	}
 	if result.StatusCode < 200 || result.StatusCode >= 300 {
 		s.recordWarmupError(candidate, result.StatusCode, warmupHTTPStatusError(result.StatusCode, []byte(result.Body), "warmup upstream"))
 		return
 	}
 	if _, err := parseWarmupResponse([]byte(result.Body)); err != nil {
-		s.recordWarmupStreamError(candidate, cfg, result.StatusCode, headers, requestedAt, "management", err)
+		s.recordWarmupStreamError(candidate, cfg, result.StatusCode, responseHeaders, requestedAt, "cpa_api_call", err)
 		return
 	}
 	s.recordWarmupOutcome(candidate, result.StatusCode, windows, nil)
@@ -1081,6 +928,17 @@ func (s *schedulerRuntimeState) recordWarmupError(candidate warmupCandidate, sta
 		"retryable", !entry.Blocked)
 }
 
+// Only failures known to precede model dispatch get a normal retry interval.
+// Network errors, cancellations during dispatch, and truncated output remain
+// uncertain outcomes and keep their full duplicate-prevention suppression.
+type warmupNotSentError struct{ Code string }
+
+func (e *warmupNotSentError) Error() string { return e.Code }
+
+func (s *schedulerRuntimeState) recordWarmupNotSent(candidate warmupCandidate, code string) {
+	s.recordWarmupError(candidate, 0, &warmupNotSentError{Code: code})
+}
+
 func (s *schedulerRuntimeState) recordWarmupOutcome(candidate warmupCandidate, status int, windows []quotaWindow, err error) {
 	now := time.Now()
 	s.mu.RLock()
@@ -1100,6 +958,7 @@ func (s *schedulerRuntimeState) recordWarmupOutcome(candidate warmupCandidate, s
 	target.Status = status
 	target.OutcomeAt = now
 	if err != nil {
+		target.DispatchState = "rejected"
 		target.Error, target.Blocked = classifyWarmupFailure(status, err)
 		for _, previous := range s.warmups {
 			if previous.AuthID == target.AuthID && previous.Failures > target.Failures {
@@ -1116,7 +975,11 @@ func (s *schedulerRuntimeState) recordWarmupOutcome(candidate warmupCandidate, s
 		delay := warmupFailureDelay(cfg.WarmupRetryAfter, target.Failures)
 		// Missing transport outcome or a truncated response can still have
 		// consumed quota upstream. Do not repeat it after a short retry interval.
-		if status == 0 || strings.ReplaceAll(target.Error, ".", "_") == "response_incomplete" || errors.Is(err, errWarmupStreamIncomplete) {
+		var notSent *warmupNotSentError
+		if errors.As(err, &notSent) {
+			target.DispatchState = "not_sent"
+		} else if status == 0 || strings.ReplaceAll(target.Error, ".", "_") == "response_incomplete" || errors.Is(err, errWarmupStreamIncomplete) {
+			target.DispatchState = "uncertain"
 			if delay < warmupUncertainDelay {
 				delay = warmupUncertainDelay
 			}
@@ -1129,6 +992,7 @@ func (s *schedulerRuntimeState) recordWarmupOutcome(candidate warmupCandidate, s
 			target.SuppressUntil = candidate.RetryAt
 		}
 	} else {
+		target.DispatchState = "completed"
 		target.Error = ""
 		target.Blocked = false
 		target.Failures = 0
@@ -1173,6 +1037,7 @@ func (s *schedulerRuntimeState) recordWarmupOutcome(candidate warmupCandidate, s
 			entry.ResetAt = time.Time{}
 			entry.SuppressUntil = now.Add(warmupFallbackWindow(covered))
 			entry.Status = status
+			entry.DispatchState = "completed"
 			entry.Error = ""
 			entry.Blocked = false
 			s.warmups[key] = entry
@@ -1198,6 +1063,7 @@ func (s *schedulerRuntimeState) recordWarmupOutcome(candidate warmupCandidate, s
 		entry.ResetAt = window.ResetAt
 		entry.SuppressUntil = window.ResetAt
 		entry.Status = status
+		entry.DispatchState = "completed"
 		entry.Error = ""
 		s.warmups[key] = entry
 	}
@@ -1231,6 +1097,10 @@ func warmupActivationWindows(snapshot quotaSnapshot, now time.Time) []quotaWindo
 func classifyWarmupFailure(status int, err error) (string, bool) {
 	if err == nil {
 		return "", false
+	}
+	var notSent *warmupNotSentError
+	if errors.As(err, &notSent) {
+		return notSent.Code, notSent.Code == "invalid_warmup_model" || notSent.Code == "invalid_warmup_request" || notSent.Code == "invalid_management_url"
 	}
 	// These status semantics are authoritative even if an inconsistent body
 	// supplies a different error code. A 429 is governed only by the quota/
@@ -1360,42 +1230,6 @@ func (s *schedulerRuntimeState) recordWarmupAuthDiagnostics(source string, stats
 }
 
 func (s *schedulerRuntimeState) cpaWarmupEligibleAuths(ctx context.Context, cfg pluginConfig) (map[string]warmupAuthBinding, error) {
-	native := nativeWarmupRequested(cfg)
-	if hostAPIAvailable() {
-		result, err := callHost(pluginabi.MethodHostAuthList, map[string]any{})
-		if err == nil {
-			var response struct {
-				Files []pluginapi.HostAuthFileEntry `json:"files"`
-			}
-			if decodeErr := json.Unmarshal(result, &response); decodeErr == nil {
-				eligible, stats := warmupEligibleHostAuthsWithStats(response.Files, !native)
-				// Older CPA hosts may omit Note from host.auth.list. In management
-				// mode, fall back to the authenticated auth-files route only when
-				// that omission is the sole reason otherwise-valid Codex auths were
-				// rejected. Native mode never falls back across transports.
-				if native || stats.Eligible > 0 || stats.Rejected["missing_sidecar_marker"] == 0 {
-					s.recordWarmupAuthDiagnostics("host.auth.list", stats, nil)
-					return eligible, nil
-				}
-			} else if native {
-				err = fmt.Errorf("decode native host.auth.list: %w", decodeErr)
-			}
-		}
-		if native {
-			if err == nil {
-				err = errors.New("native host.auth.list returned unusable auth metadata")
-			} else {
-				err = fmt.Errorf("native host.auth.list failed: %w", err)
-			}
-			s.recordWarmupAuthDiagnostics("host.auth.list", newWarmupAuthEligibilityStats(), err)
-			return nil, err
-		}
-	} else if native {
-		err := errors.New("native CPA host callback API is unavailable")
-		s.recordWarmupAuthDiagnostics("host.auth.list", newWarmupAuthEligibilityStats(), err)
-		return nil, err
-	}
-
 	files, err := cpaManagementAuthFiles(ctx, cfg)
 	if err != nil {
 		s.recordWarmupAuthDiagnostics("management.auth-files", newWarmupAuthEligibilityStats(), err)
@@ -1449,8 +1283,7 @@ func cpaManagementAuthFiles(ctx context.Context, cfg pluginConfig) ([]cpaAuthFil
 }
 
 // cpaActiveCodexAuthIndexes returns the host's current routing inventory. It
-// deliberately does not require an Agent Identity note: official OAuth and
-// sidecar-backed PAT credentials are equally valid quota-refresh subjects.
+// uses the CPA credential status, without inspecting free-form notes.
 func cpaActiveCodexAuthIndexes(ctx context.Context, cfg pluginConfig) (map[string]struct{}, error) {
 	if hostAPIAvailable() {
 		result, err := callHost(pluginabi.MethodHostAuthList, map[string]any{})
@@ -1513,16 +1346,14 @@ func activeCodexHostAuthIndexes(files []pluginapi.HostAuthFileEntry) map[string]
 	return indexes
 }
 
-func nativeWarmupRequested(cfg pluginConfig) bool {
-	return normalizeWarmupExecutionMode(cfg.WarmupExecutionMode) == "native"
-}
-
 func (s *schedulerRuntimeState) clearBlockedWarmupState(authID string, all bool) int {
 	authID = strings.TrimSpace(authID)
 	removed := 0
 	s.warmupMu.Lock()
 	for key, entry := range s.warmups {
-		if !entry.Blocked || (!all && strings.TrimSpace(entry.AuthID) != authID && !strings.HasPrefix(key, authID+"|")) {
+		// Bulk recovery only lifts explicit blocks. A failed/uncertain outcome
+		// requires selecting its exact account; successful cycles stay recorded.
+		if (!entry.Blocked && (all || entry.Error == "")) || (!all && strings.TrimSpace(entry.AuthID) != authID && !strings.HasPrefix(key, authID+"|")) {
 			continue
 		}
 		delete(s.warmups, key)
@@ -1538,10 +1369,10 @@ func warmupEligibleAuths(files []cpaAuthFileEntry) map[string]warmupAuthBinding 
 }
 
 func warmupEligibleAuthsWithStats(files []cpaAuthFileEntry) (map[string]warmupAuthBinding, warmupAuthEligibilityStats) {
-	return eligibleCPACodexAuthsWithStats(files, true)
+	return eligibleCPACodexAuthsWithStats(files)
 }
 
-func eligibleCPACodexAuthsWithStats(files []cpaAuthFileEntry, requireSidecarMarker bool) (map[string]warmupAuthBinding, warmupAuthEligibilityStats) {
+func eligibleCPACodexAuthsWithStats(files []cpaAuthFileEntry) (map[string]warmupAuthBinding, warmupAuthEligibilityStats) {
 	eligible := make(map[string]warmupAuthBinding)
 	stats := newWarmupAuthEligibilityStats()
 	for _, file := range files {
@@ -1566,9 +1397,6 @@ func eligibleCPACodexAuthsWithStats(files []cpaAuthFileEntry, requireSidecarMark
 			stats.reject("inactive_status")
 			continue
 		}
-		// The pinned management request targets the Agent Identity gateway.
-		// Requiring an exact canonical Identity note prevents a future native
-		// OAuth credential from being sent to the wrong authentication endpoint.
 		authIndex := strings.TrimSpace(file.AuthIndex)
 		authID := strings.TrimSpace(file.ID)
 		if authID == "" {
@@ -1582,70 +1410,7 @@ func eligibleCPACodexAuthsWithStats(files []cpaAuthFileEntry, requireSidecarMark
 			stats.reject("missing_auth_index")
 			continue
 		}
-		if requireSidecarMarker && !trustedWarmupCredentialNote(file.Note) {
-			stats.reject("missing_sidecar_marker")
-			continue
-		}
-		binding := warmupAuthBinding{AuthID: authID, AuthIndex: authIndex}
-		for _, key := range []string{file.ID, file.AuthIndex, file.Name} {
-			if key = strings.TrimSpace(key); key != "" {
-				eligible[key] = binding
-			}
-		}
-		stats.Eligible++
-	}
-	return eligible, stats
-}
-
-func warmupEligibleHostAuths(files []pluginapi.HostAuthFileEntry) map[string]warmupAuthBinding {
-	eligible, _ := warmupEligibleHostAuthsWithStats(files, false)
-	return eligible
-}
-
-func warmupEligibleHostAuthsWithStats(files []pluginapi.HostAuthFileEntry, requireSidecarMarker bool) (map[string]warmupAuthBinding, warmupAuthEligibilityStats) {
-	eligible := make(map[string]warmupAuthBinding)
-	stats := newWarmupAuthEligibilityStats()
-	for _, file := range files {
-		stats.Seen++
-		provider := strings.TrimSpace(file.Provider)
-		if provider == "" {
-			provider = strings.TrimSpace(file.Type)
-		}
-		if !strings.EqualFold(provider, providerCodex) {
-			stats.reject("provider_mismatch")
-			continue
-		}
-		if file.Disabled {
-			stats.reject("disabled")
-			continue
-		}
-		if file.Unavailable {
-			stats.reject("unavailable")
-			continue
-		}
-		status := strings.TrimSpace(file.Status)
-		authID := strings.TrimSpace(file.ID)
-		if authID == "" {
-			authID = strings.TrimSpace(file.Name)
-		}
-		authIndex := strings.TrimSpace(file.AuthIndex)
-		if status != "" && !strings.EqualFold(status, "active") {
-			stats.reject("inactive_status")
-			continue
-		}
-		if authID == "" {
-			stats.reject("missing_auth_id")
-			continue
-		}
-		if authIndex == "" {
-			stats.reject("missing_auth_index")
-			continue
-		}
-		if requireSidecarMarker && !trustedWarmupCredentialNote(file.Note) {
-			stats.reject("missing_sidecar_marker")
-			continue
-		}
-		binding := warmupAuthBinding{AuthID: authID, AuthIndex: authIndex}
+		binding := warmupAuthBinding{AuthID: authID, AuthIndex: authIndex, AccountID: file.IDToken.AccountID}
 		for _, key := range []string{file.ID, file.AuthIndex, file.Name} {
 			if key = strings.TrimSpace(key); key != "" {
 				eligible[key] = binding

@@ -138,7 +138,7 @@ func (s *schedulerRuntimeState) setManualSerialActive(requestedAuthID string, no
 			Status: http.StatusServiceUnavailable, Code: "auth_inventory_unavailable", Message: "current CPA auth inventory is unavailable",
 		}
 	}
-	eligible, _ := eligibleCPACodexAuthsWithStats(files, false)
+	eligible, _ := eligibleCPACodexAuthsWithStats(files)
 	binding, ok := eligible[requestedAuthID]
 	if !ok {
 		return manualSerialActiveResult{}, &managementSerialActiveError{

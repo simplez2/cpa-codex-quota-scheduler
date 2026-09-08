@@ -304,16 +304,17 @@ func TestSchedulerConfigDefaultsToSerialAndValidatesThreshold(t *testing.T) {
 	if cfg.NormalCostQuantile != 0.75 || cfg.GuardCostQuantile != 0.90 || cfg.HighCostQuantile != 0.95 {
 		t.Fatalf("invalid quantiles were not reset: %#v", cfg)
 	}
-	if cfg.WarmupExecutionMode != "native" {
-		t.Fatalf("warmup transport default = %q; want native CPA", cfg.WarmupExecutionMode)
-	}
-	native, err := parsePluginConfig([]byte("warmup_execution_mode: native\n"))
+	legacy, err := parsePluginConfig([]byte("warmup_execution_mode: management\nwarmup_sidecar_url: http://removed.invalid\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if native.WarmupExecutionMode != "native" {
-		t.Fatalf("explicit native warmup mode = %q", native.WarmupExecutionMode)
+	values := panelSettingsValues(legacy)
+	for _, field := range []string{"warmup_execution_mode", "warmup_sidecar_url"} {
+		if _, exists := values[field]; exists {
+			t.Fatalf("removed field still exposed: %s", field)
+		}
 	}
+
 }
 
 func TestSchedulerConfigAllowsUserSelectedSerialHandoffMode(t *testing.T) {
@@ -479,7 +480,7 @@ func TestSerialConfigExampleParsesWithSafeRolloutValues(t *testing.T) {
 	if cfg.SchedulerMode != "serial" || cfg.SerialSwitchPercent != 98 || cfg.SerialHandoffMode != "threshold_only" || !cfg.SerialPreferActiveCycle || cfg.WarmupEnabled {
 		t.Fatalf("unsafe serial example: mode=%q threshold=%v active_cycle=%v warmup=%v", cfg.SchedulerMode, cfg.SerialSwitchPercent, cfg.SerialPreferActiveCycle, cfg.WarmupEnabled)
 	}
-	if cfg.WarmupExecutionMode != "native" || cfg.WarmupModel != "gpt-5.6-luna" || strings.Join(cfg.WindowOrder, ",") != "5h,weekly,monthly" {
-		t.Fatalf("unexpected warmup/window config: mode=%q model=%q order=%v", cfg.WarmupExecutionMode, cfg.WarmupModel, cfg.WindowOrder)
+	if cfg.WarmupModel != "gpt-5.6-luna" || strings.Join(cfg.WindowOrder, ",") != "5h,weekly,monthly" {
+		t.Fatalf("unexpected warmup/window config: model=%q order=%v", cfg.WarmupModel, cfg.WindowOrder)
 	}
 }

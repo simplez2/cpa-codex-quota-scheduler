@@ -78,7 +78,7 @@ func TestManualSerialSelectionSupportsOAuthAndPATAndPersists(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	files := []cpaAuthFileEntry{
 		{ID: "oauth-auth", AuthIndex: "oauth-index", Name: "oauth.json", Provider: providerCodex, Status: "active"},
-		{ID: "pat-auth", AuthIndex: "pat-index", Name: "pat.json", Provider: providerCodex, Status: "active", Note: "codex access token via sidecar"},
+		{ID: "pat-auth", AuthIndex: "pat-index", Name: "pat.json", Provider: providerCodex, Status: "active", Note: "imported account"},
 	}
 	state := newManualSelectionRuntime(t, files, map[string]quotaSnapshot{
 		"oauth-index": freshManualQuota("oauth-auth", "oauth-index", 5, now),

@@ -49,9 +49,8 @@ plugins:
       half_open_retry_after: 2m
       prefer_reset_credits: true
       window_order: [5h, weekly, monthly]
-      # Optional generation via CPA HostModel, separate from read-only quota queries.
+      # Optional generation via CPA api-call, using the same connection as quota queries.
       warmup_enabled: false
-      warmup_execution_mode: native
       warmup_model: gpt-5.6-luna
       warmup_retry_after: 15m
       # Pool-wide limits; failures count and reloads do not reset the budget.

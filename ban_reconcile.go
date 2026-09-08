@@ -337,10 +337,5 @@ func (s *schedulerRuntimeState) clearWarmupStateForAuth(authID string) {
 			delete(s.warmups, key)
 		}
 	}
-	for nonce, lease := range s.warmupLeases {
-		if lease.AuthID == authID {
-			delete(s.warmupLeases, nonce)
-		}
-	}
 	s.warmupMu.Unlock()
 }

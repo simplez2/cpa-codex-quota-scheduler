@@ -5,7 +5,7 @@ const handoff = [['threshold_only','达到使用阈值'],['reserve_aware','保�
 export const fields = [
   ['scheduler_mode','调度模式','allocation','select','均衡并发让多个账号共同承接请求，按余量、周预算及套餐容量分配；串行模式保留单账号连续使用。', [['balanced','均衡并发（推荐）'],['serial','串行调配'],['legacy','传统调度'],['shadow','观察对比'],['enforce','动态节奏控制']]],
   ['serial_allocation_policy','串行模式的周额度分配方式','allocation','select','均衡并发始终按周日均预算分配。', [['sustainable','按距重置时间的日均预算'],['weekly_remaining','按周剩余比例']]],
-  ['quota_default_plan','默认套餐','allocation','select','用于没有单独设置套餐的账号。倍率为容量参考，不是官方固定额度。',plans],
+  ['quota_default_plan','无法识别时的默认套餐','allocation','select','优先自动识别 CPA 返回的套餐；只有标签缺失、未知或缓存过期时使用此默认值。倍率是容量参考。',plans],
   ['serial_budget_rebalance_percent','日均预算优势达到多少时换号','allocation','number','百分比；0 关闭主动再平衡。仍需两次独立额度确认。',0,100,1],
   ['serial_weekly_rebalance_min_hold','主动换号前至少持有','allocation','duration','1 分钟至 24 小时。额度耗尽或 429 不受此等待限制。'],
   ['reserve_weekly_percent','周额度保留比例','allocation','number','百分比；仅在所有账号都进入保留区时才继续使用保留区。',0,99.9,.1],
@@ -14,13 +14,12 @@ export const fields = [
   ['reserve_5h_percent','5h 预留比例','allocation','number','零预留模式忽略此项；当前选择不会偷偷扣除余量。',0,99.9,.1],
   ['serial_prefer_active_cycle','优先使用已开始的周期','allocation','boolean','在符合额度条件的账号中优先考虑已开始计时的周期。'],
   ['serial_soft_continuation','允许旧会话越过软阈值','allocation','boolean','关闭时，后续会话请求跟随新账号；已输出内容的请求不回放。'],
-  ['quota_account_plans','每个账号的套餐','allocation','plans','未单独设置的账号沿用默认套餐。更换套餐仅影响调度参考，不会更改订阅。'],
+  ['quota_account_plans','每个账号的套餐','allocation','plans','默认自动识别 Team Standard、Team Premium 和 Plus。手动覆盖优先于自动识别，仅影响调度参考，不会更改订阅。'],
   ['warmup_enabled','自动预热','warmup','boolean','开启后产生少量真实模型请求；已确认周期不重复预热。均衡模式在真实请求进行中及结束后的短暂间隔内暂缓预热。'],
   ['warmup_model','预热模型','warmup','text','填写当前 CPA 支持的模型名称；不会更改客户端的默认模型。'],
   ['warmup_min_interval','两次预热至少间隔','warmup','duration','全账号池共用，1 分钟至 24 小时。'],
   ['warmup_max_per_day','滚动 24 小时最多预热','warmup','number','全账号池共用，失败也计入次数。',1,1000,1],
   ['warmup_retry_after','失败重试的基础等待','warmup','duration','至少 1 分钟；连续失败会延长等待，达到限制后需手动恢复。'],
-  ['warmup_execution_mode','预热执行方式','warmup','select','CPA 原生方式直接使用宿主模型能力；兼容方式使用高级设置中的预热请求地址。',[['native','CPA 原生模型调用'],['management','CPA 管理请求（兼容模式）']]],
   ['refresh_interval','活跃账号查询基础间隔','advanced','duration','默认 30 秒。均衡模式余量充足时降至每分钟；收到新额度响应头时延后重复查询，接近耗尽时加快。'],
   ['quota_refresh_cooldown','备用账号查询间隔','advanced','duration','30 秒至 24 小时；查询错误会独立退避。'],
   ['quota_refresh_batch','每轮最多查询账号数','advanced','number','请求按顺序发送；默认 8。',1,100,1],
@@ -33,7 +32,6 @@ export const fields = [
   ['cpa_management_key_file','管理密钥文件路径','connection','text','服务器或容器中的已挂载文件路径；面板不会读取或显示密钥内容。'],
   ['state_path','调度状态文件路径','connection','text','保存账号选择、额度缓存、冷却及预热记录。更换路径前需迁移已有状态。'],
   ['quota_url','上游额度查询地址','connection','url','默认使用 ChatGPT 原生额度接口。'],
-  ['warmup_sidecar_url','兼容模式预热请求地址','connection','url','仅兼容预热模式使用；CPA 原生模式不依赖此地址。'],
   ['priority','调度插件优先级','expert','number','多个调度插件并存时使用，较大的优先。',-100000,100000,1],
   ['serial_switch_percent','通用已用比例阈值','expert','number','适用于通用阈值策略。',.1,100,.1],
   ['serial_handoff_mode','通用换号方式','expert','select','不覆盖单独设置的 5h 换号方式。',handoff],
@@ -115,7 +113,7 @@ export function createSettingsEditor({api,notify,onSaved,onView}) {
     for(const id of ids) {
       const row=make('div','plan-row'),label=make('label','',id),select=make('select');
       select.setAttribute('aria-label','套餐 '+id);
-      select.append(new Option('沿用默认套餐',''));
+      select.append(new Option('自动识别（无法识别时用默认）',''));
       for(const [value,text]of plans)select.append(new Option(text,value));
       select.value=draft.quota_account_plans?.[id]||'';
       select.addEventListener('change',()=>{const map={...(draft.quota_account_plans||{})};if(select.value)map[id]=select.value;else delete map[id];draft.quota_account_plans=map;update();});

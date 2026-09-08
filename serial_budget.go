@@ -9,7 +9,7 @@ import (
 const serialBudgetResetFloor = 6 * time.Hour
 
 // Plan multipliers are approximate 5h priors, not guaranteed message counts or
-// weekly capacities. Ambiguous native "pro"/"team" labels cannot identify a seat.
+// weekly capacities. These are configuration aliases, not native SKU mappings.
 func normalizeQuotaPlan(raw string) (string, bool) {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case "plus":
@@ -36,13 +36,17 @@ func quotaPlanForAuth(cfg pluginConfig, id string) (string, float64) {
 	if !ok {
 		plan = "team_standard"
 	}
+	return plan, quotaPlanWeight(plan)
+}
+
+func quotaPlanWeight(plan string) float64 {
 	switch plan {
 	case "pro_5x", "team_premium":
-		return plan, 5
+		return 5
 	case "pro_20x":
-		return plan, 20
+		return 20
 	default:
-		return plan, 1
+		return 1
 	}
 }
 

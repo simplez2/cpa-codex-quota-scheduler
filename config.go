@@ -38,9 +38,7 @@ type pluginConfig struct {
 	CPAManagementURL             string
 	CPAManagementKeyFile         string
 	WarmupEnabled                bool
-	WarmupExecutionMode          string
 	WarmupModel                  string
-	WarmupSidecarURL             string
 	WarmupRetryAfter             time.Duration
 	WarmupMinInterval            time.Duration
 	WarmupMaxPerDay              int
@@ -92,9 +90,7 @@ type yamlPluginConfig struct {
 	CPAManagementURL             string            `yaml:"cpa_management_url"`
 	CPAManagementKeyFile         string            `yaml:"cpa_management_key_file"`
 	WarmupEnabled                *bool             `yaml:"warmup_enabled"`
-	WarmupExecutionMode          string            `yaml:"warmup_execution_mode"`
 	WarmupModel                  string            `yaml:"warmup_model"`
-	WarmupSidecarURL             string            `yaml:"warmup_sidecar_url"`
 	WarmupRetryAfter             string            `yaml:"warmup_retry_after"`
 	WarmupMinInterval            string            `yaml:"warmup_min_interval"`
 	WarmupMaxPerDay              *int              `yaml:"warmup_max_per_day"`
@@ -143,9 +139,7 @@ func defaultPluginConfig() pluginConfig {
 		DrainWindowHours:             6,
 		CPAManagementURL:             "http://127.0.0.1:8317/v0/management/api-call",
 		CPAManagementKeyFile:         "/run/secrets/management_key",
-		WarmupExecutionMode:          "native",
 		WarmupModel:                  "gpt-5.6-luna",
-		WarmupSidecarURL:             "http://codex-agent-identity-gateway:8787/backend-api/codex",
 		WarmupRetryAfter:             15 * time.Minute,
 		WarmupMinInterval:            15 * time.Minute,
 		WarmupMaxPerDay:              8,
@@ -284,18 +278,12 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 	if in.WarmupEnabled != nil {
 		cfg.WarmupEnabled = *in.WarmupEnabled
 	}
-	if strings.TrimSpace(in.WarmupExecutionMode) != "" {
-		cfg.WarmupExecutionMode = strings.TrimSpace(in.WarmupExecutionMode)
-	}
 	if strings.TrimSpace(in.WarmupModel) != "" {
 		model, err := validateWarmupModel(in.WarmupModel)
 		if err != nil {
 			return cfg, err
 		}
 		cfg.WarmupModel = model
-	}
-	if strings.TrimSpace(in.WarmupSidecarURL) != "" {
-		cfg.WarmupSidecarURL = strings.TrimRight(strings.TrimSpace(in.WarmupSidecarURL), "/")
 	}
 	if v, ok := parseDuration(in.WarmupRetryAfter); ok {
 		cfg.WarmupRetryAfter = v
@@ -392,7 +380,6 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 	cfg.SchedulerMode = normalizeSchedulerMode(cfg.SchedulerMode)
 	cfg.SerialHandoffMode = normalizeSerialHandoffMode(cfg.SerialHandoffMode)
 	cfg.Serial5hHandoffMode = normalizeSerial5hHandoffMode(cfg.Serial5hHandoffMode)
-	cfg.WarmupExecutionMode = normalizeWarmupExecutionMode(cfg.WarmupExecutionMode)
 	if cfg.RefreshInterval < time.Second {
 		cfg.RefreshInterval = time.Second
 	}
@@ -404,9 +391,6 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 	}
 	if cfg.WarmupModel == "" {
 		cfg.WarmupModel = "gpt-5.6-luna"
-	}
-	if cfg.WarmupSidecarURL == "" {
-		cfg.WarmupSidecarURL = "http://codex-agent-identity-gateway:8787/backend-api/codex"
 	}
 	if cfg.StaleAfter < cfg.RefreshInterval {
 		cfg.StaleAfter = 15 * time.Minute
@@ -498,15 +482,6 @@ func normalizeSerial5hHandoffMode(raw string) string {
 		return "429_only"
 	default:
 		return "inherit_global"
-	}
-}
-
-func normalizeWarmupExecutionMode(raw string) string {
-	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case "native", "host", "host-model", "host_model":
-		return "native"
-	default:
-		return "management"
 	}
 }
 

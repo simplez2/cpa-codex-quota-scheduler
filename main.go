@@ -105,7 +105,7 @@ import (
 
 const (
 	pluginName    = "codex-quota-scheduler"
-	pluginVersion = "0.3.0"
+	pluginVersion = "0.3.1"
 
 	// providerCodex is the CPA provider key for OpenAI Codex (ChatGPT backend).
 	providerCodex = "codex"
@@ -124,7 +124,6 @@ const (
 	usedPercentThreshold = 100
 
 	managementRoutePrefix = "/plugins/" + pluginName
-	warmupRequestHeader   = "X-CPA-Warmup-Request"
 )
 
 // banStore keeps a credential quarantined until an explicit half-open probe
@@ -544,18 +543,16 @@ func pluginRegistration() registration {
 				{Name: "serial_allocation_policy", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"sustainable", "weekly_remaining"}, Description: "Default sustainable uses safe 5h headroom then normalized weekly budget until reset. weekly_remaining retains raw weekly percentage ranking."},
 				{Name: "serial_budget_rebalance_percent", Type: pluginapi.ConfigFieldTypeNumber, Description: "Relative weekly budget advantage before proactive sustainable handoff (default 20 percent, 0 disables); requires independent evidence and minimum hold."},
 				{Name: "serial_soft_continuation", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Legacy session continuation past a soft threshold; defaults false so subsequent session requests follow the replacement."},
-				{Name: "quota_default_plan", Type: pluginapi.ConfigFieldTypeString, Description: "Default capacity prior: team_standard (default), plus, pro_5x, pro_20x or team_premium. Per-auth quota_account_plans YAML overrides are supported; priors are not guaranteed weekly limits."},
+				{Name: "quota_default_plan", Type: pluginapi.ConfigFieldTypeString, Description: "Fallback capacity prior when native plan detection is unavailable: team_standard (default), plus, pro_5x, pro_20x or team_premium. Explicit quota_account_plans overrides take precedence over detection. Priors are not guaranteed weekly limits."},
 				{Name: "serial_weekly_rebalance_percent", Type: pluginapi.ConfigFieldTypeNumber, Description: "Weekly remaining percentage-point advantage required for proactive serial balancing (default 10, 0 disables). Two distinct fresh observations of both accounts are required."},
 				{Name: "serial_weekly_rebalance_min_hold", Type: pluginapi.ConfigFieldTypeString, Description: "Minimum primary hold before proactive weekly balancing (1m-24h, default 5m). Hard limits, quarantine and other safety handoffs do not wait."},
 				{Name: "quota_refresh_cooldown", Type: pluginapi.ConfigFieldTypeString, Description: "Per-account cooldown for standby native quota queries. Defaults to 2m; the active account uses refresh_interval."},
 				{Name: "quota_url", Type: pluginapi.ConfigFieldTypeString, Description: "Native Codex quota endpoint queried via CPA api-call. Defaults to https://chatgpt.com/backend-api/wham/usage."},
 				{Name: "quota_refresh_batch", Type: pluginapi.ConfigFieldTypeInteger, Description: "Maximum sequential quota queries per refresh tick (1-100, default 8)."},
-				{Name: "cpa_management_url", Type: pluginapi.ConfigFieldTypeString, Description: "CPA Management api-call endpoint for native quota queries and optional management warmup; auth-files is resolved under the same base path."},
+				{Name: "cpa_management_url", Type: pluginapi.ConfigFieldTypeString, Description: "CPA Management api-call endpoint shared by quota polling and warmup; auth-files is resolved under the same base path. No separate warmup endpoint is required."},
 				{Name: "cpa_management_key_file", Type: pluginapi.ConfigFieldTypeString, Description: "Mounted owner-readable CPA management key file; the key is never placed in YAML or logs."},
 				{Name: "warmup_enabled", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Optional budgeted activation of idle Codex quota windows. Requires a writable state file and fresh eligible quota; defaults to false."},
-				{Name: "warmup_execution_mode", Type: pluginapi.ConfigFieldTypeString, Description: "Warmup transport. management is bounded and hot-reload safe; native requires a CPA HostModel implementation with a verified bounded timeout."},
 				{Name: "warmup_model", Type: pluginapi.ConfigFieldTypeString, Description: "Model used for the minimal pinned activation request; this does not change any route default."},
-				{Name: "warmup_sidecar_url", Type: pluginapi.ConfigFieldTypeString, Description: "Internal Codex Agent Identity sidecar base URL used by pinned warmup."},
 				{Name: "warmup_retry_after", Type: pluginapi.ConfigFieldTypeString, Description: "Base delay for exponential warmup failure backoff. Three failures require explicit repair/retry; uncertain outcomes wait at least 5h."},
 				{Name: "warmup_min_interval", Type: pluginapi.ConfigFieldTypeString, Description: "Durable pool-wide spacing between warmup attempts (1m-24h, default 15m)."},
 				{Name: "warmup_max_per_day", Type: pluginapi.ConfigFieldTypeInteger, Description: "Maximum admitted warmups across the pool in a rolling 24h window (1-1000, default 8), including failures."},

@@ -38,7 +38,7 @@ type balancedAccountStatus struct {
 }
 
 func balancedWeight(choice serialCandidate, cfg pluginConfig, now time.Time) float64 {
-	_, capacity := quotaPlanForAuth(cfg, choice.Candidate.ID)
+	_, capacity, _ := resolvedQuotaPlan(cfg, choice.Candidate.ID, choice.Snapshot, now)
 	// At identical percentages/reset times, larger plans carry proportionally
 	// more work. The scarcer of 5h headroom and weekly daily budget sets pace.
 	pace := 1.0

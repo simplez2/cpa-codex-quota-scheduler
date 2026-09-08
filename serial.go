@@ -382,7 +382,7 @@ func (s *schedulerRuntimeState) annotateSerialCandidateLocked(choice *serialCand
 	if s.serialLastSelected != nil {
 		choice.LastSelectedAt = s.serialLastSelected[choice.Candidate.ID]
 	}
-	choice.Plan, choice.PlanWeight = quotaPlanForAuth(s.cfg, choice.Candidate.ID)
+	choice.Plan, choice.PlanWeight, _ = resolvedQuotaPlan(s.cfg, choice.Candidate.ID, choice.Snapshot, now)
 	fiveHourMode, _ := serialWindowHandoffPolicy(s.cfg, "5h")
 	fiveHourReserve := s.cfg.Reserve5hPercent
 	if fiveHourMode == "429_only" {

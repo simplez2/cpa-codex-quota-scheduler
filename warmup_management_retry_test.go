@@ -34,7 +34,7 @@ func TestManagementWarmupNonRetryableFailuresStayBlocked(t *testing.T) {
 				case "/v0/management/auth-files":
 					_ = json.NewEncoder(w).Encode(map[string]any{"files": []map[string]any{{
 						"id": "acct", "auth_index": "idx-acct", "provider": providerCodex,
-						"status": "active", "note": "Agent Identity via sidecar",
+						"status": "active", "note": "imported account",
 					}}})
 				case "/v0/management/api-call":
 					apiCalls.Add(1)
@@ -123,7 +123,7 @@ func TestManagementWarmupHTTPAuthFailuresStayBlocked(t *testing.T) {
 				case "/v0/management/auth-files":
 					_ = json.NewEncoder(w).Encode(map[string]any{"files": []map[string]any{{
 						"id": "acct", "auth_index": "idx-acct", "provider": providerCodex,
-						"status": "active", "note": "Agent Identity via sidecar",
+						"status": "active", "note": "imported account",
 					}}})
 				case "/v0/management/api-call":
 					apiCalls.Add(1)
@@ -169,7 +169,7 @@ func TestManagementWarmup429DoesNotImmediatelyRetry(t *testing.T) {
 		case "/v0/management/auth-files":
 			_ = json.NewEncoder(w).Encode(map[string]any{"files": []map[string]any{{
 				"id": "acct", "auth_index": "idx-acct", "provider": providerCodex,
-				"status": "active", "note": "Agent Identity via sidecar",
+				"status": "active", "note": "imported account",
 			}}})
 		case "/v0/management/api-call":
 			apiCalls.Add(1)
@@ -207,10 +207,10 @@ func newManagementWarmupRuntimeForRetryTest(t *testing.T, serverURL, keyPath str
 	t.Helper()
 	cfg := defaultPluginConfig()
 	cfg.WarmupEnabled = true
-	cfg.WarmupExecutionMode = "management"
+
 	cfg.CPAManagementURL = serverURL + "/v0/management/api-call"
 	cfg.CPAManagementKeyFile = keyPath
-	cfg.WarmupSidecarURL = serverURL + "/backend-api/codex"
+
 	cfg.WarmupRetryAfter = time.Nanosecond
 	cfg.StatePath = filepath.Join(t.TempDir(), "state.json")
 	now := time.Now()

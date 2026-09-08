@@ -57,6 +57,8 @@ type nativeRateLimit struct {
 // before dispatch, never advanced when a cached snapshot is read.
 func parseNativeQuota(raw []byte, authID, index string, observedAt time.Time) (quotaSnapshot, error) {
 	var response struct {
+		AccountID  json.RawMessage  `json:"account_id"`
+		PlanType   json.RawMessage  `json:"plan_type"`
 		RateLimit  *nativeRateLimit `json:"rate_limit"`
 		Additional []struct {
 			RateLimit *nativeRateLimit `json:"rate_limit"`
@@ -70,6 +72,19 @@ func parseNativeQuota(raw []byte, authID, index string, observedAt time.Time) (q
 		return quotaSnapshot{}, errors.New("missing_rate_limit")
 	}
 	out := quotaSnapshot{AuthID: authID, AuthIndex: index, RefreshedAt: observedAt}
+	var accountID string
+	if json.Unmarshal(response.AccountID, &accountID) == nil {
+		out.AccountID = normalizeNativePlanType(accountID)
+	}
+	var planType string
+	// Optional metadata must not invalidate an otherwise usable quota response.
+	if json.Unmarshal(response.PlanType, &planType) == nil {
+		out.Plan.Type = normalizeNativePlanType(planType)
+	}
+	out.Plan.ObservedAt = observedAt
+	if out.Plan.Type != "" {
+		out.Plan.Source = "cpa_usage"
+	}
 	if response.ResetCredits != nil && *response.ResetCredits >= 0 {
 		out.ResetCredits = *response.ResetCredits
 	}
@@ -371,6 +386,12 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 		} else {
 			poll.Failures = 0
 			poll.Error = ""
+			if snapshot.Plan.Type == "" {
+				snapshot.Plan.Type = normalizeNativePlanType(auth.IDToken.PlanType)
+				if snapshot.Plan.Type != "" {
+					snapshot.Plan.Source = "cpa_auth_files"
+				}
+			}
 			s.quotaRunway.Observe(snapshot, time.Now())
 			if s.quotaNative == nil {
 				s.quotaNative = make(map[string]quotaSnapshot)

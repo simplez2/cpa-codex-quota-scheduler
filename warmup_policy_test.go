@@ -203,7 +203,7 @@ func TestScheduleWarmupConcurrentAndReloadedCallsSendOnce(t *testing.T) {
 		switch r.URL.Path {
 		case "/v0/management/auth-files":
 			inventoryCalls.Add(1)
-			files := []cpaAuthFileEntry{{ID: "a", AuthIndex: "idx-a", Provider: "codex", Status: "active", Note: "Agent Identity via sidecar"}, {ID: "b", AuthIndex: "idx-b", Provider: "codex", Status: "active", Note: "Agent Identity via sidecar"}}
+			files := []cpaAuthFileEntry{{ID: "a", AuthIndex: "idx-a", Provider: "codex", Status: "active", Note: "imported account"}, {ID: "b", AuthIndex: "idx-b", Provider: "codex", Status: "active", Note: "imported account"}}
 			_ = json.NewEncoder(w).Encode(map[string]any{"files": files})
 		case "/v0/management/api-call":
 			calls.Add(1)
@@ -215,7 +215,7 @@ func TestScheduleWarmupConcurrentAndReloadedCallsSendOnce(t *testing.T) {
 	defer server.Close()
 	cfg := defaultPluginConfig()
 	cfg.StatePath = filepath.Join(root, "state.json")
-	cfg.WarmupEnabled, cfg.WarmupExecutionMode = true, "management"
+	cfg.WarmupEnabled = true
 	cfg.CPAManagementURL, cfg.CPAManagementKeyFile = server.URL+"/v0/management/api-call", key
 	newState := func() *schedulerRuntimeState {
 		s := newManagedRuntimeForTest(t, cfg.StatePath)
@@ -267,7 +267,7 @@ func TestScheduleWarmupDoesNotSendWhenAdmissionCannotPersist(t *testing.T) {
 	root := t.TempDir()
 	cfg := defaultPluginConfig()
 	cfg.StatePath, cfg.CPAManagementKeyFile = filepath.Join(root, "state.json"), filepath.Join(root, "key")
-	cfg.WarmupEnabled, cfg.WarmupExecutionMode = true, "management"
+	cfg.WarmupEnabled = true
 	if err := os.WriteFile(cfg.CPAManagementKeyFile, []byte("test-key"), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -281,7 +281,7 @@ func TestScheduleWarmupDoesNotSendWhenAdmissionCannotPersist(t *testing.T) {
 			if err := os.Mkdir(cfg.StatePath, 0700); err != nil {
 				t.Error(err)
 			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"files": []cpaAuthFileEntry{{ID: "a", AuthIndex: "idx-a", Provider: "codex", Status: "active", Note: "Agent Identity via sidecar"}}})
+			_ = json.NewEncoder(w).Encode(map[string]any{"files": []cpaAuthFileEntry{{ID: "a", AuthIndex: "idx-a", Provider: "codex", Status: "active", Note: "imported account"}}})
 			return
 		}
 		calls.Add(1)
