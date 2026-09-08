@@ -675,27 +675,6 @@ func schedulerHeader(options pluginapi.SchedulerOptions, name string) string {
 	return ""
 }
 
-func schedulerSessionHash(req pluginapi.SchedulerPickRequest) string {
-	value := schedulerHeader(req.Options, "X-Session-ID")
-	if value == "" {
-		value = schedulerHeader(req.Options, "Session-Id")
-	}
-	if value == "" {
-		value = schedulerHeader(req.Options, "Session_id")
-	}
-	if value == "" {
-		value = extractMetadataString(req.Options.Metadata, "session_id", "sessionId", "execution_session_id", "executionSessionId", "conversation_id", "conversationId")
-	}
-	if value == "" {
-		value = schedulerHeader(req.Options, "X-Client-Request-Id")
-	}
-	if value == "" {
-		return ""
-	}
-	sum := sha256.Sum256([]byte(value))
-	return hex.EncodeToString(sum[:12])
-}
-
 func (s *schedulerRuntimeState) applyStickyLocked(req pluginapi.SchedulerPickRequest, choices []pacingCandidate, now time.Time) pacingCandidate {
 	best := choices[0]
 	if s.cfg.StickySeconds <= 0 {

@@ -3,7 +3,7 @@ const handoff = [['threshold_only','达到使用阈值'],['reserve_aware','保�
 // Metadata is presentation only. Defaults and validation come from the running
 // plugin so an omitted YAML field is never silently saved as zero or empty.
 export const fields = [
-  ['scheduler_mode','调度模式','allocation','select','均衡并发让多个账号共同承接请求，按余量、周预算及套餐容量分配；串行模式保留单账号连续使用。', [['balanced','均衡并发（推荐）'],['serial','串行调配'],['legacy','传统调度'],['shadow','观察对比'],['enforce','动态节奏控制']]],
+  ['scheduler_mode','调度模式','allocation','select','均衡并发按会话分配：新会话按余量、周预算及套餐容量选择账号；同一会话的续聊、工具调用和并发请求保持绑定。账号不可用时才切换。', [['balanced','均衡并发（会话粘性）'],['serial','串行调配'],['legacy','传统调度'],['shadow','观察对比'],['enforce','动态节奏控制']]],
   ['serial_allocation_policy','串行模式的周额度分配方式','allocation','select','均衡并发始终按周日均预算分配。', [['sustainable','按距重置时间的日均预算'],['weekly_remaining','按周剩余比例']]],
   ['quota_default_plan','无法识别时的默认套餐','allocation','select','优先自动识别 CPA 返回的套餐；只有标签缺失、未知或缓存过期时使用此默认值。倍率是容量参考。',plans],
   ['serial_budget_rebalance_percent','日均预算优势达到多少时换号','allocation','number','百分比；0 关闭主动再平衡。仍需两次独立额度确认。',0,100,1],
@@ -43,7 +43,7 @@ export const fields = [
   ['reserve_monthly_percent','月额度保留比例','expert','number','存在月额度窗口时使用。',0,99.9,.1],
   ['soft_limit_percent','动态调度软阈值','expert','number','已用百分比；主要用于非串行模式。',.1,100,.1],
   ['low_quota_percent','进入低余量区的比例','expert','number','剩余百分比；提升动态消耗估计分位。',.1,100,.1],
-  ['sticky_seconds','会话绑定空闲有效期','expert','number','秒；0 关闭绑定。',0,864000,1],
+  ['sticky_seconds','会话绑定空闲有效期','allocation','number','秒；默认 1500（25 分钟）。请求和完成时续期，生成中的会话不按空闲过期；0 关闭绑定。均衡模式不因其他账号额度更多而打断绑定。',0,864000,1],
   ['switch_confirmations','动态候选连续获胜次数','expert','number','主要用于非串行会话绑定切换。',1,100,1],
   ['cost_sample_limit','保留的请求成本样本数','expert','number','动态节奏评估的内存样本上限。',32,100000,1],
   ['decision_history_limit','保留的调度决策条数','expert','number','只保留脱敏后的决策记录。',1,10000,1],

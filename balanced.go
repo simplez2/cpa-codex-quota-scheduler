@@ -13,9 +13,10 @@ import (
 const balancedPendingTTL = 2 * time.Hour
 
 type balancedPending struct {
-	At    time.Time
-	Model string
-	Cost  float64
+	Session string
+	At      time.Time
+	Model   string
+	Cost    float64
 }
 
 // Credits are local fair-share work units, never an upstream quota reservation.
@@ -65,7 +66,17 @@ func (s *schedulerRuntimeState) balancedPick(req pluginapi.SchedulerPickRequest,
 		}
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	now = s.balancedTimeLocked(now)
+	bindingChanged := false
+	defer func() {
+		s.mu.Unlock()
+		// New conversations and failovers are durable. Continuations renew in
+		// memory and piggyback on the regular state flush instead of disk I/O
+		// for every model/tool request.
+		if bindingChanged {
+			s.persistBanState()
+		}
+	}()
 	if !s.cfg.Enabled {
 		return pluginapi.SchedulerPickResponse{}
 	}
@@ -78,6 +89,17 @@ func (s *schedulerRuntimeState) balancedPick(req pluginapi.SchedulerPickRequest,
 		}
 	}
 	pinned := serialPinnedAuthID(req)
+	session, parent := "", ""
+	if s.cfg.StickySeconds > 0 && pinned == "" {
+		session = schedulerSessionHash(req)
+		parent = schedulerParentSessionHash(req)
+	}
+	s.pruneBalancedSessionsLocked(now)
+	binding, bound := s.balancedSessionLocked(session, now)
+	if !bound && parent != "" {
+		binding, bound = s.balancedSessionLocked(parent, now)
+	}
+	var sticky *serialCandidate
 	choices := []serialCandidate{}
 	bestTier := 10
 	seen := map[string]bool{}
@@ -92,6 +114,14 @@ func (s *schedulerRuntimeState) balancedPick(req pluginapi.SchedulerPickRequest,
 		choice := inspectSerialCandidate(candidate, snapshot, found, s.cfg, now)
 		if !choice.Eligible && choice.Reason != "serial_threshold" {
 			continue
+		}
+		// A live conversation stays on an available account even if another
+		// plan or weekly budget scores better. Hard quota and CPA's filtered
+		// candidates remain authoritative; soft tiers only place new sessions.
+		if bound && choice.Candidate.ID == binding.AuthID &&
+			(binding.AuthIndex == "" || !found || binding.AuthIndex == snapshot.AuthIndex) {
+			copy := choice
+			sticky = &copy
 		}
 		tier := 0
 		if choice.WeeklyProtected {
@@ -113,6 +143,18 @@ func (s *schedulerRuntimeState) balancedPick(req pluginapi.SchedulerPickRequest,
 	}
 	if len(choices) == 0 {
 		return pluginapi.SchedulerPickResponse{}
+	}
+	if sticky != nil {
+		present := false
+		for _, choice := range choices {
+			if choice.Candidate.ID == sticky.Candidate.ID {
+				present = true
+				break
+			}
+		}
+		if !present {
+			choices = append(choices, *sticky)
+		}
 	}
 	// Sorting makes simultaneous equal-share starts independent of host order.
 	sort.Slice(choices, func(i, j int) bool { return choices[i].Candidate.ID < choices[j].Candidate.ID })
@@ -140,10 +182,17 @@ func (s *schedulerRuntimeState) balancedPick(req pluginapi.SchedulerPickRequest,
 		id := choice.Candidate.ID
 		account := s.balancedAccounts[id]
 		account.Credit = math.Max(-limit, math.Min(limit, account.Credit+cost*account.Weight/total))
-		if account.Credit > bestScore {
+		// Capped credits can tie after many cheap sticky continuations. Prefer
+		// the least recently selected account instead of permanently favoring
+		// the lexicographically first credential at that ceiling.
+		if account.Credit > bestScore || (account.Credit == bestScore && selected != "" && account.LastPicked.Before(s.balancedAccounts[selected].LastPicked)) {
 			selected = id
 			bestScore = account.Credit
 		}
+	}
+	if sticky != nil {
+		selected = sticky.Candidate.ID
+		s.balancedSessionHits++
 	}
 	account := s.balancedAccounts[selected]
 	account.Credit -= cost
@@ -152,7 +201,19 @@ func (s *schedulerRuntimeState) balancedPick(req pluginapi.SchedulerPickRequest,
 	if len(account.Pending) >= 256 {
 		account.Pending = account.Pending[1:]
 	}
-	account.Pending = append(account.Pending, balancedPending{At: now, Model: normalizeModelName(req.Model), Cost: cost})
+	account.Pending = append(account.Pending, balancedPending{At: now, Model: normalizeModelName(req.Model), Cost: cost, Session: session})
+	if session != "" {
+		var index string
+		for _, choice := range choices {
+			if choice.Candidate.ID == selected {
+				index = choice.Snapshot.AuthIndex
+				break
+			}
+		}
+		bindingChanged = s.bindBalancedSessionLocked(session, selected, index, now)
+	} else if pinned == "" {
+		s.balancedUnkeyedRequests++
+	}
 	return pluginapi.SchedulerPickResponse{Handled: true, AuthID: selected}
 }
 
@@ -174,6 +235,7 @@ func (a *balancedAccount) prune(now time.Time) {
 func (s *schedulerRuntimeState) observeBalancedUsage(record pluginapi.UsageRecord, now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	now = s.balancedTimeLocked(now)
 	id := strings.TrimSpace(record.AuthID)
 	if id == "" {
 		id = s.identities[strings.TrimSpace(record.AuthIndex)]
@@ -209,7 +271,13 @@ func (s *schedulerRuntimeState) observeBalancedUsage(record pluginapi.UsageRecor
 	if index < 0 {
 		return
 	}
-	predicted := account.Pending[index].Cost
+	pending := account.Pending[index]
+	if binding, ok := s.balancedSessions[pending.Session]; ok && binding.AuthID == id &&
+		(record.AuthIndex == "" || binding.AuthIndex == "" || record.AuthIndex == binding.AuthIndex) && now.After(binding.LastUsedAt) {
+		binding.LastUsedAt = now
+		s.balancedSessions[pending.Session] = binding
+	}
+	predicted := pending.Cost
 	account.Pending = append(account.Pending[:index], account.Pending[index+1:]...)
 	if account.Completed == nil {
 		account.Completed = map[string]time.Time{}

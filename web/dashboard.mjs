@@ -170,15 +170,19 @@ function renderAccounts() {
 function renderPolicy() {
   const policy = $('policy'); policy.replaceChildren();
   const noReserve = state.serial_5h_handoff_mode === '429_only';
-  const modes = {balanced:'均衡并发',serial:'串行调度',legacy:'传统调度',shadow:'观察模式',enforce:'强制调度'};
+  const modes = {balanced:'均衡并发 · 会话粘性',serial:'串行调度',legacy:'传统调度',shadow:'观察模式',enforce:'强制调度'};
   const hold = String(state.serial_weekly_rebalance_min_hold || '').replace(/([hm])0s$/,'$1').replace(/(\d+)h/g,'$1 小时 ').replace(/(\d+)m/g,'$1 分钟 ').replace(/(\d+)s/g,'$1 秒').trim();
   const pairs = [
     ['调度模式',modes[state.scheduler_mode] || state.scheduler_mode],
-    ['分配策略',state.scheduler_mode==='balanced'?'5h 余量 × 套餐容量，兼顾周日均预算':state.serial_allocation_policy === 'sustainable' ? '按周日均预算平衡' : '按周剩余比例平衡'],
+    ['分配策略',state.scheduler_mode==='balanced'?'新会话按 5h 余量、套餐容量和周日均预算分配':state.serial_allocation_policy === 'sustainable' ? '按周日均预算平衡' : '按周剩余比例平衡'],
     ['5h 切换',noReserve ? '额度用尽 / 上游限额时切换' : state.serial_5h_handoff_mode],
     ['5h 预留',noReserve ? '0%（不提前预留）' : pct(state.reserve_5h_percent)],
-    [state.scheduler_mode==='balanced'?'并发分配':'主动再平衡最短持有',state.scheduler_mode==='balanced'?'请求到来时记账，完成后校正':hold],
-    ['最近切换',dateText(state.serial_last_switch_at)]
+    [state.scheduler_mode==='balanced'?'并发分配':'主动再平衡最短持有',state.scheduler_mode==='balanced'?'同一会话保持账号，各会话可并发':hold],
+    ...(state.scheduler_mode==='balanced' ? [
+      ['会话绑定',state.sticky_seconds>0 ? (state.balanced_sticky_bindings||0)+' 个 · 空闲 '+state.sticky_seconds+' 秒后到期' : '已关闭'],
+      ['绑定命中 / 不可用换号',(state.balanced_session_hits||0)+' / '+(state.balanced_session_switches||0)],
+      ['缺少会话标识请求',(state.balanced_unkeyed_requests||0)+' 次 · 无标识时按单次请求分配']
+    ] : [['最近切换',dateText(state.serial_last_switch_at)]])
   ];
   for (const [label,value] of pairs) {
     const row = element('div'); row.append(element('dt','',label),element('dd','',value || '—')); policy.append(row);
@@ -220,12 +224,12 @@ function render() {
   const accounts = state.snapshots || [];
   $('content').hidden = false; $('login').hidden = true;
   const balanced=state.scheduler_mode==='balanced';
-  $('active-account').textContent = balanced?'多账号共同承接请求':state.serial_active_auth_id || '等待首个请求选择账号';
-  $('selection-mode').textContent = balanced?'均衡并发':state.serial_manual_selection ? '手动指定' : '自动调配';
+  $('active-account').textContent = balanced?'多账号按会话承接请求':state.serial_active_auth_id || '等待首个请求选择账号';
+  $('selection-mode').textContent = balanced?'均衡并发 · 会话粘性':state.serial_manual_selection ? '手动指定' : '自动调配';
   $('auto-select').hidden=balanced||!state.serial_manual_selection;
   $('auto-select').disabled=operating||editor.isSaving();
   $('active-detail').textContent = state.serial_active_auth_id ? '选中于 ' + dateText(state.serial_selected_at) + (state.serial_last_switch_reason ? ' · ' + (reasons[state.serial_last_switch_reason] || state.serial_last_switch_reason) : '') : '额度查询继续运行，收到请求后按可用额度选择。';
-  if(balanced)$('active-detail').textContent='相近余量轮流分配，预算宽裕的账号多承担；请求中的预计消耗已计入分配。';
+  if(balanced)$('active-detail').textContent='新会话按可用预算均衡分配；同一会话续聊、工具调用和并发请求保持账号，只有额度耗尽或账号不可用时换号。切换后继续绑定替换账号。';
   $('eligible-count').replaceChildren(document.createTextNode(String(accounts.filter(usable).length)),element('small','', ' / ' + accounts.length));
   $('switch-count').textContent = String(state.serial_switches ?? 0);
   $('cooldown-count').textContent = String(state.quarantine?.cooldown ?? 0);

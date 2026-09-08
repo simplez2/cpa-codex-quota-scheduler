@@ -99,10 +99,29 @@ serial remains the default and pacing retains built-in cost estimates.
 
 ## Routing and recovery
 
-Select **均衡并发** in the panel to spread requests across accounts. This does
-not limit the pool to one active request or one account. Equivalent accounts
-receive even shares; unequal plans and budgets receive weighted shares. Existing
-installations keep their configured mode until it is changed in the panel.
+Select **均衡并发（会话粘性）** in the panel to distribute new conversations
+across accounts. Turns, tool calls, model changes and concurrent requests within
+one conversation stay on its eligible account; different conversations can run
+on different accounts simultaneously. New conversations receive weighted shares
+based on plan capacity and available budgets. Existing installations keep their
+configured mode until it is changed in the panel.
+
+CPA's plugin scheduler runs before its native affinity selector, so the plugin
+owns its balanced-mode bindings. It consumes CPA's `canonical_session_id` and
+`caller_scope`, with native session/thread headers as fallbacks. A known CPA
+`parent_session_id` can seed a child binding without coupling later failovers.
+No other plugin is required. Per-request IDs are never used as conversation IDs.
+Requests with no session identity remain individually balanced and are counted
+in the panel; clients must supply a stable session/thread identity for affinity.
+
+The panel's **会话绑定空闲有效期** (`sticky_seconds`, default 1500 seconds) renews
+on requests and matched completions; a tracked in-flight generation does not
+expire as idle. Set it to 0 to disable affinity. Better relative quota, plan
+weights, or soft budget thresholds never preempt an active conversation. Hard
+quota limits, quarantine/429, an unavailable credential or an incompatible model
+allow failover and rebind the conversation to its replacement. Explicit account
+pins remain isolated from ordinary conversation bindings. An already emitted
+stream cannot be transparently replayed by this selection change.
 
 Balanced mode first excludes hard-limited/quarantined accounts and prefers
 fresh usable accounts outside the weekly reserve. It then uses smooth weighted
@@ -117,8 +136,10 @@ requests cannot all choose a stale best score. Completion token costs correct
 that estimate with bounded debt; cost estimates never mark quota exhausted.
 The host ABI has no shared selection/completion request ID, so outstanding work
 is labeled an estimate and unmatched/expired completions cannot debit new work.
-Short-lived fairness history resets on reload; quota/bans/warmup history stays
-persisted. Balanced mode postpones optional warmup while foreground requests
+Short-lived fairness history resets on reload. Hashed conversation bindings
+(up to 8192) persist on creation/failover and renew through regular state saves,
+alongside quota/bans/warmup history. The cache expires idle entries and evicts
+the least recently used entry at capacity. Balanced mode postpones optional warmup while foreground requests
 are active and for a one-minute quiet interval. These controls reduce redundant
 traffic and bursts; they do not guarantee avoidance of upstream risk controls.
 

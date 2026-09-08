@@ -111,8 +111,14 @@ type schedulerRuntimeState struct {
 	lastBanClearReason         string
 	lastBanClearAt             time.Time
 
-	pickCounter      uint64
-	balancedAccounts map[string]*balancedAccount
+	pickCounter             uint64
+	balancedClock           time.Time
+	balancedAccounts        map[string]*balancedAccount
+	balancedSessions        map[string]balancedSessionBinding
+	balancedSessionPrunedAt time.Time
+	balancedSessionHits     uint64
+	balancedSessionSwitches uint64
+	balancedUnkeyedRequests uint64
 
 	pricing             map[string]modelPricing
 	costSamples         map[string][]float64
@@ -176,7 +182,13 @@ func configureSchedulerRuntime(raw []byte) {
 	schedulerRuntime.quotaPolls = make(map[string]quotaPollState)
 	schedulerRuntime.quotaRunway = quotaRunwayTracker{}
 	schedulerRuntime.quotaNative = make(map[string]quotaSnapshot)
+	schedulerRuntime.balancedClock = time.Time{}
 	schedulerRuntime.balancedAccounts = make(map[string]*balancedAccount)
+	schedulerRuntime.balancedSessions = make(map[string]balancedSessionBinding)
+	schedulerRuntime.balancedSessionPrunedAt = time.Time{}
+	schedulerRuntime.balancedSessionHits = 0
+	schedulerRuntime.balancedSessionSwitches = 0
+	schedulerRuntime.balancedUnkeyedRequests = 0
 	schedulerRuntime.quotas = make(map[string]quotaSnapshot)
 	schedulerRuntime.identities = make(map[string]string)
 	schedulerRuntime.lastRefresh = time.Time{}
@@ -1008,6 +1020,7 @@ func (s *schedulerRuntimeState) nextPick(n int) int {
 }
 
 type persistedBanState struct {
+	BalancedSessions       map[string]balancedSessionBinding `json:"balanced_sessions,omitempty"`
 	QuotaPolls             map[string]quotaPollState         `json:"quota_polls,omitempty"`
 	Quotas                 map[string]quotaSnapshot          `json:"quota_cache,omitempty"`
 	Version                int                               `json:"version"`
@@ -1133,6 +1146,7 @@ func (s *schedulerRuntimeState) loadBanStateWithConfirmationMode(path string, re
 			s.quotas[id] = mergePartialQuotaSnapshot(q, old, time.Now(), s.cfg.StaleAfter)
 		}
 	}
+	s.restoreBalancedSessionsLocked(state.BalancedSessions, time.Now())
 	s.serialActiveAuthID = strings.TrimSpace(state.SerialActiveAuthID)
 	s.quotaRunway = quotaRunwayTracker{}
 	s.quotaNative = make(map[string]quotaSnapshot)
@@ -1216,6 +1230,7 @@ func (s *schedulerRuntimeState) persistBanState() bool {
 		quotas[id] = q
 	}
 	path := strings.TrimSpace(s.cfg.StatePath)
+	balancedSessions := s.snapshotBalancedSessionsLocked(time.Now())
 	serialActiveAuthID := strings.TrimSpace(s.serialActiveAuthID)
 	serialSelectionSource := normalizeSerialSelectionSource(s.serialSelectionSource)
 	serialSelectedAt := s.serialSelectedAt
@@ -1267,7 +1282,7 @@ func (s *schedulerRuntimeState) persistBanState() bool {
 	}
 	s.banResetMu.Unlock()
 	state := persistedBanState{
-		QuotaPolls: polls, Quotas: quotas,
+		QuotaPolls: polls, Quotas: quotas, BalancedSessions: balancedSessions,
 		Version:                6,
 		Bans:                   banStore.snapshot(),
 		Warmups:                warmups,
@@ -1330,6 +1345,11 @@ func (s *schedulerRuntimeState) persistBanState() bool {
 }
 
 type runtimeStatus struct {
+	BalancedStickyBindings        int                              `json:"balanced_sticky_bindings"`
+	BalancedSessionHits           uint64                           `json:"balanced_session_hits"`
+	BalancedSessionSwitches       uint64                           `json:"balanced_session_switches"`
+	BalancedUnkeyedRequests       uint64                           `json:"balanced_unkeyed_requests"`
+	StickySeconds                 int                              `json:"sticky_seconds"`
 	BalancedAccounts              map[string]balancedAccountStatus `json:"balanced_accounts,omitempty"`
 	QuotaPolls                    map[string]quotaPollState        `json:"quota_polls,omitempty"`
 	Enabled                       bool                             `json:"enabled"`
@@ -1576,6 +1596,8 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 		decision.Candidates = append([]schedulerCandidateAudit(nil), decision.Candidates...)
 		decisions[index] = decision
 	}
+	balancedStickyCount := len(s.snapshotBalancedSessionsLocked(time.Now()))
+	balancedHits, balancedSwitches, balancedUnkeyed := s.balancedSessionHits, s.balancedSessionSwitches, s.balancedUnkeyedRequests
 	bindings := make(map[string]stickyBinding, len(s.stickyBindings))
 	for key, binding := range s.stickyBindings {
 		bindings[key] = binding
@@ -1895,7 +1917,12 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 		PricingModels:                 pricingModels,
 		CostProfiles:                  costProfiles,
 		Pacing:                        pacing,
-		StickyBindings:                stickyBindings,
+		StickyBindings:                stickyBindings + balancedStickyCount,
+		BalancedStickyBindings:        balancedStickyCount,
+		BalancedSessionHits:           balancedHits,
+		BalancedSessionSwitches:       balancedSwitches,
+		BalancedUnkeyedRequests:       balancedUnkeyed,
+		StickySeconds:                 cfg.StickySeconds,
 		SessionSwitches:               sessionSwitches,
 		ShadowDisagreements:           shadowDisagreements,
 		WarmupCandidates:              warmupCandidates,
