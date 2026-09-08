@@ -276,6 +276,11 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 			delete(s.quotaPolls, id)
 		}
 	}
+	for id := range s.authExpiry {
+		if _, exists := inventory[id]; !exists {
+			delete(s.authExpiry, id)
+		}
+	}
 	s.quotas = next
 	s.identities = identities
 	activeID := s.serialActiveAuthID
@@ -345,6 +350,7 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 		s.persistBanState()
 		attempted++
 		requestCtx, cancelRequest := context.WithTimeout(batchCtx, quotaRefreshRequestTimeout)
+		document, documentErr := readAuthExpiryDocument(auth, callHost)
 		response, fetchErr := fetchCPAQuota(requestCtx, cfg, auth)
 		var snapshot quotaSnapshot
 		if fetchErr == nil {
@@ -404,6 +410,7 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 		}
 		s.quotaPolls[id] = poll
 		s.mu.Unlock()
+		s.reconcileAuthExpiry(batchCtx, cfg, auth, document, documentErr, snapshot, fetchErr, now, callHost, saveNativeAuthExpiry)
 		if batchCtx.Err() != nil {
 			break
 		}

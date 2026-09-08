@@ -281,3 +281,29 @@ go build -buildmode=c-shared -o codex-quota-scheduler.dll .
 
 Build a .so on the deployment's Linux platform; Windows DLLs cannot load there.
 See HANDOFF.zh-CN.md for migration acceptance.
+
+
+### 插件内自动恢复认证过期标记（v0.3.3）
+
+CPA 会在调度插件收到候选账号之前排除过期认证。某些明确标记为
+`credential_kind: personal_access_token` 的非 JWT 长期令牌可能携带旧的
+`expired` 元数据，出现“额度充足，但 no auth available”的状态冲突。
+
+插件现在复用现有原生额度查询，通过 CPA 自带的 `host.auth.get`、
+`host.auth.get_runtime` 回调检测，通过原生 `POST /v0/management/auth-files`
+接口恢复，完整保留代理、前缀和优先级等运行配置，不依赖其他插件，
+不修改 CPA 主程序，不要求更换用户请求路径。
+
+- 在“调配设置”中控制 `auth_expiry_auto_repair`，默认开启；关闭后仍显示诊断。
+- 只修复明确标记的非 JWT PAT，且只能存在单一顶层 `expired` 字段。
+  OAuth、JWT、含刷新令牌或复杂过期字段的认证只诊断，不自动修改。
+- 同一认证文件连续两次原生额度认证成功、间隔至少 30 秒且不超过 10 分钟，
+  额度可用、账号启用且未冷却，才可移除已过期的 `expired` 字段。
+  读取缓存、401/403、429、522 或网络超时均不构成成功确认。
+- 查询前后及保存前重新读取认证，发现凭据、索引、文件内容或运行状态变化即停止。
+  保存后再次核对。CPA 的原生保存回调不提供跨外部写入者的原子条件更新，
+  因此检测到其他写入者反复写回旧字段时，24 小时内不重复修复。
+- 写入意图和脱敏结果保存到已有 `state_path`，需要当前持有者及可写状态文件。
+  失败或结果不确定后至少等待 30 分钟，不清除真实额度冷却，不额外发起生成或预热。
+- 面板显示认证阻断、等待确认、自动恢复和查询网络故障；额度余量与认证状态分别展示。
+  本功能修复本地元数据冲突，不保证上游网络或模型服务可用。

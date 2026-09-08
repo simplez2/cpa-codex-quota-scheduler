@@ -15,6 +15,7 @@ export const fields = [
   ['serial_prefer_active_cycle','优先使用已开始的周期','allocation','boolean','在符合额度条件的账号中优先考虑已开始计时的周期。'],
   ['serial_soft_continuation','允许旧会话越过软阈值','allocation','boolean','关闭时，后续会话请求跟随新账号；已输出内容的请求不回放。'],
   ['quota_account_plans','每个账号的套餐','allocation','plans','默认自动识别 Team Standard、Team Premium 和 Plus。手动覆盖优先于自动识别，仅影响调度参考，不会更改订阅。'],
+  ['auth_expiry_auto_repair','自动恢复失效的认证过期标记','allocation','boolean','仅处理明确标记的长期令牌：连续两次原生额度认证成功且凭据未变化后恢复。保留 OAuth/JWT 过期限制；不增加生成或预热请求。'],
   ['warmup_enabled','自动预热','warmup','boolean','开启后产生少量真实模型请求；已确认周期不重复预热。均衡模式在真实请求进行中及结束后的短暂间隔内暂缓预热。'],
   ['warmup_model','预热模型','warmup','text','填写当前 CPA 支持的模型名称；不会更改客户端的默认模型。'],
   ['warmup_min_interval','两次预热至少间隔','warmup','duration','全账号池共用，1 分钟至 24 小时。'],

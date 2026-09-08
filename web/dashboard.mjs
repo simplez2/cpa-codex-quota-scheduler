@@ -127,7 +127,7 @@ function renderAccounts() {
     const ban = banFor(account);
     if (active) meta.append(element('span','badge active','当前'));
     const banLabels = {cooldown:'冷却中',probe_ready:'待恢复探测',half_open:'恢复探测中',probation:'恢复观察中'};
-    meta.append(element('span','badge' + (usable(account) ? ' good' : ' warning'),ban ? banLabels[ban.state] || '恢复观察中' : !account.fresh ? '待更新' : account.eligible ? '可用' : '暂不可用'));
+    meta.append(element('span','badge' + (usable(account) ? ' good' : ' warning'),ban ? banLabels[ban.state] || '恢复观察中' : !account.fresh ? '待更新' : account.auth_health?.blocked ? '认证受阻' : account.eligible ? '可用' : '暂不可用'));
     const configuredPlan = plans[account.plan_prior] || account.plan_prior || '套餐未知';
     const upstreamPlan = upstreamPlans[account.upstream_plan_type] || account.upstream_plan_type;
     const automatic = ['cpa_usage','cpa_auth_files'].includes(account.plan_source);
@@ -140,7 +140,15 @@ function renderAccounts() {
     info.append(element('span','subtext',planStatus));
     if (upstreamPlan && !automatic) info.append(element('span','subtext','上游：'+upstreamPlan+(account.upstream_plan_fresh?'':'（缓存已过期）')));
     if (ban) info.append(element('span','subtext','冷却到期 ' + dateText(ban.reset_at)));
-    if (account.reason && account.reason!=='eligible') {
+    const pollError=state.quota_polls?.[account.auth_id]?.Error || '';
+    if(pollError) info.append(element('span','subtext error',/401|403/.test(pollError)?'额度查询认证被上游拒绝，请检查凭据':'额度查询暂不可达，当前余量来自缓存；网络失败不代表额度耗尽'));
+    if (account.auth_health) {
+      const health=account.auth_health;
+      const labels={expiry_conflict:'过期标记冲突 · 等待两次认证确认',token_expired:'凭据已过期 · 需要重新登录或更新',repaired:'已自动恢复过期标记',repair_disabled:'过期标记冲突 · 自动恢复已关闭',verification_failed:'认证验证失败或上游连接异常',credential_changed:'认证文件发生变化 · 等待重新验证',repair_deferred:'等待账号恢复后验证',repair_failed:'恢复未确认 · 稍后重新检查',repeated_expiry:'过期标记再次被写回 · 暂停重复修复',host_unavailable:'CPA 认证检查暂不可用',checked:'未发现过期阻断'};
+      info.append(element('span','subtext',labels[health.reason]||health.reason));
+      if(timestamp(health.repaired_at)) info.append(element('span','subtext','最近自动恢复 '+dateText(health.repaired_at)));
+    }
+    if (account.reason && account.reason!=='eligible' && !account.auth_health?.blocked) {
       const labels={not_allowed:'上游暂不可用',limit_reached:'额度已耗尽',serial_threshold:'达到设定阈值',quota_unknown:'等待额度确认'};
       info.append(element('span','subtext',labels[account.reason]||account.reason));
     }

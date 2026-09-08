@@ -64,6 +64,7 @@ type quotaSnapshot struct {
 }
 
 type schedulerRuntimeState struct {
+	authExpiry     map[string]authExpiryState
 	quotaRefreshMu sync.Mutex
 	quotaPolls     map[string]quotaPollState
 	quotaRunway    quotaRunwayTracker
@@ -1020,6 +1021,7 @@ func (s *schedulerRuntimeState) nextPick(n int) int {
 }
 
 type persistedBanState struct {
+	AuthExpiry             map[string]authExpiryState        `json:"auth_expiry,omitempty"`
 	BalancedSessions       map[string]balancedSessionBinding `json:"balanced_sessions,omitempty"`
 	QuotaPolls             map[string]quotaPollState         `json:"quota_polls,omitempty"`
 	Quotas                 map[string]quotaSnapshot          `json:"quota_cache,omitempty"`
@@ -1146,6 +1148,7 @@ func (s *schedulerRuntimeState) loadBanStateWithConfirmationMode(path string, re
 			s.quotas[id] = mergePartialQuotaSnapshot(q, old, time.Now(), s.cfg.StaleAfter)
 		}
 	}
+	s.authExpiry = cloneAuthExpiryStates(state.AuthExpiry)
 	s.restoreBalancedSessionsLocked(state.BalancedSessions, time.Now())
 	s.serialActiveAuthID = strings.TrimSpace(state.SerialActiveAuthID)
 	s.quotaRunway = quotaRunwayTracker{}
@@ -1221,6 +1224,7 @@ func (s *schedulerRuntimeState) persistBanState() bool {
 	}
 
 	s.mu.RLock()
+	authExpiry := cloneAuthExpiryStates(s.authExpiry)
 	polls := make(map[string]quotaPollState, len(s.quotaPolls))
 	for id, poll := range s.quotaPolls {
 		polls[id] = poll
@@ -1282,7 +1286,7 @@ func (s *schedulerRuntimeState) persistBanState() bool {
 	}
 	s.banResetMu.Unlock()
 	state := persistedBanState{
-		QuotaPolls: polls, Quotas: quotas, BalancedSessions: balancedSessions,
+		QuotaPolls: polls, Quotas: quotas, BalancedSessions: balancedSessions, AuthExpiry: authExpiry,
 		Version:                6,
 		Bans:                   banStore.snapshot(),
 		Warmups:                warmups,
@@ -1345,6 +1349,7 @@ func (s *schedulerRuntimeState) persistBanState() bool {
 }
 
 type runtimeStatus struct {
+	AuthExpiryAutoRepair          bool                             `json:"auth_expiry_auto_repair"`
 	BalancedStickyBindings        int                              `json:"balanced_sticky_bindings"`
 	BalancedSessionHits           uint64                           `json:"balanced_session_hits"`
 	BalancedSessionSwitches       uint64                           `json:"balanced_session_switches"`
@@ -1435,6 +1440,7 @@ type runtimeStatus struct {
 }
 
 type runtimeQuotaStatus struct {
+	AuthHealth         *authExpiryStatus             `json:"auth_health,omitempty"`
 	Runway             []quotaRunwayWindowAssessment `json:"runway,omitempty"`
 	Plan               string                        `json:"plan_prior"`
 	PlanWeight         float64                       `json:"five_hour_capacity_weight_prior"`
@@ -1565,6 +1571,7 @@ func runtimeCostProfileFor(model, effort string, samples []float64) runtimeCostP
 
 func (s *schedulerRuntimeState) status() runtimeStatus {
 	s.mu.RLock()
+	authExpiry := cloneAuthExpiryStates(s.authExpiry)
 	cfg := s.cfg
 	quotas := make(map[string]quotaSnapshot, len(s.quotas))
 	for key, snapshot := range s.quotas {
@@ -1724,6 +1731,14 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 			ActiveWindows: evaluation.ActiveWindows,
 			Reason:        evaluation.Reason,
 		}
+		if health, ok := authExpiry[canonical]; ok {
+			status := health.Status
+			item.AuthHealth = &status
+			if status.Blocked {
+				item.Eligible = false
+				item.Reason = status.Reason
+			}
+		}
 		window := evaluation.Bottleneck
 		item.Plan, item.PlanWeight, item.PlanSource = resolvedQuotaPlan(cfg, canonical, snapshot, now)
 		item.UpstreamPlanType = snapshot.Plan.Type
@@ -1869,6 +1884,7 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 	}
 
 	out := runtimeStatus{
+		AuthExpiryAutoRepair:          cfg.AuthExpiryAutoRepair,
 		BalancedAccounts:              balancedAccounts,
 		Enabled:                       cfg.Enabled,
 		SchedulerMode:                 cfg.SchedulerMode,
