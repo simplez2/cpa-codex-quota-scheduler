@@ -1,0 +1,934 @@
+diff --git a/internal/config/config_types.go b/internal/config/config_types.go
+index 3708458..63ad35f 100644
+--- a/internal/config/config_types.go
++++ b/internal/config/config_types.go
+@@ -153,6 +153,8 @@ type CodexConfig struct {
+ 	// arrives. The upstream delivers server_is_overloaded rejections inside an HTTP 200 stream
+ 	// right after those handshake events instead of returning 503 on the wire, so buffering them
+ 	// keeps the downstream response headers uncommitted long enough to retry on another credential.
++	// Quota exhaustion (usage_limit_reached) before generated output also fails over,
++	// preserving HTTP 429 and its reset hint without closing the downstream WebSocket.
+ 	// Trade-off: the response headers are delayed until the upstream starts generating, which can
+ 	// trip client or reverse-proxy read timeouts. Default is false.
+ 	StreamBootstrapBuffering bool `yaml:"stream-bootstrap-buffering" json:"stream-bootstrap-buffering"`
+diff --git a/internal/runtime/executor/codex_executor_stream.go b/internal/runtime/executor/codex_executor_stream.go
+index b51e273..7193860 100644
+--- a/internal/runtime/executor/codex_executor_stream.go
++++ b/internal/runtime/executor/codex_executor_stream.go
+@@ -146,7 +146,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
+ 	var initialChunks [][]byte
+ 	streamStarted := false
+ 	immediateTerminal := false
+-	// bootstrapTerminalErr holds a non-overload terminal failure seen while buffering. It is
++	// bootstrapTerminalErr holds a non-retryable terminal failure seen while buffering. It is
+ 	// delivered as an in-stream chunk after the buffered handshake so downstream behaviour stays
+ 	// identical to the unbuffered path instead of silently turning into a credential failover.
+ 	var bootstrapTerminalErr error
+@@ -183,6 +183,11 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
+ 					}
+ 					helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
+ 					reporter.PublishFailure(ctx, streamErr)
++					if isCodexUsageLimitError(terminalBody) {
++						// No generated output escaped: preserve the quota status and reset
++						// hint so the manager can cool this credential and try another.
++						return nil, newCodexStatusErr(http.StatusTooManyRequests, terminalBody)
++					}
+ 					if isCodexOverloadBootstrapFailure(terminalBody) {
+ 						// Transient capacity rejection smuggled into an HTTP 200 stream. Fail the
+ 						// attempt before the downstream headers are committed so the conductor can
+@@ -224,9 +229,10 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
+ 			if isHandshake && !terminalSuccess {
+ 				if len(bufferedChunks) < codexBootstrapMaxBufferedEvents {
+ 					bufferedChunks = append(bufferedChunks, chunks...)
+-					continue
+ 				}
+-				helps.LogWithRequestID(ctx).Debugf("codex executor: bootstrap buffer limit %d reached, releasing stream without overload probing", codexBootstrapMaxBufferedEvents)
++				// Repeated metadata must not commit the downstream response before
++				// a quota rejection arrives. Retain a bounded prefix and keep probing.
++				continue
+ 			}
+ 
+ 			initialChunks = chunks
+diff --git a/internal/runtime/executor/codex_executor_terminal.go b/internal/runtime/executor/codex_executor_terminal.go
+index 1e8988a..aa683fa 100644
+--- a/internal/runtime/executor/codex_executor_terminal.go
++++ b/internal/runtime/executor/codex_executor_terminal.go
+@@ -414,7 +414,7 @@ func parseCodexRetryAfter(statusCode int, errorBody []byte, now time.Time) *time
+ // back while probing for an upstream rejection embedded in an HTTP 200 stream. The websocket
+ // transport prefixes response events with codex.response.metadata and codex.rate_limits frames,
+ // so the limit must comfortably exceed the four handshake frames observed in practice. Once the
+-// limit is reached the stream is released and the original unbuffered semantics apply.
++// limit is reached redundant metadata is discarded until output or a terminal event.
+ const codexBootstrapMaxBufferedEvents = 16
+ 
+ // isCodexHandshakeMetadataEvent reports whether an event carries no generated output and is
+diff --git a/internal/runtime/executor/codex_stream_bootstrap_buffering_test.go b/internal/runtime/executor/codex_stream_bootstrap_buffering_test.go
+index 2a4e6e2..6bc7f63 100644
+--- a/internal/runtime/executor/codex_stream_bootstrap_buffering_test.go
++++ b/internal/runtime/executor/codex_stream_bootstrap_buffering_test.go
+@@ -11,6 +11,7 @@ import (
+ 
+ 	"github.com/gorilla/websocket"
+ 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
++	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+ 	_ "github.com/router-for-me/CLIProxyAPI/v7/internal/translator"
+ 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+ 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+@@ -18,6 +19,7 @@ import (
+ )
+ 
+ const (
++	codexQuotaEvent         = `{"type":"error","error":{"type":"usage_limit_reached","message":"You've hit your usage limit.","resets_in_seconds":120}}`
+ 	codexOverloadEvent      = `{"type":"error","error":{"type":"service_unavailable_error","code":"server_is_overloaded","message":"Our servers are currently overloaded. Please try again later.","param":null},"sequence_number":2}`
+ 	codexInvalidEvent       = `{"type":"error","error":{"type":"invalid_request_error","code":"invalid_value","message":"Invalid input."},"sequence_number":2}`
+ 	codexCreatedEvent       = `{"type":"response.created","response":{"id":"resp_1","model":"gpt-5.6-terra"}}`
+@@ -26,6 +28,107 @@ const (
+ 	codexCompletedEventBody = `{"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`
+ )
+ 
++func TestCodexBootstrapQuotaFailover(t *testing.T) {
++	for _, transport := range []string{"sse", "websocket"} {
++		for _, afterOutput := range []bool{false, true} {
++			t.Run(fmt.Sprintf("%s/afterOutput=%v", transport, afterOutput), func(t *testing.T) {
++				events := []string{codexCreatedEvent, codexInProgressEvent}
++				if afterOutput {
++					events = append(events, codexOutputAddedEvent)
++				}
++				events = append(events, codexQuotaEvent)
++				var result *cliproxyexecutor.StreamResult
++				var err error
++				if transport == "sse" {
++					server := codexSSEServer(events...)
++					defer server.Close()
++					req, opts := codexTestRequest()
++					result, err = NewCodexExecutor(codexBufferingConfig(true)).ExecuteStream(context.Background(), codexTestAuth(server.URL), req, opts)
++				} else {
++					server := codexWebsocketServer(t, events...)
++					defer server.Close()
++					req, opts := codexWebsocketRequest()
++					result, err = NewCodexWebsocketsExecutor(codexBufferingConfig(true)).ExecuteStream(context.Background(), codexTestAuth(server.URL), req, opts)
++				}
++				if afterOutput {
++					if err != nil || result == nil {
++						t.Fatalf("committed output must not be replayed: result=%v err=%v", result, err)
++					}
++					payload, streamErr := drainChunks(result)
++					if !strings.Contains(payload, "response.output_item.added") || streamErr == nil {
++						t.Fatalf("expected output followed by quota failure: payload=%s err=%v", payload, streamErr)
++					}
++					return
++				}
++				if result != nil || err == nil {
++					t.Fatalf("quota rejection must not leak handshake: result=%v err=%v", result, err)
++				}
++				if statusCodeFromTestError(t, err) != http.StatusTooManyRequests {
++					t.Fatalf("quota status lost: %v", err)
++				}
++				quotaErr, ok := err.(statusErr)
++				if !ok || quotaErr.retryAfter == nil || *quotaErr.retryAfter <= 0 {
++					t.Fatalf("quota reset hint lost: %v", err)
++				}
++			})
++		}
++	}
++}
++
++func TestCodexWebsocketsExecutor_BootstrapQuotaDoesNotDisconnect(t *testing.T) {
++	notified, err := executeWebsocketStreamInSession(t, codexCreatedEvent, codexInProgressEvent, codexQuotaEvent)
++	if err == nil || statusCodeFromTestError(t, err) != http.StatusTooManyRequests || notified {
++		t.Fatalf("quota failover must preserve client connection: notified=%v err=%v", notified, err)
++	}
++}
++
++func TestCodexBootstrapQuotaManagerSwitchesCredential(t *testing.T) {
++	for _, transport := range []string{"sse", "websocket"} {
++		t.Run(transport, func(t *testing.T) {
++			var exhausted, healthy *httptest.Server
++			cfg := codexBufferingConfig(true)
++			manager := cliproxyauth.NewManager(nil, nil, nil)
++			manager.SetRetryConfig(0, 0, 2)
++			req, opts := codexTestRequest()
++			if transport == "sse" {
++				exhausted = codexSSEServer(codexCreatedEvent, codexInProgressEvent, codexQuotaEvent)
++				healthy = codexSSEServer(codexCreatedEvent, codexCompletedEventBody)
++				manager.RegisterExecutor(NewCodexExecutor(cfg))
++			} else {
++				exhausted = codexWebsocketServer(t, codexCreatedEvent, codexInProgressEvent, codexQuotaEvent)
++				healthy = codexWebsocketServer(t, codexCreatedEvent, codexCompletedEventBody)
++				manager.RegisterExecutor(NewCodexWebsocketsExecutor(cfg))
++				req, opts = codexWebsocketRequest()
++			}
++			defer exhausted.Close()
++			defer healthy.Close()
++			for i, server := range []*httptest.Server{exhausted, healthy} {
++				auth := codexTestAuth(server.URL)
++				auth.ID = fmt.Sprintf("quota-failover-%s-%d", transport, i)
++				auth.Provider = "codex"
++				auth.Status = cliproxyauth.StatusActive
++				auth.Attributes["priority"] = fmt.Sprint(100 - i)
++				registry.GetGlobalRegistry().RegisterClient(auth.ID, "codex", []*registry.ModelInfo{{ID: req.Model}})
++				t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
++				if _, err := manager.Register(context.Background(), auth); err != nil {
++					t.Fatal(err)
++				}
++			}
++			result, err := manager.ExecuteStream(context.Background(), []string{"codex"}, req, opts)
++			if err != nil || result == nil {
++				t.Fatalf("healthy backup must complete the same request: %v", err)
++			}
++			payload, streamErr := drainChunks(result)
++			if streamErr != nil || !strings.Contains(payload, "response.completed") || strings.Contains(payload, "usage_limit_reached") {
++				t.Fatalf("client must receive only successful backup output: %s err=%v", payload, streamErr)
++			}
++			if strings.Count(payload, `"type":"response.created"`) != 1 || strings.Contains(payload, "response.in_progress") {
++				t.Fatalf("failed credential handshake leaked: %s", payload)
++			}
++		})
++	}
++}
++
+ func codexBufferingConfig(enabled bool) *config.Config {
+ 	return &config.Config{Codex: config.CodexConfig{StreamBootstrapBuffering: enabled}}
+ }
+@@ -154,29 +257,55 @@ func TestCodexExecutor_BootstrapBuffering_NonOverloadStaysInStream(t *testing.T)
+ 	}
+ }
+ 
+-// Once the buffer limit is exceeded the stream is released and overload probing stops, which
+-// bounds how long the downstream response headers can stay uncommitted.
+-func TestCodexExecutor_BootstrapBuffering_BufferLimitReleasesStream(t *testing.T) {
+-	events := make([]string, 0, codexBootstrapMaxBufferedEvents+2)
+-	for i := 0; i < codexBootstrapMaxBufferedEvents+1; i++ {
+-		events = append(events, fmt.Sprintf(`{"type":"response.in_progress","response":{"id":"resp_%d"}}`, i))
+-	}
+-	events = append(events, codexOverloadEvent)
+-	server := codexSSEServer(events...)
+-	defer server.Close()
+-
+-	req, opts := codexTestRequest()
+-	result, err := NewCodexExecutor(codexBufferingConfig(true)).ExecuteStream(context.Background(), codexTestAuth(server.URL), req, opts)
+-
+-	if err != nil {
+-		t.Fatalf("expected the stream to be released once the buffer limit is hit: %v", err)
+-	}
+-	if result == nil {
+-		t.Fatal("expected a stream result after the buffer limit released the stream")
+-	}
+-	_, streamErr := drainChunks(result)
+-	if streamErr == nil {
+-		t.Fatal("expected the overload error to be delivered in-stream after the limit was hit")
++// Excess handshake metadata cannot turn an otherwise recoverable quota rejection
++// into a committed downstream stream. A successful stream still retains its prefix.
++func TestCodexBootstrapBufferLimitDoesNotCommitRejectedAttempt(t *testing.T) {
++	for _, transport := range []string{"sse", "websocket"} {
++		for _, terminal := range []string{codexQuotaEvent, codexOverloadEvent, codexCompletedEventBody} {
++			t.Run(transport+"/"+terminal, func(t *testing.T) {
++				events := []string{codexCreatedEvent}
++				for i := 0; i < codexBootstrapMaxBufferedEvents*2; i++ {
++					events = append(events, codexInProgressEvent)
++				}
++				events = append(events, terminal)
++				var result *cliproxyexecutor.StreamResult
++				var err error
++				if transport == "sse" {
++					server := codexSSEServer(events...)
++					defer server.Close()
++					req, opts := codexTestRequest()
++					result, err = NewCodexExecutor(codexBufferingConfig(true)).ExecuteStream(context.Background(), codexTestAuth(server.URL), req, opts)
++				} else {
++					server := codexWebsocketServer(t, events...)
++					defer server.Close()
++					req, opts := codexWebsocketRequest()
++					result, err = NewCodexWebsocketsExecutor(codexBufferingConfig(true)).ExecuteStream(context.Background(), codexTestAuth(server.URL), req, opts)
++				}
++				if terminal == codexCompletedEventBody {
++					if err != nil || result == nil {
++						t.Fatalf("successful stream lost: %v", err)
++					}
++					body, streamErr := drainChunks(result)
++					if streamErr != nil || !strings.Contains(body, "response.created") || !strings.Contains(body, "response.completed") {
++						t.Fatalf("successful stream missing prefix/completion: %s %v", body, streamErr)
++					}
++					if strings.Count(body, "response.in_progress") > codexBootstrapMaxBufferedEvents {
++						t.Fatal("handshake buffer exceeded its bound")
++					}
++					return
++				}
++				if result != nil || err == nil {
++					t.Fatalf("metadata committed rejected stream: result=%v err=%v", result, err)
++				}
++				want := http.StatusServiceUnavailable
++				if terminal == codexQuotaEvent {
++					want = http.StatusTooManyRequests
++				}
++				if got := statusCodeFromTestError(t, err); got != want {
++					t.Fatalf("status=%d want=%d", got, want)
++				}
++			})
++		}
+ 	}
+ }
+ 
+diff --git a/internal/runtime/executor/codex_websockets_session.go b/internal/runtime/executor/codex_websockets_session.go
+index 10219fc..55d14c1 100644
+--- a/internal/runtime/executor/codex_websockets_session.go
++++ b/internal/runtime/executor/codex_websockets_session.go
+@@ -63,11 +63,12 @@ type codexWebsocketSession struct {
+ 
+ 	writeMu sync.Mutex
+ 
+-	activeMu     sync.Mutex
+-	activeConn   *websocket.Conn
+-	activeCh     chan codexWebsocketRead
+-	activeDone   <-chan struct{}
+-	activeCancel context.CancelFunc
++	activeMu            sync.Mutex
++	activeConn          *websocket.Conn
++	activeCh            chan codexWebsocketRead
++	activeDone          <-chan struct{}
++	activeCancel        context.CancelFunc
++	activeBootstrapDone chan struct{}
+ 
+ 	readerConn *websocket.Conn
+ 
+@@ -90,6 +91,10 @@ func (s *codexWebsocketSession) setActive(conn *websocket.Conn, ch chan codexWeb
+ 		return
+ 	}
+ 	s.activeMu.Lock()
++	if s.activeBootstrapDone != nil {
++		close(s.activeBootstrapDone)
++		s.activeBootstrapDone = nil
++	}
+ 	if s.activeCancel != nil {
+ 		s.activeCancel()
+ 		s.activeCancel = nil
+@@ -114,6 +119,40 @@ func (s *codexWebsocketSession) activate(conn *websocket.Conn) chan codexWebsock
+ 	return ch
+ }
+ 
++// Bootstrap owns the decision to preserve or close the downstream connection.
++// A reader EOF queued behind a quota rejection must not make that decision first.
++func (s *codexWebsocketSession) beginBootstrap(conn *websocket.Conn, ch chan codexWebsocketRead) {
++	if s == nil {
++		return
++	}
++	s.activeMu.Lock()
++	defer s.activeMu.Unlock()
++	if s.activeConn == conn && s.activeCh == ch && s.activeBootstrapDone == nil {
++		s.activeBootstrapDone = make(chan struct{})
++	}
++}
++
++func (s *codexWebsocketSession) endBootstrap(conn *websocket.Conn, ch chan codexWebsocketRead) {
++	if s == nil {
++		return
++	}
++	s.activeMu.Lock()
++	defer s.activeMu.Unlock()
++	if s.activeConn == conn && s.activeCh == ch && s.activeBootstrapDone != nil {
++		close(s.activeBootstrapDone)
++		s.activeBootstrapDone = nil
++	}
++}
++
++func (s *codexWebsocketSession) bootstrapForConn(conn *websocket.Conn, ch chan codexWebsocketRead) <-chan struct{} {
++	s.activeMu.Lock()
++	defer s.activeMu.Unlock()
++	if s.activeConn != conn || s.activeCh != ch {
++		return nil
++	}
++	return s.activeBootstrapDone
++}
++
+ func (s *codexWebsocketSession) activeForConn(conn *websocket.Conn) (chan codexWebsocketRead, <-chan struct{}) {
+ 	if s == nil || conn == nil {
+ 		return nil, nil
+@@ -144,6 +183,10 @@ func (s *codexWebsocketSession) clearActive(conn *websocket.Conn, ch chan codexW
+ 	}
+ 	s.activeConn = nil
+ 	s.activeCh = nil
++	if s.activeBootstrapDone != nil {
++		close(s.activeBootstrapDone)
++		s.activeBootstrapDone = nil
++	}
+ 	if s.activeCancel != nil {
+ 		s.activeCancel()
+ 	}
+@@ -558,7 +601,21 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession,
+ 			invalidated := false
+ 			ch, done := sess.activeForConn(conn)
+ 			if ch != nil {
+-				invalidated = sendTerminalWebsocketRead(ch, done, codexWebsocketRead{conn: conn, err: errRead}, invalidate)
++				if bootstrapDone := sess.bootstrapForConn(conn, ch); bootstrapDone != nil {
++					// Keep queued frames ahead of EOF. A quota rejection will
++					// detach this connection without notifying before releasing
++					// bootstrap; actual output or read failure retains notification.
++					select {
++					case ch <- codexWebsocketRead{conn: conn, err: errRead}:
++					case <-done:
++					}
++					select {
++					case <-bootstrapDone:
++					case <-done:
++					}
++				} else {
++					invalidated = sendTerminalWebsocketRead(ch, done, codexWebsocketRead{conn: conn, err: errRead}, invalidate)
++				}
+ 				if sess.clearActive(conn, ch) {
+ 					close(ch)
+ 				}
+diff --git a/internal/runtime/executor/codex_websockets_stream.go b/internal/runtime/executor/codex_websockets_stream.go
+index 217d6e6..8eace28 100644
+--- a/internal/runtime/executor/codex_websockets_stream.go
++++ b/internal/runtime/executor/codex_websockets_stream.go
+@@ -188,9 +188,13 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
+ 		logCodexWebsocketConnected(executionSessionID, authID, wsURL)
+ 	}
+ 
++	buffering := e.cfg != nil && e.cfg.Codex.StreamBootstrapBuffering
+ 	var readCh chan codexWebsocketRead
+ 	if sess != nil {
+ 		readCh = sess.activate(conn)
++		if buffering {
++			sess.beginBootstrap(conn, readCh)
++		}
+ 	}
+ 	restoreMultiAgentV2 := !multiAgentV2Conflict && (optimizeMultiAgentV2 || sess.isMultiAgentV2Optimized(conn))
+ 
+@@ -234,6 +238,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
+ 				return nil, errBind
+ 			}
+ 			readCh = sess.activate(conn)
++			if buffering {
++				sess.beginBootstrap(conn, readCh)
++			}
+ 			restoreMultiAgentV2 = !multiAgentV2Conflict && (optimizeMultiAgentV2 || sess.isMultiAgentV2Optimized(conn))
+ 			wsReqBodyRetry := buildCodexWebsocketRequestBody(upstreamBody)
+ 			helps.RecordAPIWebsocketRequest(ctx, e.cfg, helps.UpstreamRequestLog{
+@@ -272,8 +279,6 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
+ 		sess.setMultiAgentV2Optimized(conn, optimizeMultiAgentV2 && !multiAgentV2Conflict)
+ 	}
+ 
+-	buffering := e.cfg != nil && e.cfg.Codex.StreamBootstrapBuffering
+-
+ 	claudeInputTokens := helps.NewClaudeInputTokenState(from, to, responseFormat, originalPayload)
+ 	var param any
+ 	outputItemsByIndex := make(map[int64][]byte)
+@@ -282,7 +287,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
+ 	var bufferedChunks [][]byte
+ 	var initialChunks [][]byte
+ 	immediateTerminal := false
+-	// bootstrapTerminalErr holds a non-overload terminal failure seen while buffering. It is
++	// bootstrapTerminalErr holds a non-retryable terminal failure seen while buffering. It is
+ 	// delivered as an in-stream chunk after the buffered handshake so downstream behaviour stays
+ 	// identical to the unbuffered path instead of silently turning into a credential failover.
+ 	var bootstrapTerminalErr error
+@@ -343,7 +348,12 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
+ 
+ 			if wsErr, ok := parseCodexWebsocketError(payload); ok {
+ 				if sess != nil {
+-					e.invalidateUpstreamConn(sess, conn, "upstream_error", wsErr)
++					status, hasStatus := wsErr.(interface{ StatusCode() int })
++					if (hasStatus && status.StatusCode() == http.StatusTooManyRequests) || isCodexUsageLimitError([]byte(wsErr.Error())) {
++						e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, "upstream_error", wsErr)
++					} else {
++						e.invalidateUpstreamConn(sess, conn, "upstream_error", wsErr)
++					}
+ 					sess.clearActive(conn, readCh)
+ 					unlockStreamSession()
+ 				} else {
+@@ -360,12 +370,13 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
+ 				return nil, wsErr
+ 			}
+ 			if streamErr, terminalBody, ok := codexTerminalFailureErr(payload); ok {
+-				// A transient capacity rejection is retried on another credential, so the
++				// A capacity rejection or quota exhaustion is retried on another credential, so the
+ 				// downstream websocket session must survive this upstream teardown. Notifying
+ 				// the disconnect here would close the client connection before the retry can
+ 				// deliver anything. Every other terminal failure is forwarded in-stream and
+ 				// legitimately terminates the session, so it keeps the notifying variant.
+-				failoverPending := isCodexOverloadBootstrapFailure(terminalBody)
++				quotaExhausted := isCodexUsageLimitError(terminalBody)
++				failoverPending := quotaExhausted || isCodexOverloadBootstrapFailure(terminalBody)
+ 				if sess != nil {
+ 					unlockStreamSession()
+ 					if failoverPending {
+@@ -385,6 +396,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
+ 				}
+ 				helps.RecordAPIWebsocketError(ctx, e.cfg, "upstream_error", streamErr)
+ 				reporter.PublishFailure(ctx, streamErr)
++				if quotaExhausted {
++					return nil, newCodexStatusErr(http.StatusTooManyRequests, terminalBody)
++				}
+ 				if failoverPending {
+ 					// Fail the attempt before the downstream headers are committed so the
+ 					// conductor can transparently retry on another credential, and report the
+@@ -436,9 +450,10 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
+ 			if isCodexHandshakeMetadataEvent(eventType) && !isTerminalEvent {
+ 				if len(bufferedChunks) < codexBootstrapMaxBufferedEvents {
+ 					bufferedChunks = append(bufferedChunks, currentChunks...)
+-					continue
+ 				}
+-				helps.LogWithRequestID(ctx).Debugf("codex websockets executor: bootstrap buffer limit %d reached, releasing stream without overload probing", codexBootstrapMaxBufferedEvents)
++				// Retain a bounded prefix without committing downstream output;
++				// later quota failures must still be eligible for account failover.
++				continue
+ 			}
+ 
+ 			initialChunks = currentChunks
+@@ -449,6 +464,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
+ 		}
+ 	}
+ 
++	if sess != nil {
++		sess.endBootstrap(conn, readCh)
++	}
+ 	chanCapacity := len(bufferedChunks) + len(initialChunks)
+ 	if bootstrapTerminalErr != nil {
+ 		chanCapacity++
+diff --git a/sdk/api/handlers/openai/openai_responses_websocket.go b/sdk/api/handlers/openai/openai_responses_websocket.go
+index a8c2e36..a9cac0d 100644
+--- a/sdk/api/handlers/openai/openai_responses_websocket.go
++++ b/sdk/api/handlers/openai/openai_responses_websocket.go
+@@ -591,7 +591,16 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
+ 			attemptedUpstreamMode = upstreamModeForAuth(selectedAuth)
+ 		})
+ 		if pinnedAuthID != "" && !routeOverridesModelResolution {
+-			cliCtx = handlers.WithPinnedAuthID(cliCtx, pinnedAuthID)
++			pinnedAuth, homeRuntime, _ := sessionAuthByIDWithSource(pinnedAuthID)
++			// Full response.create turns can be replayed on another local Codex auth before
++			// output starts. Preserve normal session affinity and caller-supplied pins,
++			// but do not promote this socket's automatic affinity to a hard constraint.
++			// Incremental turns still depend on upstream state; Home runtime auths also
++			// retain their leased execution session instead of dispatching a new lease.
++			if requestRequiresCurrentUpstreamWebsocket || homeRuntime || pinnedAuth == nil ||
++				!strings.EqualFold(strings.TrimSpace(pinnedAuth.Provider), "codex") {
++				cliCtx = handlers.WithPinnedAuthID(cliCtx, pinnedAuthID)
++			}
+ 		}
+ 		dataChan, _, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, requestJSON, "")
+ 		if !selectedAuthObserved {
+diff --git a/internal/runtime/executor/codex_websockets_quota_disconnect_test.go b/internal/runtime/executor/codex_websockets_quota_disconnect_test.go
+new file mode 100644
+--- /dev/null
++++ b/internal/runtime/executor/codex_websockets_quota_disconnect_test.go
+@@ -0,0 +1,224 @@
++package executor
++
++import (
++	"context"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/gorilla/websocket"
++	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
++	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
++	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
++)
++
++const codexQuotaStatusEvent = `{"type":"error","status":429,"body":{"error":{"type":"usage_limit_reached","message":"quota reached","resets_in_seconds":120}},"headers":{"x-request-id":"quota-test"}}`
++
++const codexRateLimitStatusEvent = `{"type":"error","status":429,"error":{"type":"rate_limit_error","message":"Too many requests"},"headers":{"retry-after":"3","x-request-id":"rate-test"}}`
++
++func quotaDisconnectTestExecutor() *CodexWebsocketsExecutor {
++	executor := NewCodexWebsocketsExecutor(codexBufferingConfig(true))
++	executor.store = &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
++	return executor
++}
++
++func assertQuotaDisconnectLockReleased(t *testing.T, executor *CodexWebsocketsExecutor, sessionID string) {
++	t.Helper()
++	session := executor.getOrCreateSession(sessionID)
++	if !session.reqMu.TryLock() {
++		t.Fatal("quota failure retained session request lock")
++	}
++	session.reqMu.Unlock()
++	session.activeMu.Lock()
++	defer session.activeMu.Unlock()
++	if session.activeCh != nil || session.activeBootstrapDone != nil {
++		t.Fatal("quota failure retained active bootstrap state")
++	}
++}
++
++func TestCodexQuotaWebsocketStatusBootstrapPreservesConnection(t *testing.T) {
++	server := codexWebsocketServerHoldingConnection(t, codexCreatedEvent, codexQuotaStatusEvent)
++	defer server.Close()
++	executor := quotaDisconnectTestExecutor()
++	const sessionID = "quota-status-bootstrap"
++	disconnect := executor.UpstreamDisconnectChan(sessionID)
++	req, opts := codexWebsocketRequest()
++	opts.Metadata = map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey: sessionID}
++	result, err := executor.ExecuteStream(context.Background(), codexTestAuth(server.URL), req, opts)
++	if result != nil || err == nil || statusCodeFromTestError(t, err) != http.StatusTooManyRequests {
++		t.Fatalf("quota bootstrap must return 429 without a stream: result=%v err=%v", result, err)
++	}
++	metadata, ok := err.(interface{ Headers() http.Header })
++	if !ok || metadata.Headers().Get("X-Request-Id") != "quota-test" {
++		t.Fatalf("quota failure lost upstream metadata: %v", err)
++	}
++	retry, ok := err.(interface{ RetryAfter() *time.Duration })
++	if !ok || retry.RetryAfter() == nil || *retry.RetryAfter() != 2*time.Minute {
++		t.Fatalf("quota failure lost reset hint: %v", err)
++	}
++	select {
++	case failure := <-disconnect:
++		t.Fatalf("quota attempt notified downstream disconnect: %v", failure)
++	default:
++	}
++	assertQuotaDisconnectLockReleased(t, executor, sessionID)
++}
++
++func TestCodexQuotaWebsocketGeneric429PreservesConnection(t *testing.T) {
++	server := codexWebsocketServerHoldingConnection(t, codexCreatedEvent, codexRateLimitStatusEvent)
++	defer server.Close()
++	executor := quotaDisconnectTestExecutor()
++	const sessionID = "transient-rate-bootstrap"
++	disconnect := executor.UpstreamDisconnectChan(sessionID)
++	req, opts := codexWebsocketRequest()
++	opts.Metadata = map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey: sessionID}
++	result, err := executor.ExecuteStream(context.Background(), codexTestAuth(server.URL), req, opts)
++	if result != nil || err == nil || statusCodeFromTestError(t, err) != http.StatusTooManyRequests {
++		t.Fatalf("rate rejection must remain a retryable bootstrap error: result=%v err=%v", result, err)
++	}
++	metadata, ok := err.(interface{ Headers() http.Header })
++	if !ok || metadata.Headers().Get("Retry-After") != "3" || metadata.Headers().Get("X-Request-Id") != "rate-test" {
++		t.Fatalf("transient 429 lost headers: %v", err)
++	}
++	if scoped, ok := err.(interface{ IsCredentialScoped() bool }); ok && scoped.IsCredentialScoped() {
++		t.Fatal("transient rate limit was marked as account quota exhaustion")
++	}
++	select {
++	case failure := <-disconnect:
++		t.Fatalf("transient 429 notified downstream disconnect: %v", failure)
++	default:
++	}
++	assertQuotaDisconnectLockReleased(t, executor, sessionID)
++}
++
++func TestCodexQuotaWebsocketImmediateClosePreservesConnection(t *testing.T) {
++	for _, frame := range []string{codexQuotaStatusEvent, codexRateLimitStatusEvent, codexQuotaEvent, codexOverloadEvent} {
++		t.Run(frame, func(t *testing.T) {
++			// The server closes immediately after writing the error frame. This
++			// exercises the reader EOF racing the queued bootstrap rejection.
++			server := codexWebsocketServer(t, codexCreatedEvent, codexInProgressEvent, frame)
++			defer server.Close()
++			for attempt := 0; attempt < 20; attempt++ {
++				executor := quotaDisconnectTestExecutor()
++				sessionID := fmt.Sprintf("immediate-close-%d", attempt)
++				disconnect := executor.UpstreamDisconnectChan(sessionID)
++				req, opts := codexWebsocketRequest()
++				opts.Metadata = map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey: sessionID}
++				result, err := executor.ExecuteStream(context.Background(), codexTestAuth(server.URL), req, opts)
++				if result != nil || err == nil {
++					t.Fatalf("rejection became a committed stream: result=%v err=%v", result, err)
++				}
++				select {
++				case failure := <-disconnect:
++					t.Fatalf("immediate EOF beat failover decision: %v", failure)
++				default:
++				}
++				assertQuotaDisconnectLockReleased(t, executor, sessionID)
++			}
++		})
++	}
++}
++
++func TestCodexQuotaWebsocketCommittedFailureStillNotifies(t *testing.T) {
++	server := codexWebsocketServer(t, codexCreatedEvent, codexOutputAddedEvent, codexQuotaStatusEvent)
++	defer server.Close()
++	executor := quotaDisconnectTestExecutor()
++	const sessionID = "committed-quota-failure"
++	disconnect := executor.UpstreamDisconnectChan(sessionID)
++	req, opts := codexWebsocketRequest()
++	opts.Metadata = map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey: sessionID}
++	result, err := executor.ExecuteStream(context.Background(), codexTestAuth(server.URL), req, opts)
++	if result == nil || err != nil {
++		t.Fatalf("committed output must remain a stream: result=%v err=%v", result, err)
++	}
++	payload, streamErr := drainChunks(result)
++	if streamErr == nil || !strings.Contains(payload, "response.output_item.added") {
++		t.Fatalf("committed stream lost output or failure: payload=%s err=%v", payload, streamErr)
++	}
++	select {
++	case <-disconnect:
++	case <-time.After(time.Second):
++		t.Fatal("committed upstream failure no longer notifies downstream")
++	}
++	assertQuotaDisconnectLockReleased(t, executor, sessionID)
++}
++
++func TestCodexQuotaWebsocketIdleCloseStillNotifies(t *testing.T) {
++	release := make(chan struct{})
++	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		conn, err := upgrader.Upgrade(w, r, nil)
++		if err != nil {
++			return
++		}
++		defer func() { _ = conn.Close() }()
++		if _, _, errRead := conn.ReadMessage(); errRead != nil {
++			return
++		}
++		_ = conn.WriteMessage(websocket.TextMessage, []byte(codexCompletedEventBody))
++		<-release
++	}))
++	defer server.Close()
++	defer close(release)
++	executor := quotaDisconnectTestExecutor()
++	const sessionID = "idle-after-success"
++	disconnect := executor.UpstreamDisconnectChan(sessionID)
++	req, opts := codexWebsocketRequest()
++	opts.Metadata = map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey: sessionID}
++	result, err := executor.ExecuteStream(context.Background(), codexTestAuth(server.URL), req, opts)
++	if result == nil || err != nil {
++		t.Fatalf("successful stream failed: %v", err)
++	}
++	if _, errStream := drainChunks(result); errStream != nil {
++		t.Fatal(errStream)
++	}
++	release <- struct{}{}
++	select {
++	case <-disconnect:
++	case <-time.After(time.Second):
++		t.Fatal("idle close notification was suppressed")
++	}
++}
++
++func TestCodexQuotaWebsocketManagerSwitchesAfterImmediateClose(t *testing.T) {
++	exhausted := codexWebsocketServer(t, codexCreatedEvent, codexQuotaStatusEvent)
++	healthy := codexWebsocketServerHoldingConnection(t, codexCreatedEvent, codexCompletedEventBody)
++	defer exhausted.Close()
++	defer healthy.Close()
++	executor := quotaDisconnectTestExecutor()
++	manager := cliproxyauth.NewManager(nil, nil, nil)
++	manager.SetRetryConfig(0, 0, 2)
++	manager.RegisterExecutor(executor)
++	req, opts := codexWebsocketRequest()
++	const sessionID = "manager-status-quota-failover"
++	opts.Metadata = map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey: sessionID}
++	disconnect := executor.UpstreamDisconnectChan(sessionID)
++	for index, server := range []*httptest.Server{exhausted, healthy} {
++		auth := codexTestAuth(server.URL)
++		auth.ID = fmt.Sprintf("immediate-quota-manager-%d", index)
++		auth.Provider, auth.Status = "codex", cliproxyauth.StatusActive
++		auth.Attributes["priority"] = fmt.Sprint(100 - index)
++		registry.GetGlobalRegistry().RegisterClient(auth.ID, "codex", []*registry.ModelInfo{{ID: req.Model}})
++		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
++		if _, err := manager.Register(context.Background(), auth); err != nil {
++			t.Fatal(err)
++		}
++	}
++	result, err := manager.ExecuteStream(context.Background(), []string{"codex"}, req, opts)
++	if result == nil || err != nil {
++		t.Fatalf("same request did not reach healthy backup: %v", err)
++	}
++	payload, streamErr := drainChunks(result)
++	if streamErr != nil || !strings.Contains(payload, "response.completed") || strings.Contains(payload, "usage_limit_reached") || strings.Count(payload, `"type":"response.created"`) != 1 {
++		t.Fatalf("client received failed attempt: payload=%s err=%v", payload, streamErr)
++	}
++	select {
++	case failure := <-disconnect:
++		t.Fatalf("manager failover closed downstream: %v", failure)
++	default:
++	}
++	manager.CloseExecutionSession(sessionID)
++}
+diff --git a/sdk/api/handlers/openai/openai_responses_websocket_quota_failover_test.go b/sdk/api/handlers/openai/openai_responses_websocket_quota_failover_test.go
+new file mode 100644
+--- /dev/null
++++ b/sdk/api/handlers/openai/openai_responses_websocket_quota_failover_test.go
+@@ -0,0 +1,190 @@
++package openai
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"maps"
++	"net/http"
++	"net/http/httptest"
++	"reflect"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/gin-gonic/gin"
++	"github.com/gorilla/websocket"
++	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
++	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
++	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
++	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
++	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
++	"github.com/tidwall/gjson"
++)
++
++type websocketFullTurnQuotaExecutor struct {
++	websocketPinnedFailoverExecutor
++	captureMu    sync.Mutex
++	attempted    []string
++	metadata     []map[string]any
++	quotaInChunk bool
++}
++
++func (*websocketFullTurnQuotaExecutor) Identifier() string { return "codex" }
++
++func (e *websocketFullTurnQuotaExecutor) ExecuteStream(_ context.Context, auth *coreauth.Auth, req coreexecutor.Request, opts coreexecutor.Options) (*coreexecutor.StreamResult, error) {
++	e.captureMu.Lock()
++	e.attempted = append(e.attempted, auth.ID)
++	e.metadata = append(e.metadata, maps.Clone(opts.Metadata))
++	call := len(e.attempted)
++	e.captureMu.Unlock()
++	if auth.ID == "full-turn-auth-a" && call == 2 {
++		quotaErr := websocketPinnedFailoverStatusError{status: http.StatusTooManyRequests, msg: `{"error":{"type":"usage_limit_reached","message":"5h quota exhausted"}}`}
++		if !e.quotaInChunk {
++			return nil, quotaErr
++		}
++		chunks := make(chan coreexecutor.StreamChunk, 1)
++		chunks <- coreexecutor.StreamChunk{Err: quotaErr}
++		close(chunks)
++		return &coreexecutor.StreamResult{Chunks: chunks}, nil
++	}
++	chunks := make(chan coreexecutor.StreamChunk, 1)
++	chunks <- coreexecutor.StreamChunk{Payload: []byte(fmt.Sprintf(`{"type":"response.completed","response":{"id":"resp-%s-%d","output":[]}}`, auth.ID, call))}
++	close(chunks)
++	return &coreexecutor.StreamResult{Chunks: chunks}, nil
++}
++
++func newWebsocketFullTurnQuotaTest(t *testing.T, quotaInChunk, backupWebsocket bool, explicitPin string) (*websocket.Conn, *websocketFullTurnQuotaExecutor, string) {
++	t.Helper()
++	gin.SetMode(gin.TestMode)
++	executor := &websocketFullTurnQuotaExecutor{quotaInChunk: quotaInChunk}
++	selector := coreauth.NewSessionAffinitySelector(&orderedWebsocketSelector{order: []string{"full-turn-auth-a", "full-turn-auth-b"}})
++	manager := coreauth.NewManager(nil, selector, nil)
++	manager.RegisterExecutor(executor)
++	modelName := fmt.Sprintf("full-turn-quota-%t-%t-model", quotaInChunk, backupWebsocket)
++	for _, auth := range []*coreauth.Auth{
++		{ID: "full-turn-auth-a", Provider: executor.Identifier(), Status: coreauth.StatusActive, Attributes: map[string]string{"websockets": "true"}},
++		{ID: "full-turn-auth-b", Provider: executor.Identifier(), Status: coreauth.StatusActive, Attributes: map[string]string{"websockets": fmt.Sprint(backupWebsocket)}},
++	} {
++		if _, err := manager.Register(context.Background(), auth); err != nil {
++			t.Fatalf("register auth: %v", err)
++		}
++		registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: modelName}})
++		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
++	}
++	base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{Streaming: sdkconfig.StreamingConfig{BootstrapRetries: 1}}, manager)
++	handler := NewOpenAIResponsesAPIHandler(base)
++	router := gin.New()
++	router.GET("/v1/responses/ws", func(c *gin.Context) {
++		if explicitPin != "" {
++			c.Request = c.Request.WithContext(handlers.WithPinnedAuthID(c.Request.Context(), explicitPin))
++		}
++		handler.ResponsesWebsocket(c)
++	})
++	server := httptest.NewServer(router)
++	t.Cleanup(server.Close)
++	header := http.Header{"Session-Id": []string{"full-turn-quota-stable-session"}}
++	conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+"/v1/responses/ws", header)
++	if err != nil {
++		t.Fatalf("dial websocket: %v", err)
++	}
++	t.Cleanup(func() { _ = conn.Close() })
++	return conn, executor, modelName
++}
++
++func TestResponsesWebsocketFullRequestQuotaFailoverKeepsSocket(t *testing.T) {
++	for _, quotaInChunk := range []bool{false, true} {
++		for _, backupWebsocket := range []bool{false, true} {
++			t.Run(fmt.Sprintf("chunk-%t-backup-ws-%t", quotaInChunk, backupWebsocket), func(t *testing.T) {
++				conn, executor, modelName := newWebsocketFullTurnQuotaTest(t, quotaInChunk, backupWebsocket, "")
++				for turn := 1; turn <= 3; turn++ {
++					request := fmt.Sprintf(`{"type":"response.create","model":%q,"input":[{"role":"user","content":"complete independent turn %d"}]}`, modelName, turn)
++					if err := conn.WriteMessage(websocket.TextMessage, []byte(request)); err != nil {
++						t.Fatalf("write full turn %d: %v", turn, err)
++					}
++					_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
++					_, payload, err := conn.ReadMessage()
++					if err != nil || gjson.GetBytes(payload, "type").String() != wsEventTypeCompleted {
++						t.Fatalf("full turn %d must complete without client quota error or close: payload=%s err=%v", turn, payload, err)
++					}
++				}
++				executor.captureMu.Lock()
++				defer executor.captureMu.Unlock()
++				want := []string{"full-turn-auth-a", "full-turn-auth-a", "full-turn-auth-b", "full-turn-auth-b"}
++				if !reflect.DeepEqual(executor.attempted, want) {
++					t.Fatalf("auth attempts = %v, want %v (soft affinity then quota failover)", executor.attempted, want)
++				}
++				session := executor.metadata[0][coreexecutor.ExecutionSessionMetadataKey]
++				if session == nil || session == "" {
++					t.Fatal("missing execution session")
++				}
++				for i, metadata := range executor.metadata {
++					if pin := metadata[coreexecutor.PinnedAuthMetadataKey]; pin != nil && pin != "" {
++						t.Fatalf("full turn attempt %d has automatic hard pin %v", i, pin)
++					}
++					if metadata[coreexecutor.ExecutionSessionMetadataKey] != session {
++						t.Fatalf("execution session changed on attempt %d", i)
++					}
++				}
++			})
++		}
++	}
++}
++
++func TestResponsesWebsocketFullRequestPreservesExplicitAuthPin(t *testing.T) {
++	conn, executor, modelName := newWebsocketFullTurnQuotaTest(t, false, true, "full-turn-auth-b")
++	for turn := 0; turn < 2; turn++ {
++		request := fmt.Sprintf(`{"type":"response.create","model":%q,"input":[]}`, modelName)
++		if err := conn.WriteMessage(websocket.TextMessage, []byte(request)); err != nil {
++			t.Fatalf("write explicitly pinned turn: %v", err)
++		}
++		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
++		_, payload, err := conn.ReadMessage()
++		if err != nil || gjson.GetBytes(payload, "type").String() != wsEventTypeCompleted {
++			t.Fatalf("explicitly pinned response = %s, err=%v", payload, err)
++		}
++	}
++	executor.captureMu.Lock()
++	defer executor.captureMu.Unlock()
++	for i, metadata := range executor.metadata {
++		if executor.attempted[i] != "full-turn-auth-b" || metadata[coreexecutor.PinnedAuthMetadataKey] != "full-turn-auth-b" {
++			t.Fatalf("explicit pin lost on attempt %d: auth=%q metadata=%v", i, executor.attempted[i], metadata)
++		}
++	}
++}
++
++func TestResponsesWebsocketIncrementalQuotaFailureKeepsReplayBoundary(t *testing.T) {
++	for _, incremental := range []string{
++		`{"type":"response.create","previous_response_id":"resp-full-turn-auth-a-1","input":[{"role":"user","content":"delta"}]}`,
++		`{"type":"response.append","input":[{"role":"user","content":"delta"}]}`,
++	} {
++		t.Run(gjson.Get(incremental, "type").String(), func(t *testing.T) {
++			conn, executor, modelName := newWebsocketFullTurnQuotaTest(t, false, true, "")
++			first := fmt.Sprintf(`{"type":"response.create","model":%q,"input":[]}`, modelName)
++			if err := conn.WriteMessage(websocket.TextMessage, []byte(first)); err != nil {
++				t.Fatalf("write first turn: %v", err)
++			}
++			_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
++			if _, payload, err := conn.ReadMessage(); err != nil || gjson.GetBytes(payload, "type").String() != wsEventTypeCompleted {
++				t.Fatalf("first turn response=%s err=%v", payload, err)
++			}
++			if err := conn.WriteMessage(websocket.TextMessage, []byte(incremental)); err != nil {
++				t.Fatalf("write incremental turn: %v", err)
++			}
++			_, _, err := conn.ReadMessage()
++			var closeErr *websocket.CloseError
++			if !errors.As(err, &closeErr) || closeErr.Code != websocket.CloseServiceRestart || closeErr.Text != wsHTTPReplayRequiredCloseReason {
++				t.Fatalf("incremental quota failure must request full replay, got %v", err)
++			}
++			executor.captureMu.Lock()
++			defer executor.captureMu.Unlock()
++			if want := []string{"full-turn-auth-a", "full-turn-auth-a"}; !reflect.DeepEqual(executor.attempted, want) {
++				t.Fatalf("incremental turn rotated auth: %v", executor.attempted)
++			}
++			if executor.metadata[1][coreexecutor.PinnedAuthMetadataKey] != "full-turn-auth-a" {
++				t.Fatal("incremental turn lost required auth pin")
++			}
++		})
++	}
++}

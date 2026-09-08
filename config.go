@@ -2,6 +2,8 @@ package main
 
 import (
 	"fmt"
+	"math"
+	"net/url"
 	"strings"
 	"time"
 
@@ -15,136 +17,162 @@ const maxWarmupModelLength = 256
 // duration values are most convenient and least surprising when written as
 // strings ("30s", "15m", ...).
 type pluginConfig struct {
-	Enabled                 bool
-	Priority                int
-	SchedulerMode           string
-	SerialSwitchPercent     float64
-	SerialHandoffMode       string
-	Serial5hHandoffMode     string
-	Serial5hSwitchPercent   float64
-	SerialPreferActiveCycle bool
-	DrainWindowHours        float64
-	KeeperURL               string
-	KeeperPasswordFile      string
-	CPAManagementURL        string
-	CPAManagementKeyFile    string
-	WarmupEnabled           bool
-	WarmupExecutionMode     string
-	WarmupModel             string
-	WarmupSidecarURL        string
-	WarmupRetryAfter        time.Duration
-	KeeperRefreshCooldown   time.Duration
-	RefreshInterval         time.Duration
-	StaleAfter              time.Duration
-	StatePath               string
-	SoftLimitPercent        float64
-	Reserve5hPercent        float64
-	ReserveWeeklyPercent    float64
-	ReserveMonthlyPercent   float64
-	LowQuotaPercent         float64
-	FallbackBan             time.Duration
-	MaxBan                  time.Duration
-	HalfOpenProbeTimeout    time.Duration
-	HalfOpenRetryAfter      time.Duration
-	StickySeconds           int
-	SwitchHysteresisPercent float64
-	SwitchConfirmations     int
-	CostSampleLimit         int
-	DecisionHistoryLimit    int
-	NormalCostQuantile      float64
-	GuardCostQuantile       float64
-	HighCostQuantile        float64
-	ShadowLogInterval       time.Duration
-	PreferResetCredits      bool
-	WindowOrder             []string
+	QuotaURL                     string
+	QuotaRefreshBatch            int
+	Enabled                      bool
+	Priority                     int
+	SchedulerMode                string
+	SerialSwitchPercent          float64
+	SerialSoftContinuation       bool
+	SerialAllocationPolicy       string
+	SerialBudgetRebalancePercent float64
+	QuotaDefaultPlan             string
+	QuotaAccountPlans            map[string]string
+	SerialHandoffMode            string
+	Serial5hHandoffMode          string
+	Serial5hSwitchPercent        float64
+	SerialPreferActiveCycle      bool
+	SerialWeeklyRebalancePercent float64
+	SerialWeeklyRebalanceMinHold time.Duration
+	DrainWindowHours             float64
+	CPAManagementURL             string
+	CPAManagementKeyFile         string
+	WarmupEnabled                bool
+	WarmupExecutionMode          string
+	WarmupModel                  string
+	WarmupSidecarURL             string
+	WarmupRetryAfter             time.Duration
+	WarmupMinInterval            time.Duration
+	WarmupMaxPerDay              int
+	QuotaRefreshCooldown         time.Duration
+	RefreshInterval              time.Duration
+	StaleAfter                   time.Duration
+	StatePath                    string
+	SoftLimitPercent             float64
+	Reserve5hPercent             float64
+	ReserveWeeklyPercent         float64
+	ReserveMonthlyPercent        float64
+	LowQuotaPercent              float64
+	FallbackBan                  time.Duration
+	MaxBan                       time.Duration
+	HalfOpenProbeTimeout         time.Duration
+	HalfOpenRetryAfter           time.Duration
+	StickySeconds                int
+	SwitchHysteresisPercent      float64
+	SwitchConfirmations          int
+	CostSampleLimit              int
+	DecisionHistoryLimit         int
+	NormalCostQuantile           float64
+	GuardCostQuantile            float64
+	HighCostQuantile             float64
+	ShadowLogInterval            time.Duration
+	PreferResetCredits           bool
+	WindowOrder                  []string
 }
 
 type yamlPluginConfig struct {
-	Enabled                 *bool    `yaml:"enabled"`
-	Priority                *int     `yaml:"priority"`
-	SchedulerMode           string   `yaml:"scheduler_mode"`
-	SerialSwitchPercent     *float64 `yaml:"serial_switch_percent"`
-	SerialHandoffMode       string   `yaml:"serial_handoff_mode"`
-	Serial5hHandoffMode     string   `yaml:"serial_5h_handoff_mode"`
-	Serial5hSwitchPercent   *float64 `yaml:"serial_5h_switch_percent"`
-	SerialPreferActiveCycle *bool    `yaml:"serial_prefer_active_cycle"`
-	DrainWindowHours        *float64 `yaml:"drain_window_hours"`
-	KeeperURL               string   `yaml:"keeper_url"`
-	KeeperPasswordFile      string   `yaml:"keeper_password_file"`
-	CPAManagementURL        string   `yaml:"cpa_management_url"`
-	CPAManagementKeyFile    string   `yaml:"cpa_management_key_file"`
-	WarmupEnabled           *bool    `yaml:"warmup_enabled"`
-	WarmupExecutionMode     string   `yaml:"warmup_execution_mode"`
-	WarmupModel             string   `yaml:"warmup_model"`
-	WarmupSidecarURL        string   `yaml:"warmup_sidecar_url"`
-	WarmupRetryAfter        string   `yaml:"warmup_retry_after"`
-	KeeperRefreshCooldown   string   `yaml:"keeper_refresh_cooldown"`
-	RefreshInterval         string   `yaml:"refresh_interval"`
-	StaleAfter              string   `yaml:"stale_after"`
-	StatePath               string   `yaml:"state_path"`
-	SoftLimitPercent        *float64 `yaml:"soft_limit_percent"`
-	Reserve5hPercent        *float64 `yaml:"reserve_5h_percent"`
-	ReserveWeeklyPercent    *float64 `yaml:"reserve_weekly_percent"`
-	ReserveMonthlyPercent   *float64 `yaml:"reserve_monthly_percent"`
-	LowQuotaPercent         *float64 `yaml:"low_quota_percent"`
-	FallbackBan             string   `yaml:"fallback_ban"`
-	MaxBan                  string   `yaml:"max_ban"`
-	HalfOpenProbeTimeout    string   `yaml:"half_open_probe_timeout"`
-	HalfOpenRetryAfter      string   `yaml:"half_open_retry_after"`
-	StickySeconds           *int     `yaml:"sticky_seconds"`
-	SwitchHysteresisPercent *float64 `yaml:"switch_hysteresis_percent"`
-	SwitchConfirmations     *int     `yaml:"switch_confirmations"`
-	CostSampleLimit         *int     `yaml:"cost_sample_limit"`
-	DecisionHistoryLimit    *int     `yaml:"decision_history_limit"`
-	NormalCostQuantile      *float64 `yaml:"normal_cost_quantile"`
-	GuardCostQuantile       *float64 `yaml:"guard_cost_quantile"`
-	HighCostQuantile        *float64 `yaml:"high_cost_quantile"`
-	ShadowLogInterval       string   `yaml:"shadow_log_interval"`
-	PreferResetCredits      *bool    `yaml:"prefer_reset_credits"`
-	WindowOrder             []string `yaml:"window_order"`
+	QuotaURL                     string            `yaml:"quota_url"`
+	QuotaRefreshBatch            *int              `yaml:"quota_refresh_batch"`
+	Enabled                      *bool             `yaml:"enabled"`
+	Priority                     *int              `yaml:"priority"`
+	SchedulerMode                string            `yaml:"scheduler_mode"`
+	SerialSwitchPercent          *float64          `yaml:"serial_switch_percent"`
+	SerialSoftContinuation       *bool             `yaml:"serial_soft_continuation"`
+	SerialAllocationPolicy       string            `yaml:"serial_allocation_policy"`
+	SerialBudgetRebalancePercent *float64          `yaml:"serial_budget_rebalance_percent"`
+	QuotaDefaultPlan             string            `yaml:"quota_default_plan"`
+	QuotaAccountPlans            map[string]string `yaml:"quota_account_plans"`
+	SerialHandoffMode            string            `yaml:"serial_handoff_mode"`
+	Serial5hHandoffMode          string            `yaml:"serial_5h_handoff_mode"`
+	Serial5hSwitchPercent        *float64          `yaml:"serial_5h_switch_percent"`
+	SerialPreferActiveCycle      *bool             `yaml:"serial_prefer_active_cycle"`
+	SerialWeeklyRebalancePercent *float64          `yaml:"serial_weekly_rebalance_percent"`
+	SerialWeeklyRebalanceMinHold string            `yaml:"serial_weekly_rebalance_min_hold"`
+	DrainWindowHours             *float64          `yaml:"drain_window_hours"`
+	CPAManagementURL             string            `yaml:"cpa_management_url"`
+	CPAManagementKeyFile         string            `yaml:"cpa_management_key_file"`
+	WarmupEnabled                *bool             `yaml:"warmup_enabled"`
+	WarmupExecutionMode          string            `yaml:"warmup_execution_mode"`
+	WarmupModel                  string            `yaml:"warmup_model"`
+	WarmupSidecarURL             string            `yaml:"warmup_sidecar_url"`
+	WarmupRetryAfter             string            `yaml:"warmup_retry_after"`
+	WarmupMinInterval            string            `yaml:"warmup_min_interval"`
+	WarmupMaxPerDay              *int              `yaml:"warmup_max_per_day"`
+	QuotaRefreshCooldown         string            `yaml:"quota_refresh_cooldown"`
+	RefreshInterval              string            `yaml:"refresh_interval"`
+	StaleAfter                   string            `yaml:"stale_after"`
+	StatePath                    string            `yaml:"state_path"`
+	SoftLimitPercent             *float64          `yaml:"soft_limit_percent"`
+	Reserve5hPercent             *float64          `yaml:"reserve_5h_percent"`
+	ReserveWeeklyPercent         *float64          `yaml:"reserve_weekly_percent"`
+	ReserveMonthlyPercent        *float64          `yaml:"reserve_monthly_percent"`
+	LowQuotaPercent              *float64          `yaml:"low_quota_percent"`
+	FallbackBan                  string            `yaml:"fallback_ban"`
+	MaxBan                       string            `yaml:"max_ban"`
+	HalfOpenProbeTimeout         string            `yaml:"half_open_probe_timeout"`
+	HalfOpenRetryAfter           string            `yaml:"half_open_retry_after"`
+	StickySeconds                *int              `yaml:"sticky_seconds"`
+	SwitchHysteresisPercent      *float64          `yaml:"switch_hysteresis_percent"`
+	SwitchConfirmations          *int              `yaml:"switch_confirmations"`
+	CostSampleLimit              *int              `yaml:"cost_sample_limit"`
+	DecisionHistoryLimit         *int              `yaml:"decision_history_limit"`
+	NormalCostQuantile           *float64          `yaml:"normal_cost_quantile"`
+	GuardCostQuantile            *float64          `yaml:"guard_cost_quantile"`
+	HighCostQuantile             *float64          `yaml:"high_cost_quantile"`
+	ShadowLogInterval            string            `yaml:"shadow_log_interval"`
+	PreferResetCredits           *bool             `yaml:"prefer_reset_credits"`
+	WindowOrder                  []string          `yaml:"window_order"`
 }
 
 func defaultPluginConfig() pluginConfig {
 	return pluginConfig{
-		Enabled:                 true,
-		SchedulerMode:           "serial",
-		SerialSwitchPercent:     98,
-		SerialHandoffMode:       "threshold_only",
-		Serial5hHandoffMode:     "inherit_global",
-		Serial5hSwitchPercent:   98,
-		SerialPreferActiveCycle: true,
-		DrainWindowHours:        6,
-		KeeperPasswordFile:      "/run/secrets/keeper_login_password",
-		CPAManagementURL:        "http://127.0.0.1:8317/v0/management/api-call",
-		CPAManagementKeyFile:    "/run/secrets/management_key",
-		WarmupExecutionMode:     "management",
-		WarmupModel:             "gpt-5.6-luna",
-		WarmupSidecarURL:        "http://codex-agent-identity-gateway:8787/backend-api/codex",
-		WarmupRetryAfter:        15 * time.Minute,
-		KeeperRefreshCooldown:   2 * time.Minute,
-		RefreshInterval:         30 * time.Second,
-		StaleAfter:              15 * time.Minute,
-		StatePath:               "/var/lib/codex-quota-scheduler/state.json",
-		SoftLimitPercent:        98,
-		Reserve5hPercent:        15,
-		ReserveWeeklyPercent:    8,
-		ReserveMonthlyPercent:   12,
-		LowQuotaPercent:         20,
-		FallbackBan:             15 * time.Minute,
-		MaxBan:                  24 * time.Hour,
-		HalfOpenProbeTimeout:    15 * time.Minute,
-		HalfOpenRetryAfter:      2 * time.Minute,
-		StickySeconds:           1500,
-		SwitchHysteresisPercent: 2,
-		SwitchConfirmations:     3,
-		CostSampleLimit:         512,
-		DecisionHistoryLimit:    100,
-		NormalCostQuantile:      0.75,
-		GuardCostQuantile:       0.90,
-		HighCostQuantile:        0.95,
-		ShadowLogInterval:       5 * time.Minute,
-		PreferResetCredits:      true,
-		WindowOrder:             []string{"5h", "weekly", "monthly"},
+		QuotaURL:                     "https://chatgpt.com/backend-api/wham/usage",
+		QuotaRefreshBatch:            8,
+		Enabled:                      true,
+		SchedulerMode:                "serial",
+		SerialSwitchPercent:          98,
+		SerialAllocationPolicy:       "sustainable",
+		SerialBudgetRebalancePercent: 20,
+		QuotaDefaultPlan:             "team_standard",
+		SerialHandoffMode:            "threshold_only",
+		Serial5hHandoffMode:          "429_only",
+		Serial5hSwitchPercent:        98,
+		SerialPreferActiveCycle:      true,
+		SerialWeeklyRebalancePercent: 10,
+		SerialWeeklyRebalanceMinHold: 5 * time.Minute,
+		DrainWindowHours:             6,
+		CPAManagementURL:             "http://127.0.0.1:8317/v0/management/api-call",
+		CPAManagementKeyFile:         "/run/secrets/management_key",
+		WarmupExecutionMode:          "native",
+		WarmupModel:                  "gpt-5.6-luna",
+		WarmupSidecarURL:             "http://codex-agent-identity-gateway:8787/backend-api/codex",
+		WarmupRetryAfter:             15 * time.Minute,
+		WarmupMinInterval:            15 * time.Minute,
+		WarmupMaxPerDay:              8,
+		QuotaRefreshCooldown:         2 * time.Minute,
+		RefreshInterval:              30 * time.Second,
+		StaleAfter:                   15 * time.Minute,
+		StatePath:                    "/var/lib/codex-quota-scheduler/state.json",
+		SoftLimitPercent:             98,
+		Reserve5hPercent:             0,
+		ReserveWeeklyPercent:         8,
+		ReserveMonthlyPercent:        12,
+		LowQuotaPercent:              20,
+		FallbackBan:                  15 * time.Minute,
+		MaxBan:                       24 * time.Hour,
+		HalfOpenProbeTimeout:         15 * time.Minute,
+		HalfOpenRetryAfter:           2 * time.Minute,
+		StickySeconds:                1500,
+		SwitchHysteresisPercent:      2,
+		SwitchConfirmations:          3,
+		CostSampleLimit:              512,
+		DecisionHistoryLimit:         100,
+		NormalCostQuantile:           0.75,
+		GuardCostQuantile:            0.90,
+		HighCostQuantile:             0.95,
+		ShadowLogInterval:            5 * time.Minute,
+		PreferResetCredits:           true,
+		WindowOrder:                  []string{"5h", "weekly", "monthly"},
 	}
 }
 
@@ -157,6 +185,18 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 	if err := yaml.Unmarshal(raw, &in); err != nil {
 		return cfg, err
 	}
+	if strings.TrimSpace(in.QuotaURL) != "" {
+		cfg.QuotaURL = strings.TrimSpace(in.QuotaURL)
+	}
+	if in.QuotaRefreshBatch != nil {
+		cfg.QuotaRefreshBatch = *in.QuotaRefreshBatch
+	}
+	if cfg.QuotaRefreshBatch < 1 || cfg.QuotaRefreshBatch > 100 {
+		return cfg, fmt.Errorf("quota_refresh_batch must be between 1 and 100")
+	}
+	if endpoint, err := url.Parse(cfg.QuotaURL); err != nil || endpoint.Host == "" || endpoint.User != nil || (endpoint.Scheme != "https" && endpoint.Scheme != "http") {
+		return cfg, fmt.Errorf("quota_url must be an absolute HTTP(S) URL without credentials")
+	}
 	if in.Enabled != nil {
 		cfg.Enabled = *in.Enabled
 	}
@@ -168,6 +208,40 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 	}
 	if in.SerialSwitchPercent != nil {
 		cfg.SerialSwitchPercent = *in.SerialSwitchPercent
+	}
+	if in.SerialSoftContinuation != nil {
+		cfg.SerialSoftContinuation = *in.SerialSoftContinuation
+	}
+	if in.SerialAllocationPolicy != "" {
+		if in.SerialAllocationPolicy != "sustainable" && in.SerialAllocationPolicy != "weekly_remaining" {
+			return cfg, fmt.Errorf("serial_allocation_policy must be sustainable or weekly_remaining")
+		}
+		cfg.SerialAllocationPolicy = in.SerialAllocationPolicy
+	}
+	if in.SerialBudgetRebalancePercent != nil {
+		v := *in.SerialBudgetRebalancePercent
+		if math.IsNaN(v) || math.IsInf(v, 0) || v < 0 || v > 100 {
+			return cfg, fmt.Errorf("serial_budget_rebalance_percent must be between 0 and 100 (0 disables budget preemption)")
+		}
+		cfg.SerialBudgetRebalancePercent = v
+	}
+	if in.QuotaDefaultPlan != "" {
+		plan, ok := normalizeQuotaPlan(in.QuotaDefaultPlan)
+		if !ok {
+			return cfg, fmt.Errorf("unknown quota_default_plan")
+		}
+		cfg.QuotaDefaultPlan = plan
+	}
+	if in.QuotaAccountPlans != nil {
+		cfg.QuotaAccountPlans = make(map[string]string, len(in.QuotaAccountPlans))
+		for authID, rawPlan := range in.QuotaAccountPlans {
+			plan, ok := normalizeQuotaPlan(rawPlan)
+			id := strings.TrimSpace(authID)
+			if !ok || id == "" {
+				return cfg, fmt.Errorf("quota_account_plans requires nonempty auth IDs and supported plan names")
+			}
+			cfg.QuotaAccountPlans[id] = plan
+		}
 	}
 	if strings.TrimSpace(in.SerialHandoffMode) != "" {
 		cfg.SerialHandoffMode = strings.ToLower(strings.TrimSpace(in.SerialHandoffMode))
@@ -184,14 +258,22 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 	if in.SerialPreferActiveCycle != nil {
 		cfg.SerialPreferActiveCycle = *in.SerialPreferActiveCycle
 	}
+	if in.SerialWeeklyRebalancePercent != nil {
+		v := *in.SerialWeeklyRebalancePercent
+		if math.IsNaN(v) || math.IsInf(v, 0) || v < 0 || v > 100 {
+			return cfg, fmt.Errorf("serial_weekly_rebalance_percent must be between 0 and 100 (0 disables proactive balancing)")
+		}
+		cfg.SerialWeeklyRebalancePercent = v
+	}
+	if strings.TrimSpace(in.SerialWeeklyRebalanceMinHold) != "" {
+		v, ok := parseDuration(in.SerialWeeklyRebalanceMinHold)
+		if !ok || v < time.Minute || v > 24*time.Hour {
+			return cfg, fmt.Errorf("serial_weekly_rebalance_min_hold must be between 1m and 24h")
+		}
+		cfg.SerialWeeklyRebalanceMinHold = v
+	}
 	if in.DrainWindowHours != nil {
 		cfg.DrainWindowHours = *in.DrainWindowHours
-	}
-	if strings.TrimSpace(in.KeeperURL) != "" {
-		cfg.KeeperURL = strings.TrimSpace(in.KeeperURL)
-	}
-	if strings.TrimSpace(in.KeeperPasswordFile) != "" {
-		cfg.KeeperPasswordFile = strings.TrimSpace(in.KeeperPasswordFile)
 	}
 	if strings.TrimSpace(in.CPAManagementURL) != "" {
 		cfg.CPAManagementURL = strings.TrimSpace(in.CPAManagementURL)
@@ -218,8 +300,21 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 	if v, ok := parseDuration(in.WarmupRetryAfter); ok {
 		cfg.WarmupRetryAfter = v
 	}
-	if v, ok := parseDuration(in.KeeperRefreshCooldown); ok {
-		cfg.KeeperRefreshCooldown = v
+	if strings.TrimSpace(in.WarmupMinInterval) != "" {
+		v, ok := parseDuration(in.WarmupMinInterval)
+		if !ok || v < time.Minute || v > 24*time.Hour {
+			return cfg, fmt.Errorf("warmup_min_interval must be between 1m and 24h")
+		}
+		cfg.WarmupMinInterval = v
+	}
+	if in.WarmupMaxPerDay != nil {
+		if *in.WarmupMaxPerDay < 1 || *in.WarmupMaxPerDay > 1000 {
+			return cfg, fmt.Errorf("warmup_max_per_day must be between 1 and 1000")
+		}
+		cfg.WarmupMaxPerDay = *in.WarmupMaxPerDay
+	}
+	if v, ok := parseDuration(in.QuotaRefreshCooldown); ok {
+		cfg.QuotaRefreshCooldown = v
 	}
 	if v, ok := parseDuration(in.RefreshInterval); ok {
 		cfg.RefreshInterval = v
@@ -293,7 +388,7 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 
 	// Keep malformed/unsafe values from turning a configuration reload into a
 	// routing outage.  The plugin remains loaded and falls back to CPA's native
-	// scheduler until a usable Keeper snapshot is available.
+	// scheduler until a usable quota probe snapshot is available.
 	cfg.SchedulerMode = normalizeSchedulerMode(cfg.SchedulerMode)
 	cfg.SerialHandoffMode = normalizeSerialHandoffMode(cfg.SerialHandoffMode)
 	cfg.Serial5hHandoffMode = normalizeSerial5hHandoffMode(cfg.Serial5hHandoffMode)
@@ -304,8 +399,8 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 	if cfg.WarmupRetryAfter < time.Minute {
 		cfg.WarmupRetryAfter = 15 * time.Minute
 	}
-	if cfg.KeeperRefreshCooldown < 30*time.Second || cfg.KeeperRefreshCooldown > 24*time.Hour {
-		cfg.KeeperRefreshCooldown = 2 * time.Minute
+	if cfg.QuotaRefreshCooldown < 30*time.Second || cfg.QuotaRefreshCooldown > 24*time.Hour {
+		cfg.QuotaRefreshCooldown = 2 * time.Minute
 	}
 	if cfg.WarmupModel == "" {
 		cfg.WarmupModel = "gpt-5.6-luna"
@@ -341,7 +436,7 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 		cfg.DrainWindowHours = 6
 	}
 	if cfg.Reserve5hPercent < 0 || cfg.Reserve5hPercent >= 100 {
-		cfg.Reserve5hPercent = 15
+		cfg.Reserve5hPercent = 0
 	}
 	if cfg.ReserveWeeklyPercent < 0 || cfg.ReserveWeeklyPercent >= 100 {
 		cfg.ReserveWeeklyPercent = 8

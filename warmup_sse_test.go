@@ -204,6 +204,27 @@ func TestWarmupParsersNeverLetGenericMetadataHideTerminalCode(t *testing.T) {
 	}
 }
 
+func TestWarmupOutputBudgetTerminalDoesNotRequireAnotherGeneration(t *testing.T) {
+	for _, body := range []string{
+		`{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}`,
+		"event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n",
+	} {
+		if out, err := parseWarmupResponse([]byte(body)); err != nil || out.TerminalEvent != "response.incomplete" {
+			t.Fatalf("output budget completion: %#v err=%v", out, err)
+		}
+	}
+	for _, body := range []string{
+		`{"status":"incomplete","incomplete_details":{"reason":"content_filter"}}`,
+		`{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"error":{"code":"cyber_policy"}}`,
+		`{"status":"completed","error":{"code":"cyber_policy"}}`,
+		`{"type":"response.failed","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}`,
+	} {
+		if out, err := parseWarmupResponse([]byte(body)); err == nil {
+			t.Fatalf("policy/failure accepted as activation: %#v", out)
+		}
+	}
+}
+
 func TestParseWarmupSSERejectsErrorEvent(t *testing.T) {
 	body := "event: error\n" +
 		"data: {\"type\":\"error\",\"code\":\"server_error\"}\n\n"

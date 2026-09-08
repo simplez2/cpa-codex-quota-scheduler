@@ -1,239 +1,107 @@
-# Codex Quota Scheduler 运行逻辑与状态机
+# CPA 独立额度运行逻辑
 
-本文描述 v0.1.20 源码的真实运行逻辑，供代码审查、生产验收和故障定位使用。只有匹配 tag 与 Release 资产均存在时，才视为正式发布。
+## 观测与缓存
 
-## 1. 数据来源与可信度
+CPA auth-files 提供账号清单，插件通过 api-call 发送只读 GET；
+CPA 用 auth_index 注入令牌并选择代理。插件解析原生 rate_limit 的
+primary_window/secondary_window，按实际时长识别 5h、weekly、monthly。
+额外 feature/model 限额不作为全账号限额。
 
-调度器同时观察三类信息：
+每次观测固定时间和 reset 锚点，读缓存不重算倒计时。
+响应头只覆盖实际包含的字段，不延长完整快照有效期。
+窗口按观测时间合并，旧查询不能覆盖新响应头。
+新鲜硬限额证据优先于整份快照的新鲜度判断。
 
-| 来源 | 用途 | 可信规则 |
-|---|---|---|
-| CPA scheduler candidates | 当前请求可实际选择的 auth ID、priority 与 provider | 只接受纯 codex 候选集合；混合 provider 返回 Handled=false。 |
-| Keeper quota snapshot | 5h、weekly、monthly 窗口、used%、reset、allowed、reset credits | 快照和每个有效窗口都必须在 stale_after 内；过期数据不触发阈值切换或预热。 |
-| 上游响应/配额头 | 429、reset-after、window class、成功响应 | 429 是权威隔离信号；无完整窗口头时进入有上限的 probation。 |
+## 刷新
 
-window-minutes=0 等 Primary/Secondary 占位头不覆盖 Keeper 的真实周/月窗口。显式 generate=false 的 token 计数或检查请求旁路状态变更，不会预测扣额、启动 half-open 或写入 429 隔离。
+默认每 30 秒调度，优先主账号；备用账号默认两分钟冷却。
+每轮最多顺序查询八个账号，其余按上次查询时间等待。
+每账号保存失败次数、下次查询时间和错误码；集合变化不清零他人的冷却。
+已知 reset 会缩短下一次查询等待，但不绕过失败退避。
+退避上限三十分钟，更长 Retry-After 优先。
 
-## 2. 全局串行主账号
+state.json 保存缓存与退避、隔离、主账号、会话哈希和预热记录。
+generation fence 限制持久化写入者。失败保留原观测时间，不把旧数据伪装成新数据。
+有效空清单清理缓存；清单请求失败保留最后数据。
 
-serial 模式为普通新请求维护一个全局主账号；当 CPA 提供稳定会话 ID 时，只将其哈希用于识别“已经由旧账号服务的会话”，不会据此把新请求随机分散到多个账号：
+## 调度与恢复
 
-~~~text
-未选择
-  -> 按窗口等级和同类规则选出主账号
-  -> 已提交主账号
-       -> 正常：持续使用同一账号
-       -> 旧会话：阈值/硬限额切换后可短时续跑旧账号
-       -> 新会话：只绑定已确认可用的新主账号
-       -> 临时候选缺席：请求级 provisional fallback
-       -> 阈值/429/隔离/确认缺席：正式切换
-~~~
+默认 serial 保持一个主账号，serial_allocation_policy=sustainable。
+先过滤硬限额/隔离，同类账号按
+`max(周余量−8%,0) / max(距周重置天数,0.25天)` 排序；未启动/缺失reset按7天。
+同周预算5%档位内，再比较5h观测余量×套餐先验权重。
+相同reset下80%优先40%；40%明天重置可优先于80%六天后重置。
 
-### 2.1 候选选择顺序
+预算主动切换默认需领先20%（相对值）、双方两次独立原生周观测和主账号保持5分钟。
+对应serial_budget_rebalance_percent及serial_weekly_rebalance_min_hold。
+serial_allocation_policy=weekly_remaining保留先前按原始周余量、10百分点优势的规则。
+硬限额/429交接不等待保持期；显式启用的软储备只有在有更安全备用时才触发切换。
 
-1. weekly 剩余量小于等于 `reserve_weekly_percent` 的账号进入保护分区；存在未保护账号时不消耗保护账号；
-2. drain 状态与 `window_order`，默认 5h -> weekly -> monthly；
-3. `prefer_reset_credits=true` 时优先有 reset credit；
-4. 整个候选池第一次 cold start 才兼容旧 CPA priority/fill-first；
-5. 有选择历史后，以 `switch_hysteresis_percent` 把 weekly 剩余额度分成稳定档位；
-6. 最佳 weekly 档位内优先 5h used% 更低者；
-7. 最久未选择者优先，最后用 CPA priority 与 auth ID 保证稳定。
+5h默认serial_5h_handoff_mode=429_only、reserve_5h_percent=0。
+单纯达到98%或99%已用不会因5h软阈值提前切号；真实硬满、禁用或上游429仍切换。
+周预算均衡不受影响。429_only下，5h排序也不扣静态储备、缓存年龄或预测消耗。
+runway仍可展示样本、耗速、预测储备及headroom，未知续航为null；这些估计在此模式仅用于观测。
 
-weekly 档位在排序前基于整个候选池计算，不做两两 hysteresis 比较，避免出现非传递排序。健康主账号在普通请求之间保持提交状态，不会因每次候选分数波动而切换。
+需要恢复旧方案时，显式设置reserve_aware及reserve_5h_percent=15。
+仅原始quota probe能学习消耗速度，同账号/绑定/周期有两次正增量后，
+取近期峰值与EWMA中较保守者，按观测年龄扣可能消耗，并增加未来2分钟耗量储备。
+总储备上限max(静态储备,50%)；冷启动/重置/失败时回退显式配置的静态储备。
+这是反馈估计，不是已知在途数或单个任务必定完成的保证。
 
-### 2.2 正式切换条件
+默认账号team_standard，与plus权重均1；pro_5x/team_premium为5、pro_20x为20。
+quota_account_plans按CPA auth-file ID显式覆盖；不能从模糊team/pro标签猜具体席位。
+权重不乘进周评分，也不当固定周额度，否则容易优先耗空大账号。
 
-- 任一仍有效的窗口达到 serial_switch_percent；
-- 窗口 allowed=false 或 limit_reached=true；
-- 上游 429 建立 quota cooldown 或 probation；
-- 当前账号处于 cooldown/half-open 等不可调度状态；
-- CPA 连续不再提供该候选至少 90 秒且达到 3 次确认；
-- 更高优先级的窗口类别恢复并满足严格抢占条件。
-- 当前主账号进入 weekly reserve，而存在未保护备用账号；
-- 自动模式检测到可信 5h reset anchor 已越过旧边界并前移超过 5 分钟，执行一次受约束轮转。
+仍使用现有的30秒/2分钟额度查询节奏；整轮含inventory最多30秒，每次最多10秒。
+超时停止后续派发、保留缓存并退避，不增加生成请求或查询频率。
 
-`serial_switch_percent` 是软阈值。当前账号硬限额、`allowed=false` 或隔离时，即使所有备用账号都只达到软阈值，也会明确选择最优软阈值备用账号；只有所有候选都硬耗尽或隔离时才返回 `Handled=false`。
+反复读取缓存不算新确认；仅更新外层时间、周窗口过期/缺少时间、
+最近查询失败、身份不匹配均不能触发主动再平衡。
+优势消失、候选或绑定变化、真实周期变化会重新确认。
+重载保留主账号选中时间，但重新累计确认。
+quota 接口的 serial_weekly_rebalance 显示候选、余量差和确认次数；
+实际预算切换记录 weekly_budget_rebalance；旧百分比策略记录weekly_rebalance。
+最低保持时间不阻止硬限额/429切号，也不阻止显式启用的安全储备交接。
 
-### 2.3 5h drain、新周期与 overdraft
+自动再平衡同时迁移已有会话的后续请求，正在输出的流不重放。
+手动主账号及请求级 pinned_auth_id 保留显式选择语义。
+5h新周期不能机械切到周预算更低的账号。
+周额度耗尽仍不可用，即使其 5h 余量为 100%。
+这个策略均衡可比较账号的剩余百分比，不预测未来用量或不同套餐的绝对容量。
+软阈值旧会话续用默认关闭；显式serial_soft_continuation=true可恢复旧兼容行为，仍不适用于硬限额或隔离。
+无额度头的 429 进入 probation，到期只允许一个 half-open 请求。
+提前重置须两个严格更新的观测证明，不能靠本地时钟或一次 0% 清除隔离。
 
-- 实际 drain 时长为 `min(drain_window_hours, 完整窗口长度的 10%)`；默认 5h 只在最后约 30 分钟 drain，weekly/monthly 最多 6 小时。
-- drain 可越过软阈值，但不能越过 `limit_reached`、`allowed=false`、429 或隔离。
-- 只有旧 reset 边界已经经过，且新 reset anchor 前移超过 5 分钟，才认定进入新 5h 周期；移动的完整周期占位值不会反复触发。
-- 新周期事件无论成功轮转还是因保护条件被阻止，都会消费一次，避免周期中途延迟轮转。
-- 手工主账号不参与 5h 周期轮转，但仍受硬限额、429、隔离、确认缺席、更高窗口等级和 weekly reserve 保护。
-- overdraft 只保留已经存在的哈希会话绑定，使用 30 分钟滑动空闲 TTL；新会话不会绑定到已经耗尽的旧主账号。
+首次客户端输出前的同请求重试，需要配套CPA宿主修复。发布部署目标为v7.2.152，
+启用codex.stream-bootstrap-buffering=true、max-retry-credentials=0；后者取消单独的
+尝试凭据数量上限，仍受宿主整体重试规则约束。部署完成须另以运行镜像、配置与请求验收确认。
 
-### 2.4 candidate_unavailable 为什么不等于切号
+可选预热由 CPA HostModel 执行，默认关闭；之后仍需观测确认周期启动。
+pacing 保留内建成本估计，不再读取外部定价或窗口消费成本。
 
-CPA 在 408/5xx 后可能暂时将某 auth 从候选池移除约 60 秒。调度器先保留已提交主账号，仅为当前请求选一个稳定的 provisional auth：
+## 预热请求控制
 
-- 不增加正式 switch 计数；
-- 主账号回到候选池后自动恢复；
-- provisional auth 在缺席期间保持稳定，避免请求之间乱跳；
-- 只有超过宽限并满足确认次数才记录 candidate_unavailable_confirmed。
+默认全池每 15 分钟最多一次，滚动 24 小时最多 8 次；对应
+warmup_min_interval / warmup_max_per_day，失败也计数。
+独立 warmup_attempts 记录不会随着窗口过期、显式重试或热重载清零。
+先落盘准入记录，再发送请求；写入失败则停止。旧版已丢弃的历史尝试无法补算。
 
-## 3. 429 隔离状态机
+候选须具有当前 auth_index 的新鲜额度；所有已识别窗口均须允许使用且余量高于配置的 reserve。
+预热观测最多允许两分钟（stale_after 更短时从严），不会复用失败查询后的旧额度。
+当前 serial 主账号由真实请求启动，预热跳过它。发送前再检查额度、绑定与隔离。
 
-~~~mermaid
-stateDiagram-v2
-    [*] --> Healthy
-    Healthy --> Cooldown: authoritative 429
-    Cooldown --> ProbeReady: reset time reached
-    ProbeReady --> HalfOpen: one global lease acquired
-    HalfOpen --> Healthy: successful matching probe
-    HalfOpen --> Cooldown: repeated 429
-    HalfOpen --> Probation: non-429 probe failure
-    Probation --> ProbeReady: retry delay reached
-~~~
+可重试失败使整个预热池等待，按 warmup_retry_after 指数退避，上限六小时；
+更长的 Retry-After / reset 优先。同账号累计三次失败或认证、策略类不可重试错误，
+暂停自动预热，修复后通过 POST /warmup-retry 显式清除；换 auth_index 不自动清除。
+取消、超时、结果未知至少抑制五小时，热重载不提前重试，也不换窗口标签绕过等待。
+这些全局暂停仅限制可选预热，正常客户端调度继续遵守已有额度、隔离规则。
 
-- 有可信 reset 的 429 建立 quota cooldown，且重复 429 不会缩短已有期限。
-- 无可信配额头的 429 使用 fallback_ban，并受 max_ban 上限约束。
-- cooldown 到期不代表立即全量放行；只有一个并发请求能取得 half_open_probe_timeout 租约。
-- 匹配该 probe 的成功结果才清除隔离；失败会回到 cooldown 或 probation。
-- cyber_policy、cyber_abuse、认证错误和 workspace 停用不是普通 quota cooldown，不能被外部额度重置对账自动清除。
+预热完成却暂时没有 reset 头时，保留整个原始窗口的抑制记录，后续漂移的 0% 占位值
+不能在三十分钟后触发重发。明确因 max_output_tokens 结束，表明生成已执行，
+同样等待额度确认；其他失败、截断不作为成功。SSE 内额度耗尽也进入 429 隔离。
+确认必须来自同一 auth_index、完成之后的新窗口观测；外层刷新时间不替代窗口时间。
+热重载结果日志一次记录同次请求覆盖的所有窗口，避免只交接 5h 而漏掉 weekly。
 
-## 4. 预热候选的完整条件
-
-预热用于启动“100% 可用但窗口尚未真正启动”的账号周期，不用于分配普通请求。一个账号只有同时满足以下条件才进入 warmup_candidates：
-
-1. Keeper 对该 auth 的快照新鲜；
-2. 存在可识别的 5h/weekly/monthly 窗口；
-3. 所有仍有效且可识别窗口均为 0% used、allowed=true、未触限；
-4. reset 缺失、已经到期，或呈现随观察时间移动的完整周期占位值；
-5. CPA 当前存在可用的 Codex auth binding，并能稳定解析 auth ID 与 auth index；
-6. Agent Identity 场景的 sidecar 标记和绑定匹配；
-7. auth 未被禁用、不可用或隔离；
-8. 没有该窗口的 pending、confirmed、blocked 或尚未到重试时间的结果；
-9. 当前 plugin generation 仍是 owner；
-10. 当前进程取得跨实例 warmup lease。
-
-warmup_candidates=0 只说明当前轮没有可执行候选，不等于功能关闭。warmup_skipped_*、warmup_auth_rejected 和 warmup_auth_last_error 才能解释筛除原因。
-
-## 5. 如何判断“窗口尚未启动”
-
-仅看到 reset 时间不够，因为 Keeper 或上游可能提供“现在 + 完整周期”的移动占位值。调度器组合判断：
-
-- 0% used；
-- reset 是否缺失或已经过去；
-- reset 距观察时间是否接近完整 5h、7d 或 30d；
-- 相邻快照中的 reset anchor 是否稳定；
-- 窗口 class 是否可信。
-
-预热请求返回 2xx 后先写入 pending outcome。只有后续 Keeper 快照显示稳定的新 reset anchor 或真实周期证据，才标记为激活成功并设置 suppress_until。这样不会把一个返回成功但没有启动额度窗口的请求误报为已预热。
-
-## 6. 最低成本预热请求
-
-生产默认 warmup_execution_mode=management：
-
-~~~json
-{
-  "model": "<warmup_model>",
-  "input": "hello",
-  "stream": false,
-  "store": false,
-  "max_output_tokens": 16
-}
-~~~
-
-请求通过 CPA 已认证 Management api-call，携带精确 auth_index 和 pinned auth 元数据。执行前重新解析 auth binding，防止等待期间 auth 文件已被热替换。预热使用的 model 只作用于这个内部请求，不会改 CPA default 模型或正常流量模型。
-
-账号严格一次一个执行。成功、429、SSE terminal error 或 HTTP error 都会先记录结果，再释放实例租约。
-
-### 6.1 不自动重试的错误
-
-下列结果会归一化成不含敏感消息的 blocked code：
-
-- cyber_policy / cyber_abuse / abuse 类错误；
-- 401、403；
-- deactivated_workspace；
-- invalid_refresh_token；
-- auth_unavailable；
-- 其它被分类为不可恢复的认证/策略错误。
-
-插件不会自动重复触发这些账号。修复凭据、workspace 或配置后，由管理员调用 POST .../warmup-retry 显式解除；该操作不会顺便清除 quota ban。
-
-## 7. 平台批量重置与新周期识别
-
-Keeper 的 usage identity 清单会保留 disabled 历史行。v0.1.20 首先按 Keeper 同步的 `disabled/is_deleted` 排除这些行，并拒绝提交未请求的历史 cache item；真正发起 `/quota/refresh` 前，还必须与 CPA 当前 active、非 unavailable 的 Codex auth index 求交集。Host/Management 身份清单不可用时，仅跳过有副作用的 refresh 并记录 `auth_inventory_unavailable`，已读取的配额快照仍可提交。该规则同时覆盖常规 stale/missing 刷新与 ban reset 二次确认，不区分 OAuth 或 PAT，也不会调用 reset-credit 消费接口。
-
-当平台提前把多个账号恢复为 0% 时，旧 quota ban 不能立即相信，也不能永久保留。对账必须满足：
-
-1. 当前 ban 确实是 quota 类型，不是 probation、cyber 或 auth；
-2. Keeper 快照对该账号全部窗口均为 0% used、允许、未触限；
-3. 快照自身与窗口观察时间新鲜；
-4. 相对旧 ban 出现可信变化：占位 reset、reset anchor 改变或窗口类别改变；
-5. 收到两个时间严格递增、彼此独立的合格快照；
-6. ban 建立后没有新的 warmup 429 或其它冲突证据。
-
-第一次确认会触发一次有跨实例 cooldown 的定向 Keeper refresh，用独立观测完成第二次确认。确认后只清除对应 quota cooldown，并清理旧 warmup 状态，使账号可以在同一刷新循环重新进入预热候选。
-
-历史版本曾可能把周/月级 reset 统一保存成 `Window: 5h`。对账不会直接相信这个标签，而会先用 `BannedAt -> ResetAt` 的完整跨度修复可证明的低估分类；若新 Keeper 计划已经变成更短且完整的 weekly-only Team 窗口，则仍须两个独立新鲜观测才能确认旧 monthly cooldown 已失效。第二次确认完成后，当前这份 weekly 快照会在同一轮参与预热候选判断，不需要等待下一次全局刷新。
-
-## 8. 热加载与 generation ownership
-
-CPA 热重载可能让新旧动态库 generation 短时间同时存在。v0.1.20 使用两层互斥：
-
-- Generation lock 与 record：`state_path.generation.lock` 是永不替换的 OS 锁文件；`state_path.generation` 记录当前 owner。journal 达到 768 KiB 后，会在下一次 generation I/O callback 前自动压缩；旧版遗留的 1–16 MiB journal 会在有界校验后压缩到最后一条有效单调记录。超过 16 MiB 继续 fail closed。
-- Warmup instance lease：state_path.warmup.lock 使用 OS 文件锁，保证跨进程同时只有一个预热执行者。
-
-从 v0.1.19 的“锁 journal 本身”协议首次迁移到独立 lock 文件时，必须受控重启 CPA，确保旧 DSO 句柄全部退出；迁移后同协议版本才可继续使用 generation 热替换。
-
-新 generation 启动后有 15 秒预热宽限，用于合并旧实例刚完成的 outcome journal，避免同一账号在热替换边界被重复请求。被替代实例唯一允许的尾部写入是自己已经持有租约的 warmup outcome，且写到单独 journal；新 owner 合并后清空 journal。
-
-## 9. 持久化状态
-
-state_path JSON 当前包含：
-
-- bans 与 half-open/probation 元数据；
-- warmup outcome；
-- 外部 reset 双快照确认进度；
-- serial_active_auth_id、selection source、选择时间、正式切换/临时 fallback 计数和最近原因；
-- serial_overdraft 哈希会话绑定；
-- serial_last_selected 账号轮转时间；
-- serial_five_hour_cycle 5h reset anchor；
-- 保存时间和格式版本。
-
-状态不包含 Keeper 密码、CPA Management key、PAT、OAuth token、Cookie 或原始错误正文。目录以 0700 创建，文件以 0600 临时写入、fsync，再在 generation fence 内原子 rename。
-
-辅助文件：
-
-~~~text
-state.json
-state.json.generation
-state.json.generation.lock
-state.json.warmup.lock
-state.json.warmup.outcomes
-~~~
-
-这些文件应位于同一持久卷，不应由两个互不相关的 CPA 实例共享。
-
-## 10. Management 状态判读
-
-GET /v0/management/plugins/codex-quota-scheduler/quota 的关键字段：
-
-| 字段 | 正常含义 |
-|---|---|
-| scheduler_mode | 生产应为 serial。 |
-| serial_active_auth_id | 当前全局主账号，仅用于已认证管理诊断。 |
-| serial_selection_source | 当前主账号来自 auto 还是 manual。 |
-| serial_overdraft_sessions | 当前仍有效的旧会话续跑绑定数量。 |
-| serial_switches | 正式切换次数，不包含 provisional fallback。 |
-| serial_last_switch_reason | 包含 serial_threshold、weekly_reserve、five_hour_cycle_rotation、threshold_fallback 等原因。 |
-| serial_provisional_fallbacks | 临时候选缺席导致的请求级备用次数。 |
-| generation_active | 当前实例是否仍为 generation owner。 |
-| fresh_snapshots | 可用于真实策略判断的新鲜 Keeper 快照数量。 |
-| warmup_candidates | 当前轮真正可执行的候选数。 |
-| warmup_auth_rejected | CPA auth 绑定筛除分类，不含 secret。 |
-| ban_reset_pending_confirmations | 正在等待第二个独立快照的旧 quota ban 数。 |
-| last_ban_clear_reason | 最近一次安全清除旧 quota ban 的证据类型。 |
-
-正常稳定状态不要求 warmup_candidates 大于 0；若全部周期已经启动或候选仍在 suppress/confirmed 状态，0 是正确值。
-
-## 11. 不变量
-
-- 正常流量只提交一个全局 auth；预热不会改变它。
-- 5h -> weekly -> monthly 是类别优先级；系统不做请求级轮询，但会在可信 5h 新周期边界执行一次串行轮转。
-- 100% 可用不自动等于“未启动”；必须有 reset anchor 证据。
-- HTTP 2xx 不自动等于预热成功；必须由后续 Keeper 快照确认。
-- cyber_policy 原样归类为 blocked code，绝不进入自动重试。
-- 插件不接管 OAuth、PAT 保存、模型列表或第三方 API。
+GET /quota 的 warmup_traffic 提供次数、暂停原因和预算/退避最早放行时间。
+放行不代表必然执行，仍需满足候选和新鲜度条件。认证或策略暂停必须人工修复。
+这组参数是减少额外请求的保守默认值，不代表已知的上游风控阈值。

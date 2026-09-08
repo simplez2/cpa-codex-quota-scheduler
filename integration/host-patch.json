@@ -1,0 +1,5 @@
+{
+  "upstream_tag": "v7.2.152",
+  "upstream_commit": "c76dfd4e0edabab9000628b1560ab8ab379eadb8",
+  "patch_sha256": "219a209629cf6713ec9893123fbd5c4ff86003de0fb2237116b448af1596a49a"
+}

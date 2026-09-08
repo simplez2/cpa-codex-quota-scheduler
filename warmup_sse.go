@@ -110,7 +110,7 @@ func safeWarmupResponseMetadataCode(raw string) string {
 	}
 	switch code {
 	case "server_error", "internal_server_error", "upstream_error", "service_unavailable",
-		"overloaded", "rate_limit_exceeded", "insufficient_quota", "invalid_request_error",
+		"overloaded", "rate_limit_exceeded", "usage_limit_reached", "insufficient_quota", "invalid_request_error",
 		"request_timeout", "bad_gateway", "gateway_timeout", "not_found",
 		"response_failed", "response_incomplete":
 		return code
@@ -120,6 +120,9 @@ func safeWarmupResponseMetadataCode(raw string) string {
 }
 
 func parseWarmupResponse(body []byte) (warmupStreamOutcome, error) {
+	if len(body) > warmupMaxResponseBytes {
+		return warmupStreamOutcome{}, errWarmupStreamIncomplete
+	}
 	trimmed := strings.TrimSpace(string(body))
 	if trimmed == "" {
 		return warmupStreamOutcome{}, errWarmupStreamIncomplete
@@ -151,6 +154,12 @@ func parseWarmupJSON(body []byte) (warmupStreamOutcome, error) {
 		if nested := strings.ToLower(strings.TrimSpace(payload.Response.Status)); nested != "" {
 			status = nested
 		}
+	}
+	if nonRetryableWarmupCode(code) {
+		return warmupStreamOutcome{TerminalEvent: "response.failed", ErrorCode: code}, &warmupStreamTerminalError{Event: "response.failed", Code: code}
+	}
+	if status == "incomplete" && warmupReachedOutputBudget(body) {
+		return warmupStreamOutcome{TerminalEvent: "response.incomplete"}, nil
 	}
 	if status == "completed" || (event == "response.completed" && status == "") {
 		return warmupStreamOutcome{TerminalEvent: "response.completed"}, nil
@@ -239,6 +248,10 @@ func classifyWarmupSSEEvent(eventName, data string) (warmupStreamOutcome, bool, 
 	if eventName == "" {
 		eventName = payloadType
 	}
+	if nonRetryableWarmupCode(errorCode) {
+		err := &warmupStreamTerminalError{Event: "response.failed", Code: errorCode}
+		return warmupStreamOutcome{TerminalEvent: err.Event, ErrorCode: errorCode}, true, err
+	}
 
 	switch eventName {
 	case "response.completed":
@@ -248,11 +261,44 @@ func classifyWarmupSSEEvent(eventName, data string) (warmupStreamOutcome, bool, 
 		}
 		return warmupStreamOutcome{TerminalEvent: eventName}, true, nil
 	case "response.failed", "response.incomplete", "error":
+		if eventName == "response.incomplete" && warmupReachedOutputBudget([]byte(data)) {
+			return warmupStreamOutcome{TerminalEvent: eventName}, true, nil
+		}
 		err := &warmupStreamTerminalError{Event: eventName, Code: errorCode}
 		return warmupStreamOutcome{TerminalEvent: eventName, ErrorCode: errorCode}, true, err
 	default:
 		return warmupStreamOutcome{}, false, nil
 	}
+}
+
+// A deliberately tiny output budget can end a valid generation with
+// max_output_tokens. For activation this is sufficient; resending would only
+// spend more quota. Other incomplete/filtered/failed outcomes remain failures.
+func warmupReachedOutputBudget(body []byte) bool {
+	type response struct {
+		Status            string          `json:"status"`
+		Error             json.RawMessage `json:"error"`
+		IncompleteDetails struct {
+			Reason string `json:"reason"`
+		} `json:"incomplete_details"`
+	}
+	var payload struct {
+		response
+		Type     string    `json:"type"`
+		Response *response `json:"response"`
+	}
+	if json.Unmarshal(body, &payload) != nil || (payload.Type != "" && payload.Type != "response.incomplete") {
+		return false
+	}
+	hasError := func(raw json.RawMessage) bool { return len(raw) > 0 && string(raw) != "null" }
+	if hasError(payload.Error) {
+		return false
+	}
+	value := payload.response
+	if payload.Response != nil {
+		value = *payload.Response
+	}
+	return value.Status == "incomplete" && value.IncompleteDetails.Reason == "max_output_tokens" && !hasError(value.Error)
 }
 
 func warmupSSEPayloadMetadata(data string) (payloadType, responseStatus, errorCode string) {

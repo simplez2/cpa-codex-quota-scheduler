@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -51,33 +50,17 @@ func claimManagedRuntimeForTest(t *testing.T, state *schedulerRuntimeState) {
 }
 
 func TestGenerationClaimsOnlyAfterSuccessfulRefresh(t *testing.T) {
-	now := time.Now().UTC().Truncate(time.Second)
 	var ready atomic.Bool
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/api/v1/auth/login":
-			writeTestJSON(t, w, map[string]any{"session_token": "token"})
-		case "/api/v1/usage/identities":
-			if !ready.Load() {
-				w.WriteHeader(http.StatusServiceUnavailable)
-				return
-			}
-			writeTestJSON(t, w, map[string]any{"identities": []map[string]any{{
-				"identity": "idx", "file_name": "acct", "provider": providerCodex,
-			}}})
-		case "/api/v1/quota/cache":
-			used, allowed, reached, seconds := 0.0, true, false, int64(5*60*60)
-			writeTestJSON(t, w, keeperCacheResponse{Items: []keeperCacheItem{{
-				AuthIndex: "idx", FileName: "acct", Status: "completed",
-				RefreshedAt: json.RawMessage(fmt.Sprintf("%q", now.Format(time.RFC3339))),
-				Quota: &keeperCheckResponse{Quota: []keeperQuotaRow{{
-					Label: "5h", UsedPercent: &used, Allowed: &allowed, LimitReached: &reached,
-					Window:  &keeperQuotaWindow{Seconds: &seconds},
-					ResetAt: json.RawMessage(fmt.Sprintf("%d", now.Add(5*time.Hour).Unix())),
-				}}},
-			}}})
-		case "/api/v1/pricing":
+		if !ready.Load() {
 			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		switch r.URL.Path {
+		case "/v0/management/auth-files":
+			writeTestJSON(t, w, map[string]any{"files": []map[string]any{{"id": "acct", "name": "acct", "auth_index": "idx", "provider": "codex"}}})
+		case "/v0/management/api-call":
+			writeTestJSON(t, w, cpaAPICallResponse{StatusCode: 200, Body: nativeQuotaTestBody(0)})
 		default:
 			http.NotFound(w, r)
 		}
@@ -494,16 +477,7 @@ func TestGenerationTakeoverPreservesSerialActiveAuth(t *testing.T) {
 	now := time.Now()
 	oldOwner := newManagedRuntimeForTest(t, statePath)
 	claimManagedRuntimeForTest(t, oldOwner)
-	oldOwner.quotas = map[string]quotaSnapshot{
-		"primary": {
-			AuthID: "primary", RefreshedAt: now,
-			Windows: []quotaWindow{{Class: "weekly", UsedPercent: 60, Allowed: true, ResetAt: now.Add(4 * 24 * time.Hour), ObservedAt: now}},
-		},
-		"backup": {
-			AuthID: "backup", RefreshedAt: now,
-			Windows: []quotaWindow{{Class: "weekly", UsedPercent: 10, Allowed: true, ResetAt: now.Add(6 * 24 * time.Hour), ObservedAt: now}},
-		},
-	}
+	oldOwner.quotas = newSerialTestState(now).quotas
 	request := serialTestRequest()
 	first, err := oldOwner.schedulerPick(request)
 	if err != nil || !first.Handled || first.AuthID != "primary" {
@@ -533,7 +507,7 @@ func TestGenerationTakeoverPreservesSerialActiveAuth(t *testing.T) {
 
 	next, err := newOwner.schedulerPick(request)
 	if err != nil || !next.Handled || next.AuthID != "primary" {
-		t.Fatalf("takeover changed fill-first active auth=%#v err=%v", next, err)
+		t.Fatalf("takeover changed committed active auth=%#v err=%v", next, err)
 	}
 	if oldOwner.persistBanState() {
 		t.Fatal("retired owner persisted state after takeover")

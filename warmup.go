@@ -29,6 +29,8 @@ type warmupEntry struct {
 	AuthIndex     string    `json:"auth_index,omitempty"`
 	Window        string    `json:"window"`
 	AttemptedAt   time.Time `json:"attempted_at"`
+	OutcomeAt     time.Time `json:"outcome_at,omitempty"`
+	Failures      int       `json:"failures,omitempty"`
 	CompletedAt   time.Time `json:"completed_at,omitempty"`
 	ActivatedAt   time.Time `json:"activated_at,omitempty"`
 	ResetAt       time.Time `json:"reset_at,omitempty"`
@@ -41,6 +43,7 @@ type warmupEntry struct {
 type warmupCandidate struct {
 	Snapshot quotaSnapshot
 	Window   quotaWindow
+	RetryAt  time.Time
 }
 
 type warmupAuthBinding struct {
@@ -68,6 +71,9 @@ type cpaAPICallResponse struct {
 }
 
 type cpaAuthFileEntry struct {
+	IDToken struct {
+		AccountID string `json:"chatgpt_account_id"`
+	} `json:"id_token"`
 	ID          string `json:"id"`
 	AuthIndex   string `json:"auth_index"`
 	Name        string `json:"name"`
@@ -122,7 +128,7 @@ const (
 )
 
 // warmupStartupReady keeps activation traffic away from CPA while a newly
-// claimed plugin generation is still starting. The next Keeper refresh will
+// claimed plugin generation is still starting. The next quota probe refresh will
 // retry after CPA's API server, auth registry, and Agent Identity proxy have
 // had time to settle.
 func (s *schedulerRuntimeState) warmupStartupReady(now time.Time) bool {
@@ -133,14 +139,13 @@ func (s *schedulerRuntimeState) warmupStartupReady(now time.Time) bool {
 	return !now.Before(ownership.ClaimedAt.Add(warmupStartupGrace))
 }
 
-// scheduleWarmup is called after a fresh Keeper snapshot. It deliberately
-// schedules at most one request at a time so full accounts are activated
-// sequentially instead of creating a burst across the pool.
+// scheduleWarmup is called after a fresh quota probe snapshot. It deliberately
+// admits one request under a durable pool-wide traffic budget and instance lease.
 func (s *schedulerRuntimeState) scheduleWarmup(parent context.Context, skipAuthIDs map[string]struct{}) {
 	s.mu.RLock()
 	cfg := s.cfg
 	s.mu.RUnlock()
-	if !cfg.Enabled || !cfg.WarmupEnabled {
+	if !cfg.Enabled || !cfg.WarmupEnabled || strings.TrimSpace(cfg.StatePath) == "" || parent.Err() != nil {
 		return
 	}
 	if !s.generationOwnerActive() {
@@ -160,24 +165,6 @@ func (s *schedulerRuntimeState) scheduleWarmup(parent context.Context, skipAuthI
 		strings.TrimSpace(cfg.CPAManagementKeyFile) == "" || strings.TrimSpace(cfg.WarmupSidecarURL) == "" {
 		return
 	}
-	if s.pruneExpiredWarmups(now) {
-		s.persistBanState()
-	}
-
-	eligible, err := s.cpaWarmupEligibleAuths(parent, cfg)
-	if err != nil {
-		code, _ := classifyWarmupFailure(0, err)
-		slog.Warn("codex-quota-scheduler: warmup skipped because CPA auth status is unavailable", "error_code", code)
-		return
-	}
-	if !s.generationOwnerActive() {
-		return
-	}
-	candidates := s.findWarmupCandidates(eligible, skipAuthIDs, time.Now())
-	if len(candidates) == 0 {
-		return
-	}
-
 	now = time.Now()
 	s.warmupMu.Lock()
 	if s.warmupRunning {
@@ -225,8 +212,33 @@ func (s *schedulerRuntimeState) scheduleWarmup(parent context.Context, skipAuthI
 			slog.Warn("codex-quota-scheduler: could not compact merged warmup outcome journal", "error", err)
 		}
 	}
+	// Check before auth discovery so budget exhaustion creates no additional
+	// management traffic. Persisted/journal outcomes must be merged first.
 	s.warmupMu.Lock()
-	if s.warmupRunning {
+	hold := s.warmupTrafficStatusLocked(cfg, time.Now()).HoldReason
+	s.warmupMu.Unlock()
+	if hold != "" {
+		releaseInstanceLease()
+		return
+	}
+	if s.pruneExpiredWarmups(time.Now()) {
+		s.persistBanState()
+	}
+	eligible, err := s.cpaWarmupEligibleAuths(parent, cfg)
+	if err != nil {
+		releaseInstanceLease()
+		code, _ := classifyWarmupFailure(0, err)
+		slog.Warn("codex-quota-scheduler: warmup skipped because CPA auth status is unavailable", "error_code", code)
+		return
+	}
+	candidates := s.findWarmupCandidates(eligible, skipAuthIDs, time.Now())
+	if len(candidates) == 0 || parent.Err() != nil || !s.generationOwnerActive() {
+		releaseInstanceLease()
+		return
+	}
+	now = time.Now()
+	s.warmupMu.Lock()
+	if s.warmupRunning || s.warmupTrafficStatusLocked(cfg, now).HoldReason != "" {
 		s.warmupMu.Unlock()
 		releaseInstanceLease()
 		return
@@ -242,15 +254,28 @@ func (s *schedulerRuntimeState) scheduleWarmup(parent context.Context, skipAuthI
 		releaseInstanceLease()
 		return
 	}
+	failures := s.warmups[key].Failures
 	s.warmups[key] = warmupEntry{
 		AuthID:      candidate.Snapshot.AuthID,
 		AuthIndex:   candidate.Snapshot.AuthIndex,
 		Window:      candidate.Window.Class,
 		AttemptedAt: now,
+		Failures:    failures,
+		// A crash after admission gives no proof that upstream did not execute.
+		SuppressUntil: now.Add(warmupUncertainDelay),
 	}
+	s.mergeWarmupAttemptsLocked([]warmupAttempt{{AuthID: candidate.Snapshot.AuthID, At: now}}, now)
 	s.warmupRunning = true
 	s.warmupMu.Unlock()
-	s.persistBanState()
+	if !s.persistBanState() {
+		s.warmupMu.Lock()
+		s.warmupRunning = false
+		s.warmupMu.Unlock()
+		s.wg.Done()
+		releaseInstanceLease()
+		slog.Warn("codex-quota-scheduler: warmup skipped because admission could not be persisted")
+		return
+	}
 
 	go func() {
 		defer s.wg.Done()
@@ -261,7 +286,7 @@ func (s *schedulerRuntimeState) scheduleWarmup(parent context.Context, skipAuthI
 			s.warmupMu.Unlock()
 		}()
 		executed := false
-		if s.generationOwnerActive() {
+		if parent.Err() == nil && s.generationOwnerActive() && s.warmupCandidateStillEligible(candidate, time.Now()) {
 			executed = true
 			s.executeWarmup(parent, cfg, candidate)
 		}
@@ -291,6 +316,11 @@ func (s *schedulerRuntimeState) findWarmupCandidates(eligible map[string]warmupA
 		quotas[key] = snapshot
 	}
 	cfg := s.cfg
+	activeID := s.serialActiveAuthID
+	polls := make(map[string]quotaPollState, len(s.quotaPolls))
+	for key, poll := range s.quotaPolls {
+		polls[key] = poll
+	}
 	s.mu.RUnlock()
 
 	seen := make(map[string]struct{})
@@ -309,6 +339,10 @@ func (s *schedulerRuntimeState) findWarmupCandidates(eligible map[string]warmupA
 			continue
 		}
 		seen[authID] = struct{}{}
+		if authID == activeID || polls[authID].Error != "" || !warmupQuotaHasHeadroom(snapshot, cfg) {
+			skippedIneligible++
+			continue
+		}
 		if !warmupSnapshotFresh(snapshot, now, cfg.StaleAfter) {
 			skippedStale++
 			continue
@@ -326,10 +360,12 @@ func (s *schedulerRuntimeState) findWarmupCandidates(eligible map[string]warmupA
 		if _, skip := skipAuthIDs[binding.AuthID]; skip {
 			continue
 		}
-		// CPA's current auth index is authoritative. Keeper snapshots can retain
-		// an older index after Agent Identity replaces a Team workspace auth file.
-		snapshot.AuthID = binding.AuthID
-		snapshot.AuthIndex = binding.AuthIndex
+		// A replacement credential needs its own quota observation. Rebinding a
+		// stale snapshot could warm a different workspace with unknown limits.
+		if snapshot.AuthID != binding.AuthID || snapshot.AuthIndex != binding.AuthIndex {
+			skippedIneligible++
+			continue
+		}
 		// Quarantined credentials recover only through the serialized half-open
 		// scheduler path. Warmup must never bypass that lease with a second probe.
 		if _, quarantined := banStore.lookup(binding.AuthID); quarantined {
@@ -385,10 +421,12 @@ func (s *schedulerRuntimeState) countActionableWarmupCandidates(candidates []war
 	s.warmupMu.Lock()
 	defer s.warmupMu.Unlock()
 	count := 0
+	suppressed := s.warmupSuppressedAccountsLocked(now, retryAfter)
 	for _, candidate := range candidates {
 		key := warmupKey(candidate.Snapshot.AuthID, candidate.Window.Class)
 		entry, ok := s.warmups[key]
-		if !ok || staleWarmupState(entry, candidate, now, retryAfter) || !warmupEntrySuppressesNow(entry, now, retryAfter) {
+		if !suppressed[candidate.Snapshot.AuthID] &&
+			(!ok || staleWarmupState(entry, candidate, now, retryAfter) || !warmupEntrySuppressesNow(entry, now, retryAfter)) {
 			count++
 		}
 	}
@@ -399,13 +437,13 @@ func warmupEntrySuppressesNow(entry warmupEntry, now time.Time, retryAfter time.
 	if entry.Blocked {
 		return true
 	}
+	if !entry.SuppressUntil.IsZero() && now.Before(entry.SuppressUntil) {
+		return true
+	}
 	if !entry.ResetAt.IsZero() && !now.Before(entry.ResetAt) {
 		return false
 	}
 	if !entry.ActivatedAt.IsZero() && !entry.ResetAt.IsZero() && now.Before(entry.ResetAt) {
-		return true
-	}
-	if !entry.CompletedAt.IsZero() && !entry.SuppressUntil.IsZero() && now.Before(entry.SuppressUntil) {
 		return true
 	}
 	if retryAfter <= 0 {
@@ -415,13 +453,16 @@ func warmupEntrySuppressesNow(entry warmupEntry, now time.Time, retryAfter time.
 }
 
 // warmupSnapshotFresh is intentionally stricter than the ordinary scheduling
-// freshness check. A partial Keeper response can carry a missing window forward
+// freshness check. A partial quota probe response can carry a missing window forward
 // under a newer outer RefreshedAt. That is useful for routing continuity, but an
 // activation request must never be admitted from such an indefinitely carried
 // 0% row: every recognized window needs its own fresh observation.
 func warmupSnapshotFresh(snapshot quotaSnapshot, now time.Time, staleAfter time.Duration) bool {
 	if staleAfter <= 0 {
 		staleAfter = 15 * time.Minute
+	}
+	if staleAfter > warmupQuotaMaxAge {
+		staleAfter = warmupQuotaMaxAge
 	}
 	if snapshot.RefreshedAt.IsZero() || now.Before(snapshot.RefreshedAt) || now.Sub(snapshot.RefreshedAt) > staleAfter {
 		return false
@@ -439,7 +480,7 @@ func warmupSnapshotFresh(snapshot quotaSnapshot, now time.Time, staleAfter time.
 }
 
 func unstartedWarmupWindow(snapshot quotaSnapshot, now time.Time) (quotaWindow, bool) {
-	// Keeper reports a future reset even for a window that has not started yet:
+	// quota probe reports a future reset even for a window that has not started yet:
 	// resetAfterSeconds equals the full window duration and the reset timestamp
 	// moves forward with every observation. Treat that as a placeholder rather
 	// than proof of activation. Monthly-only accounts are included because their
@@ -452,16 +493,17 @@ func unstartedWarmupWindow(snapshot quotaSnapshot, now time.Time) (quotaWindow, 
 	for _, window := range snapshot.Windows {
 		class := normalizeWindowClass(window.Class)
 		if class == "" {
-			// Keeper intentionally preserves additional/future quota rows. An
+			// quota probe intentionally preserves additional/future quota rows. An
 			// unrelated unclassified meter must not suppress activation of a
 			// recognized 5h/weekly/monthly Codex window.
 			continue
 		}
-		// Evaluate each recognized window independently. A weekly/monthly row
-		// that has already started must not suppress a fresh 5h window on the
-		// same auth. Likewise, one exhausted row must not hide another window
-		// that is still waiting for its first activation.
-		if window.UsedPercent > warmupMinimumAvailablePercent || window.LimitReached || !window.Allowed {
+		// Every account-wide window constrains the generation request, even
+		// when a different row is the cycle we would like to activate.
+		if window.LimitReached || !window.Allowed || window.UsedPercent >= usedPercentThreshold {
+			return quotaWindow{}, false
+		}
+		if window.UsedPercent > warmupMinimumAvailablePercent {
 			continue
 		}
 		if window.WindowUsageCreditsKnown && window.WindowUsageCredits > warmupMinimumUsageCredits {
@@ -602,12 +644,13 @@ func (s *schedulerRuntimeState) nextWarmupCandidateLocked(candidates []warmupCan
 	return s.nextWarmupCandidateForGenerationLocked(candidates, now, retryAfter, time.Time{})
 }
 
-// nextWarmupCandidateForGenerationLocked additionally permits one retry of an
-// unfinished, retryable outcome inherited from a previous generation. Once the
-// new generation records its own attempt, ordinary retry_after suppression
-// applies again.
+// Generation changes never shorten a persisted request's suppression period.
 func (s *schedulerRuntimeState) nextWarmupCandidateForGenerationLocked(candidates []warmupCandidate, now time.Time, retryAfter time.Duration, generationClaimedAt time.Time) (warmupCandidate, string, bool) {
+	suppressed := s.warmupSuppressedAccountsLocked(now, retryAfter)
 	for _, candidate := range candidates {
+		if suppressed[candidate.Snapshot.AuthID] {
+			continue
+		}
 		key := warmupKey(candidate.Snapshot.AuthID, candidate.Window.Class)
 		if entry, ok := s.warmups[key]; ok && staleWarmupState(entry, candidate, now, retryAfter) {
 			delete(s.warmups, key)
@@ -625,8 +668,12 @@ func (s *schedulerRuntimeState) nextWarmupCandidateForGenerationLocked(candidate
 
 func staleWarmupState(entry warmupEntry, candidate warmupCandidate, now time.Time, retryAfter time.Duration) bool {
 	if entry.Blocked {
-		return strings.TrimSpace(entry.AuthIndex) != "" && strings.TrimSpace(candidate.Snapshot.AuthIndex) != "" &&
-			strings.TrimSpace(entry.AuthIndex) != strings.TrimSpace(candidate.Snapshot.AuthIndex)
+		return false
+	}
+	// A drifting zero-usage placeholder is not proof that a completed request
+	// failed. Keep the original suppression deadline, including pending rows.
+	if now.Before(entry.SuppressUntil) || now.Before(entry.ResetAt) {
+		return false
 	}
 	observedAt := candidate.Snapshot.RefreshedAt
 	completedAt := entry.ActivatedAt
@@ -657,6 +704,9 @@ func (s *schedulerRuntimeState) pruneExpiredWarmups(now time.Time) bool {
 	defer s.warmupMu.Unlock()
 	changed := false
 	for key, entry := range s.warmups {
+		if entry.Blocked || entry.Error != "" || now.Before(entry.SuppressUntil) {
+			continue
+		}
 		expiredReset := !entry.ResetAt.IsZero() && !now.Before(entry.ResetAt)
 		expiredPending := entry.ResetAt.IsZero() && !entry.SuppressUntil.IsZero() && !now.Before(entry.SuppressUntil)
 		if expiredReset || expiredPending {
@@ -681,15 +731,15 @@ func (s *schedulerRuntimeState) confirmPendingWarmups(quotas map[string]quotaSna
 	changed := false
 	s.warmupMu.Lock()
 	for key, entry := range s.warmups {
-		if entry.CompletedAt.IsZero() || !entry.ActivatedAt.IsZero() {
+		if entry.CompletedAt.IsZero() || !entry.ActivatedAt.IsZero() || entry.Blocked || entry.Error != "" {
 			continue
 		}
 		snapshot, ok := canonical[strings.TrimSpace(entry.AuthID)]
-		if !ok || !snapshot.RefreshedAt.After(entry.CompletedAt) {
+		if !ok || snapshot.AuthIndex != entry.AuthIndex || !snapshot.RefreshedAt.After(entry.CompletedAt) {
 			continue
 		}
 		for _, window := range snapshot.Windows {
-			if normalizeWindowClass(window.Class) != normalizeWindowClass(entry.Window) || window.ResetAt.IsZero() ||
+			if !window.ObservedAt.After(entry.CompletedAt) || normalizeWindowClass(window.Class) != normalizeWindowClass(entry.Window) || window.ResetAt.IsZero() ||
 				!now.Before(window.ResetAt) || quotaWindowHasPlaceholderReset(window, snapshot.RefreshedAt, now) ||
 				!quotaWindowCycleStarted(window, snapshot.RefreshedAt, now) {
 				continue
@@ -700,7 +750,7 @@ func (s *schedulerRuntimeState) confirmPendingWarmups(quotas map[string]quotaSna
 			entry.Error = ""
 			s.warmups[key] = entry
 			changed = true
-			slog.Info("codex-quota-scheduler: confirmed warmup reset anchor from Keeper",
+			slog.Info("codex-quota-scheduler: confirmed warmup reset anchor from quota probe",
 				"auth_id", entry.AuthID,
 				"window", entry.Window,
 				"reset_at", window.ResetAt.Format(time.RFC3339))
@@ -723,60 +773,7 @@ func (s *schedulerRuntimeState) warmupSuppressedForGenerationLocked(key string, 
 	if entry.Blocked {
 		return true
 	}
-	if retryableWarmupFromPriorGeneration(entry, generationClaimedAt) {
-		delete(s.warmups, key)
-		slog.Info("codex-quota-scheduler: retrying unfinished warmup from previous generation",
-			"auth_id", entry.AuthID,
-			"window", entry.Window)
-		return false
-	}
-	// A lifecycle reconfigure cancels the refresh-loop context while the old
-	// generation is retiring. That cancellation is not an upstream failure and
-	// must not suppress the same candidate in the newly active generation. A
-	// non-zero status proves that an upstream HTTP response was received, so it
-	// must still obey the ordinary retry interval even if its error was reported
-	// as a cancellation.
-	if entry.Status == 0 && entry.Error == "cancelled" && entry.CompletedAt.IsZero() && entry.ActivatedAt.IsZero() {
-		delete(s.warmups, key)
-		return false
-	}
-	if !entry.ResetAt.IsZero() && !now.Before(entry.ResetAt) {
-		delete(s.warmups, key)
-		return false
-	}
-	if !entry.ActivatedAt.IsZero() && !entry.ResetAt.IsZero() && now.Before(entry.ResetAt) {
-		return true
-	}
-	if !entry.CompletedAt.IsZero() && !entry.SuppressUntil.IsZero() && now.Before(entry.SuppressUntil) {
-		return true
-	}
-	if retryAfter <= 0 {
-		retryAfter = 15 * time.Minute
-	}
-	return !entry.AttemptedAt.IsZero() && now.Sub(entry.AttemptedAt) < retryAfter
-}
-
-func retryableWarmupFromPriorGeneration(entry warmupEntry, generationClaimedAt time.Time) bool {
-	if generationClaimedAt.IsZero() || entry.Blocked || entry.AttemptedAt.IsZero() ||
-		!entry.AttemptedAt.Before(generationClaimedAt) {
-		return false
-	}
-	if !entry.CompletedAt.IsZero() || !entry.ActivatedAt.IsZero() || !entry.ResetAt.IsZero() {
-		return false
-	}
-	// Any HTTP status, including 5xx or a 2xx response followed by an SSE
-	// terminal error, proves the request produced a completed upstream outcome.
-	// Generation churn must not turn that outcome into an immediate retry; the
-	// normal AttemptedAt/retry_after backoff remains authoritative.
-	if entry.Status != 0 {
-		return false
-	}
-	// Status-free transport/encoding failures are also completed attempts and
-	// must respect backoff. Only an admitted attempt with no recorded outcome,
-	// or a lifecycle cancellation, is genuinely unfinished/interrupted and safe
-	// to resume immediately in the next generation.
-	errorCode := strings.ToLower(strings.TrimSpace(entry.Error))
-	return errorCode == "" || errorCode == "cancelled"
+	return warmupEntrySuppressesNow(entry, now, retryAfter)
 }
 
 func (s *schedulerRuntimeState) executeWarmup(parent context.Context, cfg pluginConfig, candidate warmupCandidate) {
@@ -807,10 +804,12 @@ func (s *schedulerRuntimeState) executeNativeWarmup(parent context.Context, cfg 
 
 	body, err := json.Marshal(map[string]any{
 		"model":             cfg.WarmupModel,
-		"input":             "hello",
+		"input":             "Reply with OK.",
 		"stream":            false,
 		"store":             false,
 		"max_output_tokens": 16,
+		"reasoning":         map[string]any{"effort": "low"},
+		"text":              map[string]any{"verbosity": "low"},
 	})
 	if err != nil {
 		s.recordWarmupError(candidate, 0, fmt.Errorf("encode native warmup request: %w", err))
@@ -837,6 +836,7 @@ func (s *schedulerRuntimeState) executeNativeWarmup(parent context.Context, cfg 
 		return
 	}
 	windows := quotaWindowsFromHeaders(response.Headers, time.Now())
+	candidate.RetryAt = warmupRetryDeadline(response.Headers, time.Now())
 	if response.StatusCode == statusTooManyRequests {
 		s.recordWarmup429(candidate, cfg, response.Headers, requestedAt, "native")
 	}
@@ -845,7 +845,7 @@ func (s *schedulerRuntimeState) executeNativeWarmup(parent context.Context, cfg 
 		return
 	}
 	if _, err := parseWarmupResponse(response.Body); err != nil {
-		s.recordWarmupError(candidate, response.StatusCode, err)
+		s.recordWarmupStreamError(candidate, cfg, response.StatusCode, response.Headers, requestedAt, "native", err)
 		return
 	}
 	s.recordWarmupOutcome(candidate, response.StatusCode, windows, nil)
@@ -891,11 +891,11 @@ func (s *schedulerRuntimeState) executeManagementWarmup(parent context.Context, 
 		s.recordWarmupError(candidate, 0, errors.New("auth_binding_stale"))
 		return
 	}
-	if strings.TrimSpace(binding.AuthID) != strings.TrimSpace(candidate.Snapshot.AuthID) {
+	if strings.TrimSpace(binding.AuthID) != strings.TrimSpace(candidate.Snapshot.AuthID) ||
+		strings.TrimSpace(binding.AuthIndex) != strings.TrimSpace(candidate.Snapshot.AuthIndex) {
 		s.recordWarmupError(candidate, 0, errors.New("auth_binding_changed"))
 		return
 	}
-	candidate.Snapshot.AuthIndex = strings.TrimSpace(binding.AuthIndex)
 
 	payload, err := json.Marshal(map[string]any{
 		"model": cfg.WarmupModel,
@@ -962,13 +962,17 @@ func (s *schedulerRuntimeState) executeManagementWarmup(parent context.Context, 
 	req.Header.Set("Authorization", "Bearer "+managementKey)
 	req.Header.Set("Content-Type", "application/json")
 	requestedAt := time.Now()
-	resp, err := (&http.Client{Timeout: warmupRequestTimeout}).Do(req)
+	resp, err := (&http.Client{Timeout: warmupRequestTimeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}).Do(req)
 	if err != nil {
 		s.recordWarmupError(candidate, 0, fmt.Errorf("CPA api-call failed: %w", err))
 		return
 	}
-	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, warmupMaxResponseBytes))
+	candidate.RetryAt = warmupRetryDeadline(resp.Header, time.Now())
+	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, warmupMaxResponseBytes+1))
 	_ = resp.Body.Close()
+	if len(raw) > warmupMaxResponseBytes {
+		readErr = errWarmupStreamIncomplete
+	}
 	if readErr != nil {
 		s.recordWarmupError(candidate, resp.StatusCode, fmt.Errorf("read CPA api-call response: %w", readErr))
 		return
@@ -989,6 +993,9 @@ func (s *schedulerRuntimeState) executeManagementWarmup(parent context.Context, 
 		}
 	}
 	windows := quotaWindowsFromHeaders(headers, time.Now())
+	if retryAt := warmupRetryDeadline(headers, time.Now()); retryAt.After(candidate.RetryAt) {
+		candidate.RetryAt = retryAt
+	}
 	if result.StatusCode == statusTooManyRequests {
 		s.recordWarmup429(candidate, cfg, headers, requestedAt, "management")
 	}
@@ -997,7 +1004,7 @@ func (s *schedulerRuntimeState) executeManagementWarmup(parent context.Context, 
 		return
 	}
 	if _, err := parseWarmupResponse([]byte(result.Body)); err != nil {
-		s.recordWarmupError(candidate, result.StatusCode, err)
+		s.recordWarmupStreamError(candidate, cfg, result.StatusCode, headers, requestedAt, "management", err)
 		return
 	}
 	s.recordWarmupOutcome(candidate, result.StatusCode, windows, nil)
@@ -1013,6 +1020,22 @@ func (s *schedulerRuntimeState) executeManagementWarmup(parent context.Context, 
 		"window", candidate.Window.Class,
 		"status", result.StatusCode,
 		"activated_windows", activated)
+}
+
+func warmupRetryDeadline(headers http.Header, now time.Time) time.Time {
+	if delay := retryAfterDuration(headers, now); delay > 0 {
+		return now.Add(delay)
+	}
+	return time.Time{}
+}
+
+func (s *schedulerRuntimeState) recordWarmupStreamError(candidate warmupCandidate, cfg pluginConfig, status int, headers http.Header, requestedAt time.Time, transport string, err error) {
+	code, blocked := classifyWarmupFailure(status, err)
+	if !blocked && (code == "usage_limit_reached" || code == "rate_limit_exceeded" || code == "insufficient_quota") {
+		s.recordWarmup429(candidate, cfg, headers, requestedAt, transport)
+		status = statusTooManyRequests
+	}
+	s.recordWarmupError(candidate, status, err)
 }
 
 func (s *schedulerRuntimeState) recordWarmup429(candidate warmupCandidate, cfg pluginConfig, headers http.Header, requestedAt time.Time, transport string) {
@@ -1032,16 +1055,23 @@ func (s *schedulerRuntimeState) recordWarmup429(candidate warmupCandidate, cfg p
 
 func (s *schedulerRuntimeState) recordWarmupError(candidate warmupCandidate, status int, err error) {
 	s.recordWarmupOutcome(candidate, status, nil, err)
-	code, blocked := classifyWarmupFailure(status, err)
+	s.warmupMu.Lock()
+	entry := s.warmups[warmupKey(candidate.Snapshot.AuthID, candidate.Window.Class)]
+	s.warmupMu.Unlock()
 	slog.Warn("codex-quota-scheduler: Codex warmup failed",
 		"auth_id", candidate.Snapshot.AuthID,
 		"window", candidate.Window.Class,
-		"error_code", code,
-		"retryable", !blocked)
+		"error_code", entry.Error,
+		"retryable", !entry.Blocked)
 }
 
 func (s *schedulerRuntimeState) recordWarmupOutcome(candidate warmupCandidate, status int, windows []quotaWindow, err error) {
 	now := time.Now()
+	s.mu.RLock()
+	cfg := s.cfg
+	s.mu.RUnlock()
+	// Preserve upstream Retry-After/reset evidence even after probation clears.
+	ban, _ := banStore.lookup(candidate.Snapshot.AuthID)
 	s.warmupMu.Lock()
 	if s.warmups == nil {
 		s.warmups = make(map[string]warmupEntry)
@@ -1052,15 +1082,46 @@ func (s *schedulerRuntimeState) recordWarmupOutcome(candidate warmupCandidate, s
 	target.AuthIndex = candidate.Snapshot.AuthIndex
 	target.Window = candidate.Window.Class
 	target.Status = status
+	target.OutcomeAt = now
 	if err != nil {
 		target.Error, target.Blocked = classifyWarmupFailure(status, err)
+		for _, previous := range s.warmups {
+			if previous.AuthID == target.AuthID && previous.Failures > target.Failures {
+				target.Failures = previous.Failures
+			}
+		}
+		target.Failures++
+		if target.Failures >= warmupFailureLimit {
+			target.Blocked = true
+		}
 		target.CompletedAt = time.Time{}
 		target.ActivatedAt = time.Time{}
 		target.ResetAt = time.Time{}
-		target.SuppressUntil = time.Time{}
+		delay := warmupFailureDelay(cfg.WarmupRetryAfter, target.Failures)
+		// Missing transport outcome or a truncated response can still have
+		// consumed quota upstream. Do not repeat it after a short retry interval.
+		if status == 0 || strings.ReplaceAll(target.Error, ".", "_") == "response_incomplete" || errors.Is(err, errWarmupStreamIncomplete) {
+			if delay < warmupUncertainDelay {
+				delay = warmupUncertainDelay
+			}
+		}
+		target.SuppressUntil = now.Add(delay)
+		if ban.ResetAt.After(target.SuppressUntil) {
+			target.SuppressUntil = ban.ResetAt
+		}
+		if candidate.RetryAt.After(target.SuppressUntil) {
+			target.SuppressUntil = candidate.RetryAt
+		}
 	} else {
 		target.Error = ""
 		target.Blocked = false
+		target.Failures = 0
+		for key, previous := range s.warmups {
+			if previous.AuthID == target.AuthID && !previous.Blocked {
+				previous.Failures = 0
+				s.warmups[key] = previous
+			}
+		}
 	}
 	if target.AttemptedAt.IsZero() {
 		target.AttemptedAt = now
@@ -1074,7 +1135,7 @@ func (s *schedulerRuntimeState) recordWarmupOutcome(candidate warmupCandidate, s
 		// One successful generation request starts every unstarted quota window
 		// attached to the same Codex workspace. Persist pending sibling entries
 		// now instead of issuing a second low-cost request for weekly/monthly while
-		// Keeper or the upstream response headers are still converging.
+		// quota probe or the upstream response headers are still converging.
 		for _, covered := range warmupActivationWindows(candidate.Snapshot, now) {
 			class := normalizeWindowClass(covered.Class)
 			if class == "" {
@@ -1090,6 +1151,8 @@ func (s *schedulerRuntimeState) recordWarmupOutcome(candidate warmupCandidate, s
 			entry.Window = class
 			entry.AttemptedAt = target.AttemptedAt
 			entry.CompletedAt = target.CompletedAt
+			entry.OutcomeAt = target.OutcomeAt
+			entry.Failures = 0
 			entry.ActivatedAt = time.Time{}
 			entry.ResetAt = time.Time{}
 			entry.SuppressUntil = now.Add(warmupFallbackWindow(covered))
@@ -1100,16 +1163,21 @@ func (s *schedulerRuntimeState) recordWarmupOutcome(candidate warmupCandidate, s
 		}
 	}
 	for _, window := range windows {
-		if window.ResetAt.IsZero() || !now.Before(window.ResetAt) {
+		if window.ResetAt.IsZero() || !now.Before(window.ResetAt) || quotaWindowHasPlaceholderReset(window, now, now) {
 			continue
 		}
 		key := warmupKey(candidate.Snapshot.AuthID, window.Class)
 		entry := s.warmups[key]
+		if entry.Blocked {
+			continue
+		}
 		entry.AuthID = candidate.Snapshot.AuthID
 		entry.AuthIndex = candidate.Snapshot.AuthIndex
 		entry.Window = window.Class
 		entry.AttemptedAt = target.AttemptedAt
 		entry.CompletedAt = target.CompletedAt
+		entry.OutcomeAt = target.OutcomeAt
+		entry.Failures = 0
 		entry.ActivatedAt = now
 		entry.ResetAt = window.ResetAt
 		entry.SuppressUntil = window.ResetAt
@@ -1122,7 +1190,7 @@ func (s *schedulerRuntimeState) recordWarmupOutcome(candidate warmupCandidate, s
 	}
 	// Without an upstream reset header this remains pending_confirmation. The
 	// local suppress_until prevents duplicate low-cost calls, while the next
-	// fresh Keeper snapshot supplies the real reset anchor shown in status.
+	// fresh quota probe snapshot supplies the real reset anchor shown in status.
 	s.warmups[targetKey] = target
 	s.warmupMu.Unlock()
 	s.persistBanState()
@@ -1324,7 +1392,7 @@ func (s *schedulerRuntimeState) cpaWarmupEligibleAuths(ctx context.Context, cfg 
 
 // cpaManagementAuthFiles reads the authenticated CPA auth inventory without
 // applying warmup-specific transport rules. Quota refresh uses the same raw
-// inventory to fail closed before asking Keeper to touch a credential.
+// inventory to fail closed before asking quota probe to touch a credential.
 func cpaManagementAuthFiles(ctx context.Context, cfg pluginConfig) ([]cpaAuthFileEntry, error) {
 	keyRaw, err := os.ReadFile(cfg.CPAManagementKeyFile)
 	if err != nil {

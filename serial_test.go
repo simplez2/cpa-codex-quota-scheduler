@@ -14,16 +14,17 @@ import (
 func newSerialTestState(now time.Time) schedulerRuntimeState {
 	cfg := defaultPluginConfig()
 	cfg.StatePath = ""
+	cfg.SerialAllocationPolicy = "weekly_remaining" // legacy balance contract; budget policy has separate tests
 	return schedulerRuntimeState{
 		cfg: cfg,
 		quotas: map[string]quotaSnapshot{
 			"primary": {
 				AuthID: "primary", RefreshedAt: now,
-				Windows: []quotaWindow{{Class: "weekly", UsedPercent: 60, Allowed: true, ResetAt: now.Add(4 * 24 * time.Hour), ObservedAt: now}},
+				Windows: []quotaWindow{{Class: "weekly", UsedPercent: 10, Allowed: true, ResetAt: now.Add(4 * 24 * time.Hour), ObservedAt: now}},
 			},
 			"backup": {
 				AuthID: "backup", RefreshedAt: now,
-				Windows: []quotaWindow{{Class: "weekly", UsedPercent: 10, Allowed: true, ResetAt: now.Add(6 * 24 * time.Hour), ObservedAt: now}},
+				Windows: []quotaWindow{{Class: "weekly", UsedPercent: 60, Allowed: true, ResetAt: now.Add(6 * 24 * time.Hour), ObservedAt: now}},
 			},
 		},
 		warmups: make(map[string]warmupEntry),
@@ -503,6 +504,7 @@ func TestSerialSchedulerDrainAllowsActivePastThresholdNearReset(t *testing.T) {
 	resetBanStoreForTest()
 	now := time.Now()
 	state := newSerialTestState(now)
+	state.cfg.Serial5hHandoffMode = "inherit_global"
 	req := serialTestRequest()
 	if got, _ := state.schedulerPick(req); got.AuthID != "primary" {
 		t.Fatalf("initial pick = %#v", got)
@@ -510,10 +512,11 @@ func TestSerialSchedulerDrainAllowsActivePastThresholdNearReset(t *testing.T) {
 
 	state.mu.Lock()
 	primary := state.quotas["primary"]
-	// 99% used, reset in 4h: inside the default 6h drain window, so crossing
-	// the 98% soft threshold must not switch away.
-	primary.Windows[0].UsedPercent = 99
-	primary.Windows[0].ResetAt = now.Add(4 * time.Hour)
+	// A draining 5h window may cross its soft threshold while weekly quota is
+	// healthy. Drain no longer vetoes weekly reserve/balance protection.
+	primary.Windows = append(primary.Windows, quotaWindow{
+		Class: "5h", UsedPercent: 99, Allowed: true, ResetAt: now.Add(10 * time.Minute), ObservedAt: now,
+	})
 	state.quotas["primary"] = primary
 	state.mu.Unlock()
 	got, err := state.schedulerPick(req)
@@ -525,7 +528,7 @@ func TestSerialSchedulerDrainAllowsActivePastThresholdNearReset(t *testing.T) {
 	}
 }
 
-func TestSerialSchedulerDrainPrefersExpiringAccountOverFreshBackup(t *testing.T) {
+func TestSerialSchedulerDrainBreaksTiesWithinWeeklyBand(t *testing.T) {
 	resetBanStoreForTest()
 	now := time.Now()
 	state := newSerialTestState(now)
@@ -535,7 +538,7 @@ func TestSerialSchedulerDrainPrefersExpiringAccountOverFreshBackup(t *testing.T)
 	backup.Windows[0].ResetAt = now.Add(6 * 24 * time.Hour)
 	state.quotas["backup"] = backup
 	primary := state.quotas["primary"]
-	primary.Windows[0].UsedPercent = 90
+	primary.Windows[0].UsedPercent = 6
 	primary.Windows[0].ResetAt = now.Add(3 * time.Hour)
 	state.quotas["primary"] = primary
 	state.mu.Unlock()
@@ -573,6 +576,7 @@ func TestSerialOverdraftPinsSessionToExhaustedAuth(t *testing.T) {
 	resetBanStoreForTest()
 	now := time.Now()
 	state := newSerialTestState(now)
+	state.cfg.SerialSoftContinuation = true
 	req := serialTestRequest()
 	req.Options.Headers = map[string][]string{"X-Session-ID": {"in-flight"}}
 	if got, _ := state.schedulerPick(req); got.AuthID != "primary" {
@@ -647,7 +651,7 @@ func TestSerialStatePersistenceIncludesActiveAuth(t *testing.T) {
 	if err := json.Unmarshal(raw, &persisted); err != nil {
 		t.Fatal(err)
 	}
-	if persisted.Version != 5 || persisted.SerialActiveAuthID != "primary" || persisted.SerialSwitches != 3 || persisted.SerialFallbacks != 7 {
+	if persisted.Version != 6 || persisted.SerialActiveAuthID != "primary" || persisted.SerialSwitches != 3 || persisted.SerialFallbacks != 7 {
 		t.Fatalf("serial persistence = %#v", persisted)
 	}
 }
@@ -719,6 +723,7 @@ func TestSerialSchedulerPrefersLeastUsedFiveHourBackupAfterInitialSelection(t *t
 	resetBanStoreForTest()
 	now := time.Now()
 	state := newSerialTestState(now)
+	state.cfg.Serial5hHandoffMode = "inherit_global"
 	state.mu.Lock()
 	state.serialActiveAuthID = "primary"
 	state.serialLastSelected = map[string]time.Time{
@@ -853,6 +858,7 @@ func TestSerialSchedulerDoesNotCreateOverdraftForNewHardLimitedSessionWithoutBac
 	resetBanStoreForTest()
 	now := time.Now()
 	state := newSerialTestState(now)
+	state.cfg.SerialSoftContinuation = true
 	state.mu.Lock()
 	state.serialActiveAuthID = "primary"
 	state.quotas["primary"] = quotaSnapshot{AuthID: "primary", RefreshedAt: now, Windows: []quotaWindow{
@@ -889,6 +895,7 @@ func TestSerialSchedulerClearsOverdraftWhenFiveHourLimitIsReached(t *testing.T) 
 	req.Options.Headers = map[string][]string{"X-Session-ID": {"session-hard-limit"}}
 	session := schedulerSessionHash(req)
 	state := newSerialTestState(now)
+	state.cfg.SerialSoftContinuation = true
 	state.mu.Lock()
 	state.serialActiveAuthID = "primary"
 	state.serialOverdraft = map[string]serialOverdraftBinding{
@@ -972,6 +979,7 @@ func TestInspectSerialCandidateReserveAwareHandoffIsUserSelectable(t *testing.T)
 	now := time.Now()
 	candidate := pluginapi.SchedulerAuthCandidate{ID: "acct", Provider: providerCodex}
 	thresholdOnly := defaultPluginConfig()
+	thresholdOnly.Serial5hHandoffMode = "inherit_global"
 	thresholdOnly.SerialSwitchPercent = 98
 	thresholdOnly.SerialHandoffMode = "threshold_only"
 	reserveAware := thresholdOnly

@@ -1,196 +1,173 @@
-<div align="center">
-  <img src="assets/logo.svg" width="96" alt="Codex Quota Scheduler logo">
-  <h1>Codex Quota Scheduler</h1>
-  <p><strong>CPA-native one-account-at-a-time scheduling, 5h/weekly quota balancing, persistent 429 quarantine, and safe full-quota activation.</strong></p>
-  <p>
-    <a href="https://github.com/simplez2/cpa-codex-quota-scheduler/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/simplez2/cpa-codex-quota-scheduler/ci.yml?branch=main&style=flat-square&label=CI"></a>
-    <a href="https://github.com/simplez2/cpa-codex-quota-scheduler/releases"><img alt="Release" src="https://img.shields.io/github/v/release/simplez2/cpa-codex-quota-scheduler?style=flat-square"></a>
-    <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-111827?style=flat-square"></a>
-    <img alt="CPA plugin" src="https://img.shields.io/badge/CPA-dynamic%20plugin-374151?style=flat-square">
-    <img alt="Scheduling" src="https://img.shields.io/badge/mode-serial%20quota--balanced-0f766e?style=flat-square">
-  </p>
-</div>
+# Codex Quota Scheduler
 
-> **Version note:** the source and registry declare plugin version **v0.1.24**. A build is a published release only after the matching `v0.1.24` tag and release assets are available.
+Standalone CPA plugin for serial Codex account selection, native quota polling,
+5h/weekly/monthly windows, persistent 429 quarantine and optional warmup.
+Source version: **0.2.0**. Local builds are not a published release.
 
-> **Upgrade exception:** the first upgrade from **v0.1.19 or earlier** to **v0.1.20** changes the generation-lock protocol and requires one controlled quick restart of CPA. Do not hot-load old and new DSOs together. Later v0.1.20-compatible reloads use the stable lock protocol normally.
+## Dependencies
 
-The plugin keeps normal Codex traffic on one globally committed credential. It switches only when quota policy, an authoritative 429, quarantine, or confirmed candidate loss requires it. Fully available accounts can be activated separately, one at a time, without turning normal traffic into round-robin usage.
+Only CPA is required. The plugin reads CPA's authenticated auth-files inventory
+and queries upstream quota through CPA's authenticated api-call endpoint.
+CPA resolves the auth index, substitutes $TOKEN$, and applies its proxy policy.
+The plugin never reads or stores upstream OAuth/PAT credentials.
 
-## Why this exists
+The default endpoint is https://chatgpt.com/backend-api/wham/usage.
+The quota_url option can select a trusted alternative implementing the same
+native schema. Custom providers without that schema cannot supply fresh quota;
+the plugin never invents their percentages.
 
-| Requirement | Behavior |
-|---|---|
-| Lower account-risk exposure | One committed account serves normal traffic until a real switch trigger occurs. |
-| Spend short cycles before long cycles | Default class order is **5h �?weekly �?monthly**. |
-| Avoid wasting reset credits | Within a class, reset-credit accounts can be preferred before active-cycle and usage concentration tie-breakers. |
-| Survive transient 408/5xx suppression | CPA candidate loss first becomes a request-local provisional fallback, not an immediate permanent switch. |
-| Recover safely after 429 | Durable cooldown, one global half-open probe, then healthy or probation. |
-| Start dormant full-quota cycles | Strictly sequential, pinned, minimal Responses requests; normal routing remains serial. |
-| Handle platform-wide early resets | Two independent fresh Keeper observations are required before a stale quota ban is cleared. |
-| Hot-reload safely | Generation ownership and cross-process warmup leases stop superseded plugin instances from continuing work. |
-| Operate from CPA Management | Change mode, threshold, warmup model, or the serial primary through authenticated hot configuration. |
+No external quota service, login session, cache database, refresh queue, pricing
+endpoint, or external quota-service password is used.
 
-## Architecture
+## Setup and migration
 
-```mermaid
-flowchart LR
-    C[Codex clients] --> CPA[CLIProxyAPI]
-    CPA --> S[Codex Quota Scheduler]
-    S -->|one committed auth| A[Codex credential pool]
-    K[Usage Keeper] -->|fresh quota snapshots| S
-    S -->|pinned minimal warmup| M[Authenticated CPA Management API]
-    M --> G[Codex Agent Identity gateway or Codex auth]
-    S --> P[(owner-only state)]
-```
+Use SERIAL_CONFIG.example.yaml. Configure cpa_management_url and mount the
+cpa_management_key_file; the CPA process/container must reach that address.
+Remove the former external-service URL/password configuration and secret mounts.
+Unknown legacy YAML fields are ignored and never activate a legacy path.
+Retain state.json and generation files to preserve bans and serial history.
 
-The scheduler never rewrites models, credentials, provider definitions, or third-party routes. It only returns an auth choice for a pure `codex` candidate set. Management responses are authenticated but may contain operational auth identifiers, so they must not be pasted into public issues without redaction.
+## Polling and cache
 
-## Selection and switching
+- Inventory is checked every refresh tick. Disabled/deleted credentials are
+  removed from the cache. Temporarily unavailable accounts remain observable
+  so cooldown recovery does not require a generation request.
+- The active account uses refresh_interval (30s); standby accounts use
+  quota_refresh_cooldown (2m). Up to quota_refresh_batch (8) queries execute
+  sequentially per tick, active first and oldest attempts next.
+- Backoff is per account/auth index and persists across reloads. Failures double
+  the interval up to 30 minutes; a longer Retry-After wins. Authentication and
+  permission failures wait at least 30 minutes.
+- Relative reset values are anchored once per observation. Cache reads never
+  move reset timestamps. Older polls cannot replace newer header observations.
+- Fresh hard-limit evidence remains effective even if a sibling window is stale.
+- State atomically persists quota snapshots, poll guards, bans, serial selection
+  and warmup records. Query errors are short codes, never private response bodies.
 
-Normal traffic still has exactly one committed global primary; this is not request-level round-robin. When an initial selection or committed switch is required, the scheduler applies these rules:
+The native rate_limit primary/secondary windows are classified by duration.
+Feature/model-scoped additional limits are not treated as account-wide limits.
+The former external pricing and window-cost calibration are no longer available;
+serial remains the default and pacing retains built-in cost estimates.
 
-1. keep accounts below `reserve_weekly_percent` in a protected partition while any unprotected account exists;
-2. honor end-of-cycle drain and `window_order`;
-3. prefer reset-credit accounts when configured;
-4. preserve the historical CPA priority/fill-first rule only for the first cold-start selection;
-5. after the pool has selection history, group weekly remaining capacity by `switch_hysteresis_percent`;
-6. inside the best weekly band, prefer the least-used 5h window;
-7. use the longest-idle selection timestamp, CPA priority, and stable auth ID as deterministic tie-breakers.
+## Routing and recovery
 
-A healthy primary remains committed between switch boundaries. It can be preempted when a higher-priority window becomes usable, when its weekly capacity enters the protected reserve while a safe backup exists, or once at a verified new 5h cycle boundary in automatic mode. Hard limits, `allowed=false`, 429, quarantine, and confirmed candidate loss always remain failover signals. If the primary is hard-limited and every backup has only crossed the soft threshold, the scheduler explicitly selects the best soft-threshold backup rather than delegating an unsafe choice back to CPA.
+Traffic stays on one committed account. Default `serial_allocation_policy:
+sustainable` first respects hard limits and quarantine, then
+ranks same-class peers by `(weekly remaining - weekly reserve) / days to reset`.
+The denominator is bounded below by six hours; unused placeholders use a full week.
+With equal reset times, 80% weekly outranks 40%. With 40% resetting tomorrow and
+80% resetting in six days, the former has more spendable budget per day.
 
-### End-of-cycle drain
+Proactive budget handoffs require a 20% relative advantage, two distinct fresh
+weekly readings of **both** accounts, and a 5-minute primary hold. Configure
+`serial_budget_rebalance_percent` (0 disables budget preemption) and
+`serial_weekly_rebalance_min_hold` (1m-24h). `weekly_remaining` retains the earlier
+raw percentage policy and its 10-point `serial_weekly_rebalance_percent` control.
+Cached reads, failed polls and mismatched auth indices cannot confirm a switch;
+late completion headers cannot override stricter fresh probe evidence.
+The quota endpoint exposes `serial_weekly_rebalance` and the committed reason
+`weekly_budget_rebalance`, with the comparison metric explicitly labeled.
 
-Drain duration is capped at the smaller of `drain_window_hours` and the final 10% of the quota window. With defaults, a 5h window drains only during its final 30 minutes, while weekly and monthly windows keep the six-hour cap. Drain may cross the soft threshold, but never overrides `limit_reached`, `allowed=false`, quarantine, or 429.
+Default `serial_5h_handoff_mode: 429_only` and `reserve_5h_percent: 0` use the
+observed 5h capacity without an early reserve handoff. Reaching 98% or 99% used
+alone keeps the current account; a confirmed hard limit, disallowed state or
+upstream 429 still triggers server-side handoff. Weekly balancing remains active.
+In this mode, 5h ranking uses observed remaining capacity times the plan prior;
+it deducts neither a configured static reserve nor forecast/cache-age estimates.
+Runway diagnostics remain observational and do not change that decision.
 
-### In-flight overdraft (session pinning)
+To restore the earlier reserve policy, explicitly select `reserve_aware` and set
+`reserve_5h_percent: 15`. Two positive native probe increments then enable a
+two-minute forecast reserve and observation-age debit. Dynamic reserve is capped
+at max(static reserve, 50%). Those optional safety handoffs do not wait for the
+budget hold, and drain cannot bypass them. With no safer peer, soft reserves
+remain usable; hard limits always win. `serial_soft_continuation: true` separately
+restores the earlier session continuation past a soft handoff.
 
-When CPA supplies a stable session identifier, serial mode records which auth already served that conversation. After a global threshold or hard-limit switch, only that pre-existing conversation may continue on its prior auth; a newly observed session is never bound to an already exhausted primary. Bindings use a 30-minute sliding inactivity TTL, persist across restarts, and are removed if the auth disappears or becomes quarantined. This is a bounded compatibility mechanism for observed upstream continuation behavior, not a promise about future quota or billing semantics. Runtime status exposes the live count as `serial_overdraft_sessions`.
+Plan priors default to `team_standard`. `plus` and `team_standard` use 1;
+`pro_5x` and `team_premium` use 5; `pro_20x` uses 20. Set per-auth overrides in
+`quota_account_plans`. Ambiguous native plan names are not guessed. Multipliers
+only compare 5h available capacity within the same 5% weekly budget band: multiplying them
+into the weekly score would prematurely exhaust large accounts. They do not
+establish fixed weekly capacity. See the official sources, experiments and
+limitations in [the allocation study](research/ALLOCATION_RESEARCH.zh-CN.md).
 
-## Warmup in one paragraph
+Polling adds no model requests. An entire refresh, including inventory, has a
+1–30s budget bounded by `refresh_interval`; each upstream call has at most 10s.
+Timeouts retain cache/backoff and stop further dispatch until another tick.
 
-A warmup candidate must have a fresh Keeper row, all recognized active windows at 0% used and allowed, a credible “not started�?reset signal, a valid CPA auth binding, no quarantine, no active/pending/blocked warmup record, and no competing generation or instance lease. The plugin then sends a pinned non-streaming `hello` request with `store=false` and `max_output_tokens=16`. Success is not assumed from HTTP 2xx alone: later Keeper data must confirm a stable reset anchor. Cyber-policy, abuse, auth, deactivated-workspace, and similar terminal failures are stored only as redacted blocked codes and are never retried automatically.
+Automatic preemptions move subsequent session requests to the replacement;
+already-running streams finish on their original account. Manual selection
+disables proactive weekly balancing and 5h cycle rotation. Hard limits still
+force failover immediately. A cycle reset cannot rotate a healthy 80% weekly
+account onto a lower-budget peer just to alternate IDs.
 
-Completed HTTP failures, including 502/503 and HTTP 200 streams that end in an error event, keep their original `AttemptedAt` backoff across plugin generations. Only a genuinely unfinished attempt with no upstream status, or a lifecycle cancellation before any result, may resume immediately after hot reload.
+Percentages balance reported capacity for comparable accounts. They do not
+predict demand or establish equal absolute capacity across different plans.
+429 recovery still requires one serialized half-open probe; early quota resets
+require two strictly newer observations. Generation ownership and warmup leases
+prevent superseded instances from committing state or running model warmups.
 
-Keeper keeps disabled credentials in its usage history. The scheduler excludes those rows from cache requests and snapshots, then intersects every side-effecting `/quota/refresh` target with CPA's current active Codex auth inventory. If that authenticated inventory is unavailable, cached quota data remains readable but the refresh request fails closed. The filter accepts both official OAuth and Agent Identity/PAT credentials and never consumes a reset credit.
+Optional warmup defaults to native CPA HostModel and is disabled by default.
+Explicit legacy management warmup remains optional and is never required for
+quota polling. A native warmup callback must finish before its worker can exit.
 
-Platform-wide resets are reconciled without trusting one transient quota row. Two strictly newer Keeper observations must independently prove the new cycle before an obsolete quota cooldown is removed. This also repairs historical cooldowns whose persisted `5h` label conflicts with their recorded weekly or monthly span, including a later weekly-only Team plan shape. Once confirmed, the stale warmup record is cleared and that same fresh snapshot may become a warmup candidate in the current refresh cycle.
+Warmup uses conservative admission controls, separate from client failover:
 
-See [Runtime logic](RUNTIME_LOGIC.zh-CN.md) for the complete state machine and [Operations handoff](HANDOFF.zh-CN.md) for deployment and incident procedures.
+- `warmup_min_interval: 15m` spaces attempts across the entire pool;
+  `warmup_max_per_day: 8` caps admissions in a rolling 24-hour window.
+  Failures count. The ledger survives restarts, hot reloads and manual retries.
+- Each recognized quota window must be allowed, above its configured reserve and
+  observed within the last 2 minutes (or a shorter `stale_after`). Active serial
+  accounts, failed quota polls and changed auth bindings are skipped. A changed
+  binding must first acquire its own fresh quota observation.
+- State must be writable: admission is persisted before dispatch. Quota and
+  quarantine are checked again immediately before execution. A failed commit
+  sends no generation request.
+- Retryable failures pause the entire warmup pool with exponential backoff
+  starting at `warmup_retry_after` (15m), capped at 6h. A longer Retry-After/reset
+  wins. Three failures for an account, or a nonretryable auth/policy failure,
+  require explicit repair and `POST /warmup-retry` before auto-warmup resumes.
+  Changing auth indexes does not clear that block.
+- Cancellation, timeout or an unknown outcome waits at least 5h. Reload never
+  grants an immediate retry. Completed activation with no reset header retains
+  its original window suppression; a moving zero-usage placeholder does not
+  justify another generation after 30 minutes.
+- An explicit `max_output_tokens` terminal result counts as executed activation
+  and awaits quota confirmation. Other incomplete/failed results remain errors.
+  HTTP 429 and SSE quota failures enter the same quarantine.
 
-## Recommended configuration
+The authenticated quota status includes `warmup_traffic` (rolling attempt count,
+hold reason and earliest budget/backoff time), plus each warmup's failure count
+and outcome time. A clear traffic hold is only one admission condition. Actual
+execution still requires fresh eligible quota. Old state can only migrate the
+attempts that the previous version retained.
 
-Start from [SERIAL_CONFIG.example.yaml](SERIAL_CONFIG.example.yaml):
+These controls reduce optional generation traffic. They do not establish an
+upstream risk threshold or guarantee that an account will not be restricted.
 
-```yaml
-plugins:
-  enabled: true
-  configs:
-    codex-quota-scheduler:
-      enabled: true
-      priority: 2000
-      scheduler_mode: serial
-      serial_switch_percent: 98
-      serial_handoff_mode: threshold_only # or reserve_aware
-      serial_5h_handoff_mode: inherit_global # custom_threshold, reserve_aware, 429_only
-      serial_5h_switch_percent: 98
-      serial_prefer_active_cycle: true
+Transparent recovery of the same streaming request also requires the matching
+CPA host pre-output quota failover patch. The deployment target is CPA v7.2.152
+with `codex.stream-bootstrap-buffering: true` and `max-retry-credentials: 0`
+(no separate credential-count cap within the host retry policy). Deployment
+completion must be verified against the running host; these requirements do not
+report a completed rollout. A scheduler plugin cannot replay an already
+committed client stream.
 
-      keeper_url: http://cpa-usage-keeper:8080/keeper
-      keeper_password_file: /run/secrets/keeper_login_password
-      refresh_interval: 30s
-      stale_after: 15m
-      state_path: /var/lib/codex-quota-scheduler/state.json
+## Management and validation
 
-      reserve_5h_percent: 15
+Authenticated routes are under /v0/management/plugins/codex-quota-scheduler/.
+GET /quota exposes windows, freshness, per-account quota_polls, errors,
+generation state and serial/warmup diagnostics. Existing bans, serial-active
+and warmup management operations remain.
 
-      prefer_reset_credits: true
-      window_order: [5h, weekly, monthly]
+Go 1.21+ and a C compiler are required:
 
-      warmup_enabled: true
-      warmup_execution_mode: management
-      warmup_model: gpt-5.6-luna
-      warmup_sidecar_url: http://codex-agent-identity-gateway:8787/backend-api/codex
-      warmup_retry_after: 15m
-      cpa_management_url: http://127.0.0.1:8317/v0/management/api-call
-      cpa_management_key_file: /run/secrets/management_key
-```
-
-`serial_handoff_mode` is user-selectable in CPA Management. `threshold_only`
-preserves the legacy behavior and switches at `serial_switch_percent`.
-`reserve_aware` also treats the configured reserve for the active window as an
-early handoff boundary: `reserve_5h_percent` for 5h, `reserve_weekly_percent`
-for weekly, and `reserve_monthly_percent` for monthly. This keeps the handoff
-logic consistent across all recognized Codex windows. Hard limits and 429
-quarantine remain authoritative in either mode.
-
-The 5h window also has an explicit override in CPA Management. The default
-`serial_5h_handoff_mode: inherit_global` keeps the existing global behavior.
-`custom_threshold` uses `serial_5h_switch_percent`, `reserve_aware` uses only
-the 5h reserve, and `429_only` disables soft 5h handoff while retaining hard
-limit, disallowed, and 429 failover. This lets an operator choose between the
-legacy 98% threshold, a custom 5h threshold, a protected reserve, or hard
-failover only without changing weekly/monthly policy.
-
-`warmup_model` applies only to the pinned activation request. It does not change CPA's default channel, official model list, or the model used by normal traffic.
-
-## Build and verify
-
-Go 1.23 or newer plus a C compiler is required for the dynamic library:
-
-```bash
-gofmt -w .
+~~~sh
 go test ./...
 go test -race ./...
-go vet ./...
-CGO_ENABLED=1 go build -buildmode=c-shared -o codex-quota-scheduler.so .
-```
+go build -buildmode=c-shared -o codex-quota-scheduler.dll .
+~~~
 
-Copy the library to CPA's platform plugin directory, enable the config, and retain `state_path` on a persistent owner-only volume. Canary-test the exact CPA image before production because the dynamic plugin ABI is tied to the host SDK.
-
-## Authenticated Management API
-
-All routes live below `/v0/management/plugins/codex-quota-scheduler`:
-
-| Method | Route | Purpose |
-|---|---|---|
-| `GET` | `/quota` | Serial, Keeper, generation, warmup, reconciliation, and authenticated operational status. |
-| `PUT` | `/serial-active` | Manually select one active, fresh, eligible serial primary with `{"auth_id":"..."}`. |
-| `DELETE` | `/serial-active` | Clear the manual primary and return to automatic selection. |
-| `GET` | `/bans` | Current cooldown, probation, and half-open entries. |
-| `POST` | `/unban` | Explicitly clear one quarantine entry. |
-| `POST` | `/unban-all` | Explicitly clear all quarantine entries. |
-| `POST` | `/warmup-retry` | Clear a repaired blocked warmup by auth ID, or explicitly with `all=true`. |
-
-Manual primary selection, unban, and warmup retry are privileged actions. The selected primary remains protected by automatic 429, hard-limit, higher-priority-window, and candidate-loss failover. The plugin intentionally registers no dynamic or privileged `/v0/resource/plugins/...` route.
-
-## Security boundary
-
-- Handles only pure `codex` candidate pools; mixed or third-party sets fall back to CPA.
-- Does not modify OAuth, PATs, cookies, auth files, official/default models, or third-party APIs.
-- Reads Keeper and CPA Management secrets only from mounted files.
-- Persists scheduling metadata, auth identifiers, hashed session identifiers, reset anchors, redacted failure codes, bans, and warmup outcomes �?never credential values.
-- Treats `cyber_policy` and `cyber_abuse` as terminal blocked results; no retry loop is started.
-- Writes state atomically with owner-only permissions and fences hot-reload generations.
-
-Read [SECURITY.md](SECURITY.md) before exposing Management routes.
-
-## Documentation
-
-- [运行逻辑与状态机](RUNTIME_LOGIC.zh-CN.md)
-- [生产交接与运维手册](HANDOFF.zh-CN.md)
-- [Serial scheduler design](DESIGN_SERIAL_SCHEDULER.md)
-- [Example configuration](SERIAL_CONFIG.example.yaml)
-- [Security policy](SECURITY.md)
-
-## Compatibility modes and limits
-
-`legacy`, `shadow`, and `enforce` remain for migration. New deployments should use `serial`; it is the only mode that guarantees independent sessions do not intentionally spread normal traffic across the pool.
-
-If every account is hard-exhausted or quarantined, the current CPA scheduler ABI cannot return a hard-denied filtered set. The plugin returns `Handled=false`, and final behavior depends on the CPA host version. A backup that has crossed only the soft threshold is still preferred over a hard-exhausted primary.
-
-## License and provenance
-
-MIT licensed. The project evolved from [ysxk/codex-429-autoban](https://github.com/ysxk/codex-429-autoban) and preserves its copyright and license notices. This repository is an independent integration project and is not an official OpenAI product.
+Build a .so on the deployment's Linux platform; Windows DLLs cannot load there.
+See HANDOFF.zh-CN.md for migration acceptance.

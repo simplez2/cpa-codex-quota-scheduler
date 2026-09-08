@@ -8,7 +8,7 @@ import (
 )
 
 // banResetConfirmation persists the two-snapshot proof used to distinguish a
-// genuinely newer quota cycle from a stale Keeper row. It contains only quota
+// genuinely newer quota cycle from a stale quota probe row. It contains only quota
 // timestamps and the CPA auth id; no credential material is stored.
 type banResetConfirmation struct {
 	AuthID          string    `json:"auth_id"`
@@ -156,7 +156,7 @@ func quotaSnapshotProvesNewQuotaCycle(snapshot quotaSnapshot, entry banEntry, no
 		}
 		observedAt := window.ObservedAt
 		// The window's own observation time is the freshness proof. Falling
-		// back to the outer snapshot timestamp would let Keeper re-emit one
+		// back to the outer snapshot timestamp would let quota probe re-emit one
 		// merged/stale window under a newer envelope and count it as an
 		// independent reset observation.
 		if observedAt.IsZero() || !observedAt.After(entry.BannedAt) || now.Before(observedAt) || now.Sub(observedAt) > staleAfter {
@@ -187,9 +187,9 @@ func quotaSnapshotProvesNewQuotaCycle(snapshot quotaSnapshot, entry banEntry, no
 // while the same imported identity later resolves to a weekly-only Team space.
 //
 // Absence alone is never sufficient evidence: every currently recognized row
-// must be a fresh Keeper observation, must identify its duration consistently,
+// must be a fresh quota probe observation, must identify its duration consistently,
 // and must be a strictly shorter class than the old effective ban. The caller's
-// existing two-snapshot confirmation then protects against one partial Keeper
+// existing two-snapshot confirmation then protects against one partial quota probe
 // response before the obsolete cooldown is cleared.
 func quotaSnapshotProvesWindowSetReplacement(snapshot quotaSnapshot, banClass string, bannedAt, now time.Time, staleAfter time.Duration) (string, time.Time, bool) {
 	banRank := windowClassRank(banClass)
@@ -208,7 +208,7 @@ func quotaSnapshotProvesWindowSetReplacement(snapshot quotaSnapshot, banClass st
 		if class == "" || class == banClass || windowClassRank(class) >= banRank {
 			return "", time.Time{}, false
 		}
-		if window.Source != quotaSourceKeeper || window.WindowSeconds <= 0 || windowClassFromSeconds(window.WindowSeconds) != class {
+		if window.Source != quotaSourceProbe || window.WindowSeconds <= 0 || windowClassFromSeconds(window.WindowSeconds) != class {
 			return "", time.Time{}, false
 		}
 		observedAt := window.ObservedAt
@@ -270,57 +270,6 @@ func windowClassRank(class string) int {
 	default:
 		return 0
 	}
-}
-
-// pendingBanResetKeeperRefreshTargets returns only first-confirmation bans.
-// One precise Keeper refresh is enough to obtain an independent window
-// observation; confirmations at two or more are never kept refreshing while a
-// separate warmup-429 guard or another safety condition delays the clear.
-func (s *schedulerRuntimeState) pendingBanResetKeeperRefreshTargets(quotas map[string]quotaSnapshot) []keeperRefreshTarget {
-	s.banResetMu.Lock()
-	pending := make(map[string]banResetConfirmation)
-	for authID, confirmation := range s.banResetConfirmations {
-		if confirmation.Confirmations == 1 && !confirmation.LastSnapshotAt.IsZero() {
-			pending[authID] = confirmation
-		}
-	}
-	s.banResetMu.Unlock()
-	if len(pending) == 0 {
-		return nil
-	}
-
-	canonical := make(map[string]quotaSnapshot)
-	for _, snapshot := range quotas {
-		authID := strings.TrimSpace(snapshot.AuthID)
-		if authID == "" {
-			continue
-		}
-		if previous, ok := canonical[authID]; !ok || snapshot.RefreshedAt.After(previous.RefreshedAt) {
-			canonical[authID] = snapshot
-		}
-	}
-	targets := make([]keeperRefreshTarget, 0, len(pending))
-	for authID, confirmation := range pending {
-		entry, banned := banStore.lookup(authID)
-		if !banned || !entry.BannedAt.Equal(confirmation.BannedAt) || !entry.ResetAt.Equal(confirmation.BanResetAt) {
-			continue
-		}
-		snapshot, ok := canonical[authID]
-		if !ok {
-			continue
-		}
-		authIndex := strings.TrimSpace(snapshot.AuthIndex)
-		if authIndex == "" {
-			continue
-		}
-		targets = append(targets, keeperRefreshTarget{
-			AuthIndex:  authIndex,
-			Reason:     "ban_reset_confirmation",
-			ObservedAt: confirmation.LastSnapshotAt,
-		})
-	}
-	sort.Slice(targets, func(i, j int) bool { return targets[i].AuthIndex < targets[j].AuthIndex })
-	return targets
 }
 
 func banWindowClass(window string) string {

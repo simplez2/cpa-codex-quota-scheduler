@@ -30,24 +30,29 @@ const (
 // mode keeps one global active auth at a time, while quota safety, weekly
 // balance, and persisted selection history decide the next committed auth.
 type serialCandidate struct {
-	Candidate         pluginapi.SchedulerAuthCandidate
-	Snapshot          quotaSnapshot
-	QuotaKnown        bool
-	Eligible          bool
-	Reason            string
-	WindowClass       string
-	CycleActive       bool
-	DrainActive       bool
-	MaxUsed           float64
-	FiveHourUsed      float64
-	FiveHourRemaining float64
-	FiveHourResetAt   time.Time
-	FiveHourKnown     bool
-	WeeklyRemaining   float64
-	WeeklyKnown       bool
-	WeeklyProtected   bool
-	LastSelectedAt    time.Time
-	ResetCredits      int
+	Candidate          pluginapi.SchedulerAuthCandidate
+	Snapshot           quotaSnapshot
+	QuotaKnown         bool
+	Eligible           bool
+	Reason             string
+	WindowClass        string
+	CycleActive        bool
+	DrainActive        bool
+	MaxUsed            float64
+	FiveHourUsed       float64
+	FiveHourRemaining  float64
+	FiveHourResetAt    time.Time
+	FiveHourKnown      bool
+	WeeklyRemaining    float64
+	WeeklyKnown        bool
+	WeeklyProtected    bool
+	WeeklyBudgetPerDay float64
+	WeeklyBudgetKnown  bool
+	Plan               string
+	PlanWeight         float64
+	CapacityHeadroom   float64
+	LastSelectedAt     time.Time
+	ResetCredits       int
 }
 
 // serialWindowDrains reports whether the window is close enough to its reset
@@ -134,6 +139,32 @@ func inspectSerialCandidate(candidate pluginapi.SchedulerAuthCandidate, snapshot
 		Reason:      "quota_unknown",
 		WindowClass: "unknown",
 	}
+	// A stale sibling must never erase fresh evidence of a hard limit.
+	if found {
+		for _, w := range snapshot.Windows {
+			observed := w.ObservedAt
+			if observed.IsZero() {
+				observed = snapshot.RefreshedAt
+			}
+			age := now.Sub(observed)
+			if observed.IsZero() || age < 0 || age > cfg.StaleAfter || (!w.ResetAt.IsZero() && !now.Before(w.ResetAt)) {
+				continue
+			}
+			if !w.Allowed || w.LimitReached || w.UsedPercent >= usedPercentThreshold {
+				choice.Eligible = false
+				choice.QuotaKnown = true
+				if choice.Reason != "not_allowed" {
+					choice.Reason = "limit_reached"
+				}
+				if !w.Allowed {
+					choice.Reason = "not_allowed"
+				}
+			}
+		}
+		if !choice.Eligible {
+			return choice
+		}
+	}
 	if !found || !quotaSnapshotFresh(snapshot, now, cfg.StaleAfter) {
 		return choice
 	}
@@ -182,7 +213,7 @@ func inspectSerialCandidate(candidate pluginapi.SchedulerAuthCandidate, snapshot
 		if draining {
 			choice.DrainActive = true
 		}
-		// Inspect every active quota window before deciding. Keeper does not
+		// Inspect every active quota window before deciding. quota probe does not
 		// guarantee row order, and a soft weekly threshold must never mask a
 		// later hard 5h limit (or vice versa).
 		if !window.Allowed {
@@ -202,7 +233,9 @@ func inspectSerialCandidate(candidate pluginapi.SchedulerAuthCandidate, snapshot
 			class != "" && reserve > 0 &&
 			100-window.UsedPercent <= reserve
 		thresholdReached := handoffMode != "429_only" && window.UsedPercent >= threshold
-		if reason == "eligible" && !draining && (thresholdReached || reserveReached) {
+		// Drain may relax a utilization threshold near reset, but it cannot
+		// spend the safety reserve that protects requests between observations.
+		if reason == "eligible" && (reserveReached || (!draining && thresholdReached)) {
 			reason = "serial_threshold"
 		}
 	}
@@ -212,27 +245,28 @@ func inspectSerialCandidate(candidate pluginapi.SchedulerAuthCandidate, snapshot
 }
 
 type serialSortContext struct {
-	coldStart          bool
+	maxWeeklyBudget    map[string]float64
 	weeklyBand         float64
 	maxWeeklyRemaining [2]float64
 	weeklyKnown        [2]bool
 }
 
 func newSerialSortContext(choices []serialCandidate, cfg pluginConfig) serialSortContext {
-	ctx := serialSortContext{coldStart: true, weeklyBand: cfg.SwitchHysteresisPercent}
+	ctx := serialSortContext{weeklyBand: cfg.SwitchHysteresisPercent, maxWeeklyBudget: make(map[string]float64)}
 	if ctx.weeklyBand < 0 {
 		ctx.weeklyBand = 0
 	}
 	for _, choice := range choices {
-		if !choice.LastSelectedAt.IsZero() {
-			ctx.coldStart = false
-		}
 		if !choice.WeeklyKnown {
 			continue
 		}
 		group := 0
 		if choice.WeeklyProtected {
 			group = 1
+		}
+		budgetGroup := serialBudgetGroup(choice)
+		if choice.WeeklyBudgetKnown && choice.WeeklyBudgetPerDay > ctx.maxWeeklyBudget[budgetGroup] {
+			ctx.maxWeeklyBudget[budgetGroup] = choice.WeeklyBudgetPerDay
 		}
 		if !ctx.weeklyKnown[group] || choice.WeeklyRemaining > ctx.maxWeeklyRemaining[group] {
 			ctx.weeklyKnown[group] = true
@@ -267,31 +301,25 @@ func serialCandidateLess(a, b serialCandidate, cfg pluginConfig, ctx serialSortC
 	if a.WeeklyProtected != b.WeeklyProtected {
 		return !a.WeeklyProtected
 	}
-	if a.DrainActive != b.DrainActive {
-		return a.DrainActive
-	}
 	if rankA, rankB := windowRankInOrder(a.WindowClass, cfg.WindowOrder), windowRankInOrder(b.WindowClass, cfg.WindowOrder); rankA != rankB {
 		return rankA < rankB
-	}
-	if cfg.PreferResetCredits && (a.ResetCredits > 0) != (b.ResetCredits > 0) {
-		return a.ResetCredits > 0
-	}
-	// Preserve the historical cold-start choice as a pool-wide mode. Fairness
-	// rules apply after
-	// the first committed selection so existing CPA priorities remain stable.
-	if ctx.coldStart {
-		if a.Candidate.Priority != b.Candidate.Priority {
-			return a.Candidate.Priority > b.Candidate.Priority
-		}
-		if a.MaxUsed != b.MaxUsed {
-			return a.MaxUsed > b.MaxUsed
-		}
 	}
 	// Compute a pool-relative tier before sorting instead of comparing each
 	// pair against hysteresis. Pairwise bands are non-transitive and can make
 	// the result depend on CPA candidate input order.
 	if a.WeeklyKnown != b.WeeklyKnown {
 		return a.WeeklyKnown
+	}
+	if serialBudgetEnabled(cfg) {
+		if a.WeeklyBudgetKnown != b.WeeklyBudgetKnown {
+			return a.WeeklyBudgetKnown
+		}
+		if tierA, tierB := serialBudgetTier(a, ctx), serialBudgetTier(b, ctx); tierA != tierB {
+			return tierA < tierB
+		}
+		if a.CapacityHeadroom != b.CapacityHeadroom {
+			return a.CapacityHeadroom > b.CapacityHeadroom
+		}
 	}
 	if tierA, tierB := serialWeeklyBalanceTier(a, ctx), serialWeeklyBalanceTier(b, ctx); tierA != tierB {
 		return tierA < tierB
@@ -304,6 +332,14 @@ func serialCandidateLess(a, b serialCandidate, cfg pluginConfig, ctx serialSortC
 	}
 	if a.FiveHourKnown && a.FiveHourUsed != b.FiveHourUsed {
 		return a.FiveHourUsed < b.FiveHourUsed
+	}
+	// Expiry and reset-credit preferences cannot override a material weekly
+	// imbalance, including on the first selection after an empty state file.
+	if a.DrainActive != b.DrainActive {
+		return a.DrainActive
+	}
+	if cfg.PreferResetCredits && (a.ResetCredits > 0) != (b.ResetCredits > 0) {
+		return a.ResetCredits > 0
 	}
 	if a.WeeklyKnown && b.WeeklyKnown && a.WeeklyRemaining != b.WeeklyRemaining {
 		return a.WeeklyRemaining > b.WeeklyRemaining
@@ -339,16 +375,42 @@ func serialPinnedAuthID(req pluginapi.SchedulerPickRequest) string {
 	return extractMetadataString(req.Options.Metadata, "pinned_auth_id")
 }
 
-func (s *schedulerRuntimeState) annotateSerialCandidateLocked(choice *serialCandidate) {
+func (s *schedulerRuntimeState) annotateSerialCandidateLocked(choice *serialCandidate, now time.Time) {
 	if choice == nil {
 		return
 	}
 	if s.serialLastSelected != nil {
 		choice.LastSelectedAt = s.serialLastSelected[choice.Candidate.ID]
 	}
+	choice.Plan, choice.PlanWeight = quotaPlanForAuth(s.cfg, choice.Candidate.ID)
+	fiveHourMode, _ := serialWindowHandoffPolicy(s.cfg, "5h")
+	fiveHourReserve := s.cfg.Reserve5hPercent
+	if fiveHourMode == "429_only" {
+		fiveHourReserve = 0
+	}
+	choice.CapacityHeadroom = math.Max(0, choice.FiveHourRemaining-fiveHourReserve) * choice.PlanWeight
+	choice.WeeklyBudgetPerDay, choice.WeeklyBudgetKnown = serialWeeklyBudget(*choice, s.cfg, now)
+	if serialBudgetEnabled(s.cfg) && choice.Eligible && choice.QuotaKnown {
+		for _, assessment := range s.quotaRunway.Assess(choice.Snapshot, s.cfg, now) {
+			if !assessment.Fresh {
+				continue
+			}
+			mode, _ := serialWindowHandoffPolicy(s.cfg, assessment.Window)
+			if assessment.Window == "5h" && fiveHourMode != "429_only" {
+				choice.CapacityHeadroom = math.Min(choice.CapacityHeadroom, assessment.HeadroomPercent*choice.PlanWeight)
+			}
+			// Forecast guards use the same soft fallback as configured reserves.
+			// Explicit threshold/429-only choices retain their configured policy.
+			if mode == "reserve_aware" && assessment.RateKnown && assessment.HeadroomPercent <= 0 {
+				choice.Eligible = false
+				choice.Reason = "serial_threshold"
+			}
+		}
+	}
 }
 
 func (s *schedulerRuntimeState) markSerialSelectedLocked(authID string, resetAt, now time.Time) {
+	s.serialWeeklyRebalance = serialWeeklyRebalanceState{}
 	authID = strings.TrimSpace(authID)
 	if authID == "" {
 		return
@@ -370,7 +432,7 @@ func (s *schedulerRuntimeState) serialFiveHourCycleAdvancedLocked(choice serialC
 		return false
 	}
 	previousResetAt := s.serialFiveHourCycle[choice.Candidate.ID]
-	// Keeper can move an unstarted 5h placeholder reset forward on each
+	// quota probe can move an unstarted 5h placeholder reset forward on each
 	// refresh. That drift is not a new quota cycle. Only rotate after the
 	// previously committed reset boundary has actually elapsed and the new
 	// anchor advances materially beyond it.
@@ -446,8 +508,9 @@ func (s *schedulerRuntimeState) serialRequestLocalPickLocked(
 			continue
 		}
 		snapshot, found := s.quotas[candidate.ID]
+		snapshot = s.serialConservativeQuotaLocked(snapshot, now)
 		choice := inspectSerialCandidate(candidate, snapshot, found, cfg, now)
-		s.annotateSerialCandidateLocked(&choice)
+		s.annotateSerialCandidateLocked(&choice, now)
 		if choice.Eligible {
 			choices = append(choices, choice)
 		} else if choice.Reason == "serial_threshold" {
@@ -464,10 +527,9 @@ func (s *schedulerRuntimeState) serialRequestLocalPickLocked(
 	return pluginapi.SchedulerPickResponse{AuthID: choices[0].Candidate.ID, Handled: true}
 }
 
-// serialOverdraftPickLocked serves one request from the session's pinned
-// overdraft auth. The candidate must still be present in CPA's list; the
-// quota check is skipped on purpose because the binding preserves the already
-// running conversation for a short, bounded compatibility window.
+// serialOverdraftPickLocked implements optional legacy soft continuation.
+// The pinned auth must still be present in CPA's list and must not have a
+// fresh hard limit. Only its soft handoff preference may be bypassed.
 func (s *schedulerRuntimeState) serialOverdraftPickLocked(
 	candidates []pluginapi.SchedulerAuthCandidate,
 	session, overdraftAuthID string,
@@ -493,6 +555,7 @@ func (s *schedulerRuntimeState) serialOverdraftPickLocked(
 		// into the upstream "usage limit reached" interruption.
 		snapshot, found := s.quotas[candidate.ID]
 		if found {
+			snapshot = s.serialConservativeQuotaLocked(snapshot, now)
 			choice := inspectSerialCandidate(candidate, snapshot, true, cfg, now)
 			if choice.QuotaKnown && (choice.Reason == "limit_reached" || choice.Reason == "not_allowed") {
 				delete(s.serialOverdraft, session)
@@ -539,7 +602,7 @@ func (s *schedulerRuntimeState) serialPick(req pluginapi.SchedulerPickRequest, n
 		s.mu.Unlock()
 		return response
 	}
-	if overdraftAuthID := s.serialOverdraftAuthLocked(session, now); overdraftAuthID != "" && overdraftAuthID != previous {
+	if overdraftAuthID := s.serialOverdraftAuthLocked(session, now); cfg.SerialSoftContinuation && overdraftAuthID != "" && overdraftAuthID != previous {
 		if response, ok := s.serialOverdraftPickLocked(req.Candidates, session, overdraftAuthID, blocked, cfg, now); ok {
 			s.mu.Unlock()
 			return response
@@ -573,20 +636,21 @@ func (s *schedulerRuntimeState) serialPick(req pluginapi.SchedulerPickRequest, n
 			continue
 		}
 		snapshot, found := s.quotas[candidate.ID]
+		snapshot = s.serialConservativeQuotaLocked(snapshot, now)
 		choice := inspectSerialCandidate(candidate, snapshot, found, cfg, now)
-		s.annotateSerialCandidateLocked(&choice)
+		s.annotateSerialCandidateLocked(&choice, now)
 		if candidate.ID == previous {
 			currentSeen = true
 			if choice.Eligible {
 				currentEligible = true
 				currentChoice = choice
-				if session != "" && (sessionPinned == "" || sessionPinned == candidate.ID) {
+				if session != "" && (!cfg.SerialSoftContinuation || sessionPinned == "" || sessionPinned == candidate.ID) {
 					s.setSerialOverdraftLocked(session, candidate.ID, now)
 					sessionPinned = candidate.ID
 				}
 				continue
 			}
-			if session != "" && sessionPinned == candidate.ID &&
+			if cfg.SerialSoftContinuation && session != "" && sessionPinned == candidate.ID &&
 				choice.Reason == "serial_threshold" && overdraftOverride == "" {
 				// In-flight overdraft: this exact conversation was already
 				// being served by the now-exhausted auth, so remember to keep
@@ -620,11 +684,11 @@ func (s *schedulerRuntimeState) serialPick(req pluginapi.SchedulerPickRequest, n
 		s.resetSerialMissingLocked()
 	}
 	if currentEligible {
-		// A drain-window account is intentionally allowed to consume its
-		// expiring quota; never preempt it with a fresh backup.
-		if currentChoice.DrainActive {
-			s.mu.Unlock()
-			return pluginapi.SchedulerPickResponse{AuthID: previous, Handled: true}
+		// Old state files may lack a selection timestamp. Establish and persist
+		// a hold baseline instead of treating an unknown age as an expired hold.
+		selectionBaselineMissing := s.serialSelectedAt.IsZero()
+		if selectionBaselineMissing {
+			s.serialSelectedAt = now
 		}
 		cycleBaselineMissing := currentChoice.FiveHourKnown && !currentChoice.FiveHourResetAt.IsZero() &&
 			(s.serialFiveHourCycle == nil || s.serialFiveHourCycle[previous].IsZero())
@@ -639,19 +703,35 @@ func (s *schedulerRuntimeState) serialPick(req pluginapi.SchedulerPickRequest, n
 		currentRank := windowRankInOrder(currentChoice.WindowClass, cfg.WindowOrder)
 		cycleRotationEligible := cycleAdvanced && len(choices) > 0 &&
 			windowRankInOrder(choices[0].WindowClass, cfg.WindowOrder) <= currentRank &&
-			(!choices[0].WeeklyProtected || currentChoice.WeeklyProtected)
-		if currentChoice.QuotaKnown && len(choices) > 0 && choices[0].QuotaKnown &&
+			(!choices[0].WeeklyProtected || currentChoice.WeeklyProtected) &&
+			serialCyclePreservesWeekly(currentChoice, choices[0], cfg)
+		preempt := currentChoice.QuotaKnown && len(choices) > 0 && choices[0].QuotaKnown &&
+			(!choices[0].WeeklyProtected || currentChoice.WeeklyProtected) &&
 			((windowRankInOrder(choices[0].WindowClass, cfg.WindowOrder) < currentRank) ||
-				(currentChoice.WeeklyProtected && !choices[0].WeeklyProtected) || cycleRotationEligible) {
-			selected := choices[0].Candidate.ID
+				(currentChoice.WeeklyProtected && !choices[0].WeeklyProtected) || cycleRotationEligible)
+		if cycleObservedAdvanced {
+			s.serialWeeklyRebalance = serialWeeklyRebalanceState{}
+		}
+		selectedChoice, weeklyRebalance := s.serialWeeklyRebalancePickLocked(currentChoice, choices, cfg, now)
+		if preempt || weeklyRebalance {
+			if preempt {
+				selectedChoice = choices[0]
+			}
+			selected := selectedChoice.Candidate.ID
 			s.serialActiveAuthID = selected
 			s.serialSelectionSource = "auto"
 			s.serialSelectedAt = now
-			s.markSerialSelectedLocked(selected, choices[0].FiveHourResetAt, now)
+			s.markSerialSelectedLocked(selected, selectedChoice.FiveHourResetAt, now)
+			s.rebindSerialSessionsLocked(previous, selected)
 			s.serialSwitches++
 			s.serialLastSwitchAt = now
 			reason := "higher_priority_window_available"
-			if cycleRotationEligible {
+			if !preempt {
+				reason = "weekly_rebalance"
+				if serialBudgetEnabled(cfg) {
+					reason = "weekly_budget_rebalance"
+				}
+			} else if cycleRotationEligible {
 				reason = "five_hour_cycle_rotation"
 			} else if currentChoice.WeeklyProtected && !choices[0].WeeklyProtected {
 				reason = "weekly_reserve"
@@ -666,6 +746,8 @@ func (s *schedulerRuntimeState) serialPick(req pluginapi.SchedulerPickRequest, n
 				s.serialFiveHourCycle = make(map[string]time.Time)
 			}
 			s.serialFiveHourCycle[previous] = currentChoice.FiveHourResetAt
+		}
+		if cycleBaselineMissing || cycleObservedAdvanced || selectionBaselineMissing {
 			s.mu.Unlock()
 			s.persistBanState()
 			return pluginapi.SchedulerPickResponse{AuthID: previous, Handled: true}
@@ -673,6 +755,7 @@ func (s *schedulerRuntimeState) serialPick(req pluginapi.SchedulerPickRequest, n
 		s.mu.Unlock()
 		return pluginapi.SchedulerPickResponse{AuthID: previous, Handled: true}
 	}
+	s.serialWeeklyRebalance = serialWeeklyRebalanceState{}
 
 	thresholdFallback := false
 	if len(choices) == 0 && previous != "" && currentSeen &&
@@ -736,6 +819,9 @@ func (s *schedulerRuntimeState) serialPick(req pluginapi.SchedulerPickRequest, n
 		} else {
 			s.markSerialSelectedLocked(selected, time.Time{}, now)
 		}
+		if !cfg.SerialSoftContinuation {
+			s.rebindSerialSessionsLocked(previous, selected)
+		}
 		s.serialSwitches++
 		s.serialLastSwitchAt = now
 		s.serialLastSwitchReason = "candidate_unavailable_confirmed"
@@ -780,6 +866,11 @@ func (s *schedulerRuntimeState) serialPick(req pluginapi.SchedulerPickRequest, n
 	s.serialSelectionSource = "auto"
 	s.serialSelectedAt = now
 	s.markSerialSelectedLocked(selected, choices[0].FiveHourResetAt, now)
+	if !cfg.SerialSoftContinuation {
+		// Only subsequent requests move. An already-running stream remains
+		// owned by its original request and is never replayed by this decision.
+		s.rebindSerialSessionsLocked(previous, selected)
+	}
 	if session != "" && overdraftOverride == "" {
 		s.setSerialOverdraftLocked(session, selected, now)
 	}
@@ -811,6 +902,7 @@ func (s *schedulerRuntimeState) markSerialUnavailable(authID, reason string, now
 		return false
 	}
 	s.serialActiveAuthID = ""
+	s.serialWeeklyRebalance = serialWeeklyRebalanceState{}
 	s.serialSelectionSource = "auto"
 	s.serialSelectedAt = time.Time{}
 	s.serialSwitches++

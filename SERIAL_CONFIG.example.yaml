@@ -1,71 +1,57 @@
-# Recommended configuration for Codex Quota Scheduler v0.1.21.
-# Secrets stay in mounted files. This plugin does not change model names,
-# provider routes, OAuth/PAT state, or third-party APIs.
+# Standalone CPA quota scheduler v0.2.0.
 plugins:
   enabled: true
   configs:
     codex-quota-scheduler:
       enabled: true
       priority: 2000
-
-      # One global active account. It switches at a hard/soft quota boundary,
-      # 429/quarantine, confirmed candidate loss, weekly-reserve protection,
-      # higher-priority window availability, or a confirmed new 5h cycle.
       scheduler_mode: serial
+      serial_allocation_policy: sustainable
+      # Relative improvement in weekly budget per day; two fresh observations and hold still apply.
+      serial_budget_rebalance_percent: 20
+      serial_soft_continuation: false
+      # Capacity priors only; do not multiply these into weekly health scores.
+      quota_default_plan: team_standard
+      # Optional CPA auth-file IDs (not tokens or email addresses):
+      # quota_account_plans:
+      #   account-pro-5: pro_5x
+      #   account-pro-20: pro_20x
+      #   account-premium: team_premium
       serial_switch_percent: 98
-      # threshold_only follows serial_switch_percent exactly. Set this to
-      # reserve_aware when you want handoff to preserve the reserve for the
-      # active 5h, weekly, or monthly window.
       serial_handoff_mode: threshold_only
-      # 5h-only override. inherit_global preserves serial_switch_percent;
-      # custom_threshold uses serial_5h_switch_percent; reserve_aware keeps
-      # reserve_5h_percent; 429_only waits for hard limit/disallowed/429.
-      serial_5h_handoff_mode: inherit_global
+      # Use observed 5h capacity without reserving for cache age or predicted consumption.
+      # Hard quota/disallowed state or an upstream 429 still triggers server-side handoff.
+      serial_5h_handoff_mode: 429_only
       serial_5h_switch_percent: 98
       serial_prefer_active_cycle: true
-
-      # End-of-cycle drain is capped at the smaller of this value and the last
-      # 10% of the quota window. With 6h configured, 5h drains only in its
-      # final 30m; hard limits, disallowed windows, quarantine, and 429 still
-      # force failover.
+      # Raw-weekly fallback policy advantage in percentage points.
+      # Requires two distinct fresh readings of both accounts; safety handoffs do not wait.
+      serial_weekly_rebalance_percent: 10
+      serial_weekly_rebalance_min_hold: 5m
+      switch_hysteresis_percent: 2
       drain_window_hours: 6
-
-      keeper_url: http://cpa-usage-keeper:8080/keeper
-      keeper_password_file: /run/secrets/keeper_login_password
+      cpa_management_url: http://127.0.0.1:8317/v0/management/api-call
+      cpa_management_key_file: /run/secrets/management_key
+      quota_url: https://chatgpt.com/backend-api/wham/usage
       refresh_interval: 30s
+      quota_refresh_cooldown: 2m
+      quota_refresh_batch: 8
       stale_after: 15m
-
-      # Used by reserve_aware handoff for the 5h window. Weekly and monthly
-      # use reserve_weekly_percent and reserve_monthly_percent respectively.
-      reserve_5h_percent: 15
-
       state_path: /var/lib/codex-quota-scheduler/state.json
-
+      reserve_5h_percent: 0
+      reserve_weekly_percent: 8
+      reserve_monthly_percent: 12
       fallback_ban: 15m
       max_ban: 24h
       half_open_probe_timeout: 15m
       half_open_retry_after: 2m
-
-      # Window order is strict. After cold start, weekly remaining-capacity
-      # tiers are balanced first; inside the best tier, lower 5h usage and the
-      # longest-idle account win deterministic tie-breaks.
       prefer_reset_credits: true
-      window_order:
-        - 5h
-        - weekly
-        - monthly
-
-      # Warmup is separate from normal serial routing. Every fully available,
-      # not-yet-started account is activated strictly one at a time; normal
-      # traffic keeps using the committed serial account.
-      warmup_enabled: true
-      # Production-safe default for hot reload. Native HostModel warmup is an
-      # explicit canary-only opt-in until CPA exposes a bounded callback timeout.
-      warmup_execution_mode: management
-      # Used only by the pinned activation request. It does not change CPA's
-      # default channel or the model selected for normal traffic.
+      window_order: [5h, weekly, monthly]
+      # Optional generation via CPA HostModel, separate from read-only quota queries.
+      warmup_enabled: false
+      warmup_execution_mode: native
       warmup_model: gpt-5.6-luna
-      warmup_sidecar_url: http://codex-agent-identity-gateway:8787/backend-api/codex
       warmup_retry_after: 15m
-      cpa_management_url: http://127.0.0.1:8317/v0/management/api-call
-      cpa_management_key_file: /run/secrets/management_key
+      # Pool-wide limits; failures count and reloads do not reset the budget.
+      warmup_min_interval: 15m
+      warmup_max_per_day: 8

@@ -27,7 +27,7 @@ func TestSerialSchedulerFollowsConfiguredWindowOrder(t *testing.T) {
 	schedulerRuntime.mu.Lock()
 	schedulerRuntime.quotas = map[string]quotaSnapshot{
 		"weekly":         {AuthID: "weekly", RefreshedAt: now, Windows: []quotaWindow{{Class: "weekly", UsedPercent: 1, Allowed: true}}},
-		"five-hour":      {AuthID: "five-hour", RefreshedAt: now, Windows: []quotaWindow{{Class: "5h", UsedPercent: 90, Allowed: true}}},
+		"five-hour":      {AuthID: "five-hour", RefreshedAt: now, Windows: []quotaWindow{{Class: "5h", UsedPercent: 80, Allowed: true}}},
 		"monthly-credit": {AuthID: "monthly-credit", ResetCredits: 1, RefreshedAt: now, Windows: []quotaWindow{{Class: "monthly", UsedPercent: 1, Allowed: true}}},
 	}
 	schedulerRuntime.mu.Unlock()
@@ -101,7 +101,7 @@ func TestObserveUsageMergesOnlyPresentHeaderFields(t *testing.T) {
 					UsedPercent:   7,
 					Allowed:       true,
 					ResetAt:       resetAt,
-					Source:        quotaSourceKeeper,
+					Source:        quotaSourceProbe,
 				}},
 			},
 		},
@@ -118,10 +118,10 @@ func TestObserveUsageMergesOnlyPresentHeaderFields(t *testing.T) {
 	})
 	got := state.quotas["acct"]
 	if got.Windows[0].UsedPercent != 7 || !got.Windows[0].ResetAt.Equal(resetAt) {
-		t.Fatalf("minutes-only header overwrote Keeper values: %#v", got.Windows[0])
+		t.Fatalf("minutes-only header overwrote quota probe values: %#v", got.Windows[0])
 	}
 	if !got.RefreshedAt.Equal(refreshedAt) || !got.HeaderObservedAt.IsZero() {
-		t.Fatalf("minutes-only header changed freshness: keeper=%v header=%v", got.RefreshedAt, got.HeaderObservedAt)
+		t.Fatalf("minutes-only header changed freshness: quota probe=%v header=%v", got.RefreshedAt, got.HeaderObservedAt)
 	}
 
 	state.observeUsage(pluginapi.UsageRecord{
@@ -134,10 +134,10 @@ func TestObserveUsageMergesOnlyPresentHeaderFields(t *testing.T) {
 	})
 	got = state.quotas["acct"]
 	if got.Windows[0].UsedPercent != 7 || !got.Windows[0].ResetAt.Equal(resetAt) {
-		t.Fatalf("durationless patch overwrote Keeper values: %#v", got.Windows[0])
+		t.Fatalf("durationless patch overwrote quota probe values: %#v", got.Windows[0])
 	}
 	if !got.RefreshedAt.Equal(refreshedAt) || !got.HeaderObservedAt.IsZero() {
-		t.Fatalf("durationless patch changed freshness: keeper=%v header=%v", got.RefreshedAt, got.HeaderObservedAt)
+		t.Fatalf("durationless patch changed freshness: quota probe=%v header=%v", got.RefreshedAt, got.HeaderObservedAt)
 	}
 
 	state.observeUsage(pluginapi.UsageRecord{
@@ -154,7 +154,7 @@ func TestObserveUsageMergesOnlyPresentHeaderFields(t *testing.T) {
 		t.Fatalf("validated patch did not preserve reset: %#v", got.Windows[0])
 	}
 	if !got.RefreshedAt.Equal(refreshedAt) || got.HeaderObservedAt.IsZero() {
-		t.Fatalf("validated header freshness was not separated: keeper=%v header=%v", got.RefreshedAt, got.HeaderObservedAt)
+		t.Fatalf("validated header freshness was not separated: quota probe=%v header=%v", got.RefreshedAt, got.HeaderObservedAt)
 	}
 	if got.Windows[0].Source != quotaSourceMixed {
 		t.Fatalf("merged source=%q; want mixed", got.Windows[0].Source)
@@ -174,7 +174,7 @@ func TestObserveUsageIgnoresZeroDurationPlaceholder(t *testing.T) {
 					WindowSeconds: 7 * 24 * 60 * 60,
 					UsedPercent:   92,
 					Allowed:       true,
-					Source:        quotaSourceKeeper,
+					Source:        quotaSourceProbe,
 				}},
 			},
 		},
@@ -192,8 +192,8 @@ func TestObserveUsageIgnoresZeroDurationPlaceholder(t *testing.T) {
 	})
 
 	got := state.quotas["acct"]
-	if len(got.Windows) != 1 || got.Windows[0].UsedPercent != 92 || got.Windows[0].Source != quotaSourceKeeper {
-		t.Fatalf("placeholder corrupted Keeper quota: %#v", got.Windows)
+	if len(got.Windows) != 1 || got.Windows[0].UsedPercent != 92 || got.Windows[0].Source != quotaSourceProbe {
+		t.Fatalf("placeholder corrupted native quota: %#v", got.Windows)
 	}
 }
 
@@ -206,7 +206,7 @@ func TestSerialSchedulerPrefersResetCreditWithinWindowClass(t *testing.T) {
 		quotas: map[string]quotaSnapshot{
 			"active": {
 				AuthID: "active", RefreshedAt: now,
-				Windows: []quotaWindow{{Class: "weekly", UsedPercent: 50, Allowed: true}},
+				Windows: []quotaWindow{{Class: "weekly", UsedPercent: 0, Allowed: true}},
 			},
 			"credit": {
 				AuthID: "credit", RefreshedAt: now, ResetCredits: 1,
@@ -298,14 +298,14 @@ func TestSchedulerConfigDefaultsToSerialAndValidatesThreshold(t *testing.T) {
 	if cfg.SchedulerMode != "serial" || cfg.SerialSwitchPercent != 98 || cfg.SerialHandoffMode != "threshold_only" || cfg.StickySeconds != 1500 {
 		t.Fatalf("unsafe mode/sticky defaults: mode=%q sticky=%d", cfg.SchedulerMode, cfg.StickySeconds)
 	}
-	if cfg.Serial5hHandoffMode != "inherit_global" || cfg.Serial5hSwitchPercent != 98 {
+	if cfg.Serial5hHandoffMode != "429_only" || cfg.Serial5hSwitchPercent != 98 || cfg.Reserve5hPercent != 0 {
 		t.Fatalf("unsafe 5h handoff defaults: mode=%q threshold=%v", cfg.Serial5hHandoffMode, cfg.Serial5hSwitchPercent)
 	}
 	if cfg.NormalCostQuantile != 0.75 || cfg.GuardCostQuantile != 0.90 || cfg.HighCostQuantile != 0.95 {
 		t.Fatalf("invalid quantiles were not reset: %#v", cfg)
 	}
-	if cfg.WarmupExecutionMode != "management" {
-		t.Fatalf("unsafe warmup transport default = %q; want management", cfg.WarmupExecutionMode)
+	if cfg.WarmupExecutionMode != "native" {
+		t.Fatalf("warmup transport default = %q; want native CPA", cfg.WarmupExecutionMode)
 	}
 	native, err := parsePluginConfig([]byte("warmup_execution_mode: native\n"))
 	if err != nil {
@@ -389,23 +389,23 @@ func TestWarmupModelAcceptsFutureIDsAndRejectsHeaderUnsafeValues(t *testing.T) {
 	}
 }
 
-func TestPluginRegistrationExposesKeeperRefreshCooldown(t *testing.T) {
+func TestPluginRegistrationExposesQuotaRefreshCooldown(t *testing.T) {
 	registration := pluginRegistration()
 	matched := 0
 	for _, field := range registration.Metadata.ConfigFields {
-		if field.Name != "keeper_refresh_cooldown" {
+		if field.Name != "quota_refresh_cooldown" {
 			continue
 		}
 		matched++
 		if field.Type != pluginapi.ConfigFieldTypeString {
-			t.Fatalf("keeper_refresh_cooldown type = %q; want string", field.Type)
+			t.Fatalf("quota_refresh_cooldown type = %q; want string", field.Type)
 		}
-		if !strings.Contains(field.Description, "targeted Keeper quota refresh") || !strings.Contains(field.Description, "2m") {
-			t.Fatalf("keeper_refresh_cooldown description = %q", field.Description)
+		if !strings.Contains(field.Description, "Per-account") || !strings.Contains(field.Description, "2m") {
+			t.Fatalf("quota_refresh_cooldown description = %q", field.Description)
 		}
 	}
 	if matched != 1 {
-		t.Fatalf("keeper_refresh_cooldown registration count = %d; want 1", matched)
+		t.Fatalf("quota_refresh_cooldown registration count = %d; want 1", matched)
 	}
 }
 
@@ -476,10 +476,10 @@ func TestSerialConfigExampleParsesWithSafeRolloutValues(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.SchedulerMode != "serial" || cfg.SerialSwitchPercent != 98 || cfg.SerialHandoffMode != "threshold_only" || !cfg.SerialPreferActiveCycle || !cfg.WarmupEnabled {
+	if cfg.SchedulerMode != "serial" || cfg.SerialSwitchPercent != 98 || cfg.SerialHandoffMode != "threshold_only" || !cfg.SerialPreferActiveCycle || cfg.WarmupEnabled {
 		t.Fatalf("unsafe serial example: mode=%q threshold=%v active_cycle=%v warmup=%v", cfg.SchedulerMode, cfg.SerialSwitchPercent, cfg.SerialPreferActiveCycle, cfg.WarmupEnabled)
 	}
-	if cfg.WarmupExecutionMode != "management" || cfg.WarmupModel != "gpt-5.6-luna" || strings.Join(cfg.WindowOrder, ",") != "5h,weekly,monthly" {
+	if cfg.WarmupExecutionMode != "native" || cfg.WarmupModel != "gpt-5.6-luna" || strings.Join(cfg.WindowOrder, ",") != "5h,weekly,monthly" {
 		t.Fatalf("unexpected warmup/window config: mode=%q model=%q order=%v", cfg.WarmupExecutionMode, cfg.WarmupModel, cfg.WindowOrder)
 	}
 }

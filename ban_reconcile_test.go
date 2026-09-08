@@ -92,7 +92,7 @@ func TestReconcileExternalResetClearsObsoleteMonthlyBanAfterWeeklyOnlyPlanChange
 				Class: "weekly", WindowSeconds: int64((7 * 24 * time.Hour).Seconds()),
 				ResetAfterSeconds: int64((7 * 24 * time.Hour).Seconds()), ResetAfterSecondsKnown: true,
 				UsedPercent: 0, Allowed: true, ResetAt: observedAt.Add(7 * 24 * time.Hour),
-				ObservedAt: observedAt, Source: quotaSourceKeeper, WindowUsageCreditsKnown: true,
+				ObservedAt: observedAt, Source: quotaSourceProbe, WindowUsageCreditsKnown: true,
 			}},
 		}
 	}
@@ -109,7 +109,7 @@ func TestReconcileExternalResetClearsObsoleteMonthlyBanAfterWeeklyOnlyPlanChange
 		t.Fatalf("second plan-shape observation cleared = %#v; want acct", cleared)
 	}
 	if _, banned := banStore.lookup("acct"); banned {
-		t.Fatal("obsolete monthly cooldown survived two weekly-only Keeper snapshots")
+		t.Fatal("obsolete monthly cooldown survived two weekly-only quota probe snapshots")
 	}
 }
 
@@ -139,7 +139,7 @@ func TestPlatformResetRepairsMisclassifiedCooldownAndAdmitsSameCycleWarmup(t *te
 			Windows: []quotaWindow{{
 				Class: "weekly", WindowSeconds: seconds, ResetAfterSeconds: seconds, ResetAfterSecondsKnown: true,
 				Allowed: true, ResetAt: observedAt.Add(7 * 24 * time.Hour), ObservedAt: observedAt,
-				Source: quotaSourceKeeper, WindowUsageCreditsKnown: true,
+				Source: quotaSourceProbe, WindowUsageCreditsKnown: true,
 			}},
 		}
 	}
@@ -179,11 +179,11 @@ func TestReconcileExternalResetWindowSetReplacementFailsClosed(t *testing.T) {
 		{name: "old class still present", mutate: func(snapshot *quotaSnapshot) {
 			snapshot.Windows = append(snapshot.Windows, quotaWindow{
 				Class: "monthly", WindowSeconds: int64((30 * 24 * time.Hour).Seconds()), UsedPercent: 0,
-				Allowed: true, ResetAt: now.Add(19 * 24 * time.Hour), ObservedAt: snapshot.RefreshedAt, Source: quotaSourceKeeper,
+				Allowed: true, ResetAt: now.Add(19 * 24 * time.Hour), ObservedAt: snapshot.RefreshedAt, Source: quotaSourceProbe,
 			})
 		}},
 		{name: "unknown row", mutate: func(snapshot *quotaSnapshot) {
-			snapshot.Windows = append(snapshot.Windows, quotaWindow{Class: "unknown", Allowed: true, ObservedAt: snapshot.RefreshedAt, Source: quotaSourceKeeper})
+			snapshot.Windows = append(snapshot.Windows, quotaWindow{Class: "unknown", Allowed: true, ObservedAt: snapshot.RefreshedAt, Source: quotaSourceProbe})
 		}},
 		{name: "header overlay", mutate: func(snapshot *quotaSnapshot) { snapshot.Windows[0].Source = quotaSourceMixed }},
 		{name: "duration mismatch", mutate: func(snapshot *quotaSnapshot) {
@@ -211,7 +211,7 @@ func TestReconcileExternalResetWindowSetReplacementFailsClosed(t *testing.T) {
 					AuthID: "acct", AuthIndex: "idx-acct", RefreshedAt: observedAt,
 					Windows: []quotaWindow{{
 						Class: "weekly", WindowSeconds: int64((7 * 24 * time.Hour).Seconds()), UsedPercent: 0,
-						Allowed: true, ResetAt: observedAt.Add(7 * 24 * time.Hour), ObservedAt: observedAt, Source: quotaSourceKeeper,
+						Allowed: true, ResetAt: observedAt.Add(7 * 24 * time.Hour), ObservedAt: observedAt, Source: quotaSourceProbe,
 					}},
 				}
 				test.mutate(&snapshot)
@@ -298,7 +298,7 @@ func TestReconcileExternalResetDoesNotCombineExpiredFirstConfirmation(t *testing
 		map[string]quotaSnapshot{"acct": fullResetSnapshot("acct", now.Add(-2*time.Minute))}, now,
 	)
 
-	// No successful Keeper refresh runs during this gap. The old observation is
+	// No successful quota probe refresh runs during this gap. The old observation is
 	// no longer fresh and cannot be combined with one recovery snapshot.
 	later := now.Add(2 * time.Hour)
 	state.reconcileExternallyResetQuotaBans(

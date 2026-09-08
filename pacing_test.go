@@ -8,7 +8,7 @@ import (
 	"github.com/simplez2/cpa-codex-quota-scheduler/cpasdk/pluginapi"
 )
 
-func TestUsageCreditsMatchesKeeperCostFormula(t *testing.T) {
+func TestUsageCreditsMatchesQuotaProbeCostFormula(t *testing.T) {
 	pricing := map[string]modelPricing{
 		"gpt-test": {
 			Model:                "gpt-test",
@@ -52,7 +52,7 @@ func TestRequestCostPredictionUsesConfiguredQuantile(t *testing.T) {
 	}
 }
 
-func TestCapacityCalibrationUsesKeeperWindowCostAndDelta(t *testing.T) {
+func TestCapacityCalibrationUsesQuotaProbeWindowCostAndDelta(t *testing.T) {
 	now := time.Now().UTC()
 	reset := now.Add(5 * 24 * time.Hour)
 	state := schedulerRuntimeState{cfg: defaultPluginConfig(), pacingAccounts: make(map[string]*accountPacingState)}

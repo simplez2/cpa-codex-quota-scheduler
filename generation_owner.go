@@ -29,7 +29,7 @@ var errGenerationLockBusy = errors.New("scheduler generation record is busy")
 
 // schedulerGenerationRecord is an append-only cross-DSO ownership journal.
 // Reservations do not replace the active owner until the new instance has a
-// complete Keeper snapshot ready to publish.
+// complete quota probe snapshot ready to publish.
 type schedulerGenerationRecord struct {
 	Version          int       `json:"version"`
 	HighestReserved  uint64    `json:"highest_reserved"`
@@ -85,7 +85,7 @@ func (s *schedulerRuntimeState) initializeGenerationOwnership(statePath string) 
 
 // reserveGenerationOwnership allocates a monotonic ticket without replacing
 // the current owner. The ticket is promoted only after the first successful
-// Keeper refresh. state_path="" preserves legacy and unit-test behavior.
+// quota probe refresh. state_path="" preserves legacy and unit-test behavior.
 func (s *schedulerRuntimeState) reserveGenerationOwnership(statePath string) error {
 	statePath = strings.TrimSpace(statePath)
 	if statePath == "" {

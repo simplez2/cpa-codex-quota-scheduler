@@ -92,7 +92,7 @@ func TestParseWarmupJSONAcceptsOnlyCompletedStatus(t *testing.T) {
 		{name: "completed", body: `{"id":"resp_1","status":"completed","output":[]}`, wantEvent: "response.completed"},
 		{name: "failed", body: `{"id":"resp_1","status":"failed","error":{"code":"auth_unavailable","message":"must not be persisted"}}`, wantEvent: "response.failed", wantCode: "auth_unavailable", wantErr: true},
 		{name: "failed by error type", body: `{"id":"resp_1","status":"failed","error":{"type":"cyber_policy","message":"must not be persisted"}}`, wantEvent: "response.failed", wantCode: "cyber_policy", wantErr: true},
-		{name: "incomplete", body: `{"id":"resp_1","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}`, wantEvent: "response.incomplete", wantErr: true},
+		{name: "output budget reached", body: `{"id":"resp_1","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}`, wantEvent: "response.incomplete"},
 		{name: "missing terminal status", body: `{"id":"resp_1","output":[]}`, wantErr: true, wantIncomplete: true},
 	}
 	for _, test := range tests {

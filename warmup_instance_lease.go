@@ -36,11 +36,12 @@ const (
 )
 
 type warmupOutcomeJournalRecord struct {
-	Version    int         `json:"version"`
-	Key        string      `json:"key"`
-	Entry      warmupEntry `json:"entry"`
-	Ban        *banEntry   `json:"ban,omitempty"`
-	RecordedAt time.Time   `json:"recorded_at"`
+	Version    int                    `json:"version"`
+	Key        string                 `json:"key"`
+	Entry      warmupEntry            `json:"entry"`
+	Siblings   map[string]warmupEntry `json:"siblings,omitempty"`
+	Ban        *banEntry              `json:"ban,omitempty"`
+	RecordedAt time.Time              `json:"recorded_at"`
 }
 
 // acquireWarmupInstanceLease serializes warmup across independently loaded
@@ -102,12 +103,14 @@ func (s *schedulerRuntimeState) mergePersistedWarmupsLocked(statePath string) (m
 		}
 	} else {
 		var state struct {
-			Warmups map[string]warmupEntry `json:"warmups"`
+			Warmups        map[string]warmupEntry `json:"warmups"`
+			WarmupAttempts []warmupAttempt        `json:"warmup_attempts"`
 		}
 		if err := json.Unmarshal(raw, &state); err != nil {
 			return nil, false, fmt.Errorf("decode persisted scheduler state: %w", err)
 		}
 		s.mergeWarmupEntriesLocked(state.Warmups)
+		s.mergeWarmupAttemptsLocked(state.WarmupAttempts, time.Now())
 	}
 	records, err := readWarmupOutcomeJournal(statePath)
 	if err != nil {
@@ -116,10 +119,12 @@ func (s *schedulerRuntimeState) mergePersistedWarmupsLocked(statePath string) (m
 	bans := make(map[string]banEntry)
 	for _, record := range records {
 		s.mergeWarmupEntriesLocked(map[string]warmupEntry{record.Key: record.Entry})
+		s.mergeWarmupEntriesLocked(record.Siblings)
 		if record.Ban != nil && strings.TrimSpace(record.Entry.AuthID) != "" {
 			bans[record.Entry.AuthID] = *record.Ban
 		}
 	}
+	s.mergeWarmupAttemptsLocked(nil, time.Now())
 	return bans, len(records) > 0, nil
 }
 
@@ -153,12 +158,18 @@ func warmupEntryNewer(incoming, current warmupEntry) bool {
 	if incoming.Error != current.Error {
 		return incoming.Error != ""
 	}
+	if incoming.Failures != current.Failures {
+		return incoming.Failures > current.Failures
+	}
+	if !incoming.SuppressUntil.Equal(current.SuppressUntil) {
+		return incoming.SuppressUntil.After(current.SuppressUntil)
+	}
 	return incoming.ResetAt.After(current.ResetAt)
 }
 
 func warmupEntryRevisionTime(entry warmupEntry) time.Time {
 	latest := entry.AttemptedAt
-	for _, candidate := range []time.Time{entry.CompletedAt, entry.ActivatedAt} {
+	for _, candidate := range []time.Time{entry.CompletedAt, entry.ActivatedAt, entry.OutcomeAt} {
 		if candidate.After(latest) {
 			latest = candidate
 		}
@@ -177,22 +188,31 @@ func (s *schedulerRuntimeState) persistWarmupLeaseOutcome(lease *warmupInstanceL
 	key := warmupKey(candidate.Snapshot.AuthID, candidate.Window.Class)
 	s.warmupMu.Lock()
 	entry, ok := s.warmups[key]
+	entries := make(map[string]warmupEntry)
+	if ok {
+		for siblingKey, sibling := range s.warmups {
+			if sibling.AuthID == entry.AuthID && sibling.AttemptedAt.Equal(entry.AttemptedAt) {
+				entries[siblingKey] = sibling
+			}
+		}
+	}
 	s.warmupMu.Unlock()
 	if !ok || entry.AttemptedAt.IsZero() {
 		return nil
 	}
-	record := warmupOutcomeJournalRecord{
-		Version:    warmupOutcomeJournalVersion,
-		Key:        key,
-		Entry:      entry,
-		RecordedAt: time.Now().UTC(),
-	}
+	var recordedBan *banEntry
 	if ban, found := banStore.lookup(candidate.Snapshot.AuthID); found &&
 		!ban.BannedAt.Before(entry.AttemptedAt.Add(-time.Second)) {
 		copy := ban
-		record.Ban = &copy
+		recordedBan = &copy
 	}
-	return appendWarmupOutcomeJournal(lease.statePath, record)
+	// One atomic journal record covers every window started by this admission.
+	// A partial append must not expose success for 5h while losing weekly.
+	delete(entries, key)
+	return appendWarmupOutcomeJournal(lease.statePath, warmupOutcomeJournalRecord{
+		Version: warmupOutcomeJournalVersion, Key: key, Entry: entry,
+		Siblings: entries, Ban: recordedBan, RecordedAt: time.Now().UTC(),
+	})
 }
 
 func warmupOutcomeJournalPath(statePath string) string {

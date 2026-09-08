@@ -3,6 +3,16 @@
 *.so
 *.dylib
 *.h
+research/*.log
+research/smoke-state-*/
+research/cpa-release/
+research/cpa-baseline/
+research/cpa-quota-failover-stage/
+research/deployment/
+research/*.exe
+research/*.tar.gz
+research/cpa-prior.patch
+research/inspect_cpa_deploy.py
 
 
 # OS clutter

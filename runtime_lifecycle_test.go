@@ -66,13 +66,13 @@ func TestConcurrentReconfigureAndStopSerializesWorkerLifecycle(t *testing.T) {
 		configureSchedulerRuntime([]byte("{\"enabled\":false,\"state_path\":\"\"}"))
 	})
 
-	passwordPath := filepath.Join(t.TempDir(), "keeper-password")
+	passwordPath := filepath.Join(t.TempDir(), "management-key")
 	if err := os.WriteFile(passwordPath, []byte("test-only"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	statePath := filepath.Join(t.TempDir(), "scheduler-state.json")
 	raw := []byte(fmt.Sprintf(
-		"{\"enabled\":true,\"keeper_url\":\"http://127.0.0.1:1\",\"keeper_password_file\":%q,\"refresh_interval\":\"1s\",\"state_path\":%q,\"warmup_enabled\":false}",
+		"{\"enabled\":true,\"cpa_management_url\":\"http://127.0.0.1:1\",\"cpa_management_key_file\":%q,\"refresh_interval\":\"1s\",\"state_path\":%q,\"warmup_enabled\":false}",
 		filepath.ToSlash(passwordPath), filepath.ToSlash(statePath),
 	))
 

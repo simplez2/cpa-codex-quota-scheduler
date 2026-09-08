@@ -97,7 +97,7 @@ func TestWarmupFindsFiveHourWindowWhenMonthlyAlreadyStarted(t *testing.T) {
 	}
 }
 
-func TestUnstartedWarmupIgnoresUnknownKeeperRows(t *testing.T) {
+func TestUnstartedWarmupIgnoresUnknownQuotaProbeRows(t *testing.T) {
 	now := time.Now()
 	window, ok := unstartedWarmupWindow(quotaSnapshot{Windows: []quotaWindow{
 		{Class: "unknown", UsedPercent: 100, Allowed: false, LimitReached: true},
@@ -276,6 +276,7 @@ func TestNativeWarmupDoesNotFallBackToManagementAuthDiscovery(t *testing.T) {
 	}))
 	defer server.Close()
 	cfg := defaultPluginConfig()
+	cfg.WarmupExecutionMode = "management"
 	cfg.WarmupExecutionMode = "native"
 	cfg.CPAManagementURL = server.URL + "/v0/management/api-call"
 	cfg.CPAManagementKeyFile = filepath.Join(t.TempDir(), "management-key")
@@ -302,6 +303,7 @@ func TestManagementWarmupUsesOnlyActiveIdentityProxyAuths(t *testing.T) {
 	defer server.Close()
 	cfg := defaultPluginConfig()
 	cfg.WarmupExecutionMode = "management"
+	cfg.WarmupExecutionMode = "management"
 	cfg.CPAManagementURL = server.URL + "/v0/management/api-call"
 	cfg.CPAManagementKeyFile = filepath.Join(t.TempDir(), "management-key")
 	if err := os.WriteFile(cfg.CPAManagementKeyFile, []byte("test-key"), 0600); err != nil {
@@ -319,7 +321,7 @@ func TestManagementWarmupUsesOnlyActiveIdentityProxyAuths(t *testing.T) {
 	}
 }
 
-func TestFindWarmupCandidateUsesCurrentCPAAuthIndex(t *testing.T) {
+func TestFindWarmupCandidateRequiresQuotaForCurrentCPAAuthIndex(t *testing.T) {
 	now := time.Now()
 	state := schedulerRuntimeState{
 		cfg: defaultPluginConfig(),
@@ -333,8 +335,8 @@ func TestFindWarmupCandidateUsesCurrentCPAAuthIndex(t *testing.T) {
 	candidate, ok := state.findWarmupCandidate(map[string]warmupAuthBinding{
 		"account": {AuthID: "account", AuthIndex: "current-index"},
 	}, now)
-	if !ok || candidate.Snapshot.AuthIndex != "current-index" {
-		t.Fatalf("candidate = %#v, ok=%v; want current CPA auth index", candidate, ok)
+	if ok {
+		t.Fatalf("stale quota was rebound to a different credential: %#v", candidate)
 	}
 }
 
@@ -358,6 +360,7 @@ func TestManagementWarmupRevalidatesAuthBindingBeforeAPICall(t *testing.T) {
 	}))
 	defer server.Close()
 	cfg := defaultPluginConfig()
+	cfg.WarmupExecutionMode = "management"
 	cfg.CPAManagementURL = server.URL + "/v0/management/api-call"
 	cfg.CPAManagementKeyFile = keyPath
 	cfg.StatePath = ""
@@ -452,11 +455,12 @@ func TestManagementWarmupUsesMinimalResponsesRequest(t *testing.T) {
 	}))
 	defer server.Close()
 	cfg := defaultPluginConfig()
+	cfg.WarmupExecutionMode = "management"
 	cfg.CPAManagementURL = server.URL + "/v0/management/api-call"
 	cfg.CPAManagementKeyFile = keyPath
 	cfg.StatePath = ""
 	state := schedulerRuntimeState{cfg: cfg, warmups: make(map[string]warmupEntry)}
-	candidate := warmupCandidate{Snapshot: quotaSnapshot{AuthID: "acct", AuthIndex: "stale"}, Window: quotaWindow{Class: "5h", Allowed: true}}
+	candidate := warmupCandidate{Snapshot: quotaSnapshot{AuthID: "acct", AuthIndex: "current"}, Window: quotaWindow{Class: "5h", Allowed: true}}
 	state.executeManagementWarmup(context.Background(), cfg, candidate)
 	entry := state.warmups[warmupKey("acct", "5h")]
 	if entry.Status != http.StatusOK || entry.Error != "" {
@@ -485,29 +489,24 @@ func TestWarmupSuppressionExpiresAtReset(t *testing.T) {
 	if s.warmupSuppressedLocked("a|5h", now, 15*time.Minute) {
 		t.Fatal("expired reset should allow a new warmup")
 	}
-	if _, ok := s.warmups["a|5h"]; ok {
-		t.Fatal("expired warmup state should be removed")
-	}
 	s.warmupMu.Unlock()
+	if !s.pruneExpiredWarmups(now) {
+		t.Fatal("expired warmup state should be pruned")
+	}
 }
 
-func TestWarmupSuppressionDiscardsLifecycleCancellation(t *testing.T) {
+func TestWarmupSuppressionKeepsLifecycleCancellation(t *testing.T) {
 	now := time.Now()
 	key := warmupKey("a", "weekly")
-	s := &schedulerRuntimeState{warmups: map[string]warmupEntry{
-		key: {
-			AuthID: "a", Window: "weekly", AttemptedAt: now.Add(-time.Second),
-			Error: "cancelled",
-		},
+	state := schedulerRuntimeState{warmups: map[string]warmupEntry{
+		key: {AuthID: "a", Window: "weekly", AttemptedAt: now.Add(-time.Second), Error: "cancelled"},
 	}}
-	s.warmupMu.Lock()
-	if s.warmupSuppressedLocked(key, now, 15*time.Minute) {
-		t.Fatal("lifecycle cancellation should not suppress the next active generation")
+	if !state.warmupSuppressedLocked(key, now, 15*time.Minute) {
+		t.Fatal("cancellation must respect backoff: upstream completion is unknown")
 	}
-	if _, ok := s.warmups[key]; ok {
-		t.Fatal("cancelled lifecycle state should be removed before retry")
+	if _, ok := state.warmups[key]; !ok {
+		t.Fatal("cancellation evidence was discarded")
 	}
-	s.warmupMu.Unlock()
 }
 
 func TestWarmupSuppressionKeepsReturnedHTTPStatusDuringBackoff(t *testing.T) {
@@ -548,111 +547,37 @@ func TestWarmupSuppressionKeepsBlockedCancellation(t *testing.T) {
 	s.warmupMu.Unlock()
 }
 
-func TestPriorGenerationWarmupRetryIsOneShot(t *testing.T) {
+func TestPriorGenerationWarmupPreservesUncertainAdmission(t *testing.T) {
 	now := time.Now()
-	claimedAt := now.Add(-time.Minute)
 	key := warmupKey("acct", "5h")
-	candidate := warmupCandidate{Snapshot: quotaSnapshot{AuthID: "acct"}, Window: quotaWindow{Class: "5h"}}
-	state := &schedulerRuntimeState{warmups: map[string]warmupEntry{
-		key: {AuthID: "acct", Window: "5h", AttemptedAt: claimedAt.Add(-time.Second)},
+	state := schedulerRuntimeState{warmups: map[string]warmupEntry{
+		key: {AuthID: "acct", Window: "5h", AttemptedAt: now.Add(-time.Hour), SuppressUntil: now.Add(4 * time.Hour)},
 	}}
-
-	state.warmupMu.Lock()
-	got, gotKey, ok := state.nextWarmupCandidateForGenerationLocked([]warmupCandidate{candidate}, now, 15*time.Minute, claimedAt)
-	state.warmupMu.Unlock()
-	if !ok || got.Snapshot.AuthID != "acct" || gotKey != key {
-		t.Fatalf("previous-generation retry candidate=%#v key=%q ok=%v", got, gotKey, ok)
-	}
-	if _, exists := state.warmups[key]; exists {
-		t.Fatal("previous-generation retryable state was not removed")
-	}
-
-	state.warmups[key] = warmupEntry{AuthID: "acct", Window: "5h", AttemptedAt: now}
-	state.warmupMu.Lock()
-	_, _, ok = state.nextWarmupCandidateForGenerationLocked([]warmupCandidate{candidate}, now.Add(time.Second), 15*time.Minute, claimedAt)
-	state.warmupMu.Unlock()
-	if ok {
-		t.Fatal("same generation retried the failed warmup more than once")
-	}
-
-	for name, entry := range map[string]warmupEntry{
-		"blocked": {AuthID: "acct", Window: "5h", AttemptedAt: claimedAt.Add(-time.Second), Error: "http_400", Blocked: true},
-		"429":     {AuthID: "acct", Window: "5h", AttemptedAt: claimedAt.Add(-time.Second), Error: "http_429", Status: statusTooManyRequests},
-		"success": {AuthID: "acct", Window: "5h", AttemptedAt: claimedAt.Add(-time.Second), Status: http.StatusOK},
-	} {
-		state.warmups[key] = entry
-		state.warmupMu.Lock()
-		_, _, ok = state.nextWarmupCandidateForGenerationLocked([]warmupCandidate{candidate}, now, 15*time.Minute, claimedAt)
-		state.warmupMu.Unlock()
-		if ok {
-			t.Fatalf("%s outcome was incorrectly retried across generations", name)
+	candidate := warmupCandidate{Snapshot: quotaSnapshot{AuthID: "acct"}, Window: quotaWindow{Class: "5h"}}
+	for _, claimed := range []time.Time{now.Add(-time.Minute), now, now.Add(time.Minute)} {
+		if _, _, ok := state.nextWarmupCandidateForGenerationLocked([]warmupCandidate{candidate}, now, 15*time.Minute, claimed); ok {
+			t.Fatal("takeover retried an uncertain admission")
 		}
+	}
+	if _, _, ok := state.nextWarmupCandidateForGenerationLocked([]warmupCandidate{candidate}, now.Add(4*time.Hour), 15*time.Minute, now); !ok {
+		t.Fatal("expired admission never became eligible")
 	}
 }
 
-func TestRetryableWarmupFromPriorGenerationOnlyRetriesUnfinishedAttempts(t *testing.T) {
-	now := time.Now().UTC()
-	claimedAt := now.Add(-time.Minute)
-	priorAttempt := claimedAt.Add(-time.Second)
-
-	tests := []struct {
-		name  string
-		entry warmupEntry
-		want  bool
-	}{
-		{
-			name:  "admitted attempt without outcome retries",
-			entry: warmupEntry{AttemptedAt: priorAttempt},
-			want:  true,
-		},
-		{
-			name:  "lifecycle cancellation without status retries",
-			entry: warmupEntry{AttemptedAt: priorAttempt, Error: "cancelled"},
-			want:  true,
-		},
-		{
-			name:  "status free transport failure waits for backoff",
-			entry: warmupEntry{AttemptedAt: priorAttempt, Error: "warmup_failed"},
-			want:  false,
-		},
-		{
-			name:  "http 200 with generic sse error waits for backoff",
-			entry: warmupEntry{AttemptedAt: priorAttempt, Status: http.StatusOK, Error: "error"},
-			want:  false,
-		},
-		{
-			name:  "clean http 200 does not retry",
-			entry: warmupEntry{AttemptedAt: priorAttempt, Status: http.StatusOK},
-			want:  false,
-		},
-		{
-			name:  "http 502 waits for backoff",
-			entry: warmupEntry{AttemptedAt: priorAttempt, Status: http.StatusBadGateway, Error: "http_502"},
-			want:  false,
-		},
-		{
-			name:  "cyber policy never retries",
-			entry: warmupEntry{AttemptedAt: priorAttempt, Status: http.StatusOK, Error: "cyber_policy", Blocked: true},
-			want:  false,
-		},
-		{
-			name:  "auth unavailable never retries",
-			entry: warmupEntry{AttemptedAt: priorAttempt, Status: http.StatusServiceUnavailable, Error: "auth_unavailable", Blocked: true},
-			want:  false,
-		},
-		{
-			name:  "http 429 does not use generation retry",
-			entry: warmupEntry{AttemptedAt: priorAttempt, Status: statusTooManyRequests, Error: "http_429"},
-			want:  false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := retryableWarmupFromPriorGeneration(tt.entry, claimedAt); got != tt.want {
-				t.Fatalf("retryableWarmupFromPriorGeneration() = %v; want %v; entry=%#v", got, tt.want, tt.entry)
-			}
-		})
+func TestPriorGenerationOutcomesNeverBypassBackoff(t *testing.T) {
+	now := time.Now()
+	key := warmupKey("acct", "5h")
+	for _, entry := range []warmupEntry{
+		{}, {Error: "cancelled"}, {Error: "warmup_failed"},
+		{Status: http.StatusOK}, {Status: http.StatusBadGateway, Error: "http_502"},
+		{Status: statusTooManyRequests, Error: "http_429"}, {Blocked: true, Error: "cyber_policy"},
+	} {
+		entry.AttemptedAt = now.Add(-time.Minute)
+		entry.AuthID = "acct"
+		state := schedulerRuntimeState{warmups: map[string]warmupEntry{key: entry}}
+		if !state.warmupSuppressedForGenerationLocked(key, now, 15*time.Minute, now) {
+			t.Fatalf("takeover bypassed backoff: %#v", entry)
+		}
 	}
 }
 
@@ -752,7 +677,7 @@ func TestWarmupCandidateStatusCountsExpiredOrStaleSuppression(t *testing.T) {
 	}
 }
 
-func TestNextWarmupCandidateDiscardsStaleActivationAfterExternalReset(t *testing.T) {
+func TestNextWarmupCandidateKeepsActivationDespiteMovingPlaceholder(t *testing.T) {
 	now := time.Now()
 	oldReset := now.Add(20 * 24 * time.Hour)
 	newPlaceholderReset := now.Add(30 * 24 * time.Hour)
@@ -779,15 +704,15 @@ func TestNextWarmupCandidateDiscardsStaleActivationAfterExternalReset(t *testing
 	s.warmupMu.Lock()
 	candidate, gotKey, ok := s.nextWarmupCandidateLocked(candidates, now, 15*time.Minute)
 	s.warmupMu.Unlock()
-	if !ok || candidate.Snapshot.AuthID != "monthly" || gotKey != key {
-		t.Fatalf("candidate = %#v, key=%q, ok=%v; stale activation should not suppress", candidate, gotKey, ok)
+	if ok {
+		t.Fatalf("candidate = %#v, key=%q, ok=%v; fixed activation must remain suppressed", candidate, gotKey, ok)
 	}
-	if _, exists := s.warmups[key]; exists {
-		t.Fatal("stale warmup activation was not removed")
+	if _, exists := s.warmups[key]; !exists {
+		t.Fatal("confirmed activation was removed before its reset")
 	}
 }
 
-func TestNextWarmupCandidateRetriesUnconfirmedWarmupAfterFreshGrace(t *testing.T) {
+func TestNextWarmupCandidateKeepsUnconfirmedWarmupUntilCycleDeadline(t *testing.T) {
 	now := time.Now()
 	windowSeconds := int64((5 * time.Hour).Seconds())
 	key := warmupKey("pending", "5h")
@@ -808,11 +733,11 @@ func TestNextWarmupCandidateRetriesUnconfirmedWarmupAfterFreshGrace(t *testing.T
 	s.warmupMu.Lock()
 	candidate, gotKey, ok := s.nextWarmupCandidateLocked(candidates, now, 15*time.Minute)
 	s.warmupMu.Unlock()
-	if !ok || candidate.Snapshot.AuthID != "pending" || gotKey != key {
-		t.Fatalf("candidate = %#v, key=%q, ok=%v; unconfirmed warmup should retry after fresh grace", candidate, gotKey, ok)
+	if ok {
+		t.Fatalf("candidate = %#v, key=%q, ok=%v; unconfirmed completion must retain its cycle suppression", candidate, gotKey, ok)
 	}
-	if _, exists := s.warmups[key]; exists {
-		t.Fatal("stale pending warmup state was not removed")
+	if _, exists := s.warmups[key]; !exists {
+		t.Fatal("pending warmup state was removed before cycle expiry")
 	}
 }
 
@@ -845,7 +770,7 @@ func TestNextWarmupCandidateKeepsPendingWarmupDuringGrace(t *testing.T) {
 	}
 }
 
-func TestBlockedWarmupRequiresChangedCPAAuthBinding(t *testing.T) {
+func TestBlockedWarmupRequiresExplicitRetryEvenAfterBindingChange(t *testing.T) {
 	now := time.Now()
 	key := warmupKey("acct", "5h")
 	state := &schedulerRuntimeState{warmups: map[string]warmupEntry{
@@ -866,11 +791,11 @@ func TestBlockedWarmupRequiresChangedCPAAuthBinding(t *testing.T) {
 	state.warmupMu.Lock()
 	got, gotKey, ok := state.nextWarmupCandidateLocked([]warmupCandidate{candidate}, now, 15*time.Minute)
 	state.warmupMu.Unlock()
-	if !ok || got.Snapshot.AuthIndex != "new-index" || gotKey != key {
+	if ok {
 		t.Fatalf("changed binding candidate = %#v key=%q ok=%v", got, gotKey, ok)
 	}
-	if _, exists := state.warmups[key]; exists {
-		t.Fatal("blocked warmup state was not cleared after CPA auth binding changed")
+	if _, exists := state.warmups[key]; !exists {
+		t.Fatal("binding change cleared a manual warmup block")
 	}
 }
 
@@ -961,7 +886,7 @@ func TestWarmupSuccessSuppressesUnstartedSiblingWindows(t *testing.T) {
 	}
 }
 
-func TestWarmupSiblingWindowConfirmsFromKeeper(t *testing.T) {
+func TestWarmupSiblingWindowConfirmsFromQuotaProbe(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	state := schedulerRuntimeState{warmups: map[string]warmupEntry{
 		warmupKey("acct", "5h"): {
@@ -993,7 +918,7 @@ func TestWarmupSiblingWindowConfirmsFromKeeper(t *testing.T) {
 		},
 	}}
 	if !state.confirmPendingWarmups(quotas, now) {
-		t.Fatal("fresh Keeper anchors did not confirm sibling warmups")
+		t.Fatal("fresh quota probe anchors did not confirm sibling warmups")
 	}
 	for _, test := range []struct {
 		class string
@@ -1009,7 +934,7 @@ func TestWarmupSiblingWindowConfirmsFromKeeper(t *testing.T) {
 	}
 }
 
-func TestWarmupSiblingPlaceholderCanRetryAfterStaleGrace(t *testing.T) {
+func TestWarmupSiblingPlaceholderKeepsOriginalSuppression(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	completedAt := now.Add(-2 * time.Hour)
 	state := schedulerRuntimeState{warmups: map[string]warmupEntry{
@@ -1031,11 +956,11 @@ func TestWarmupSiblingPlaceholderCanRetryAfterStaleGrace(t *testing.T) {
 	state.warmupMu.Lock()
 	got, _, ok := state.nextWarmupCandidateLocked([]warmupCandidate{candidate}, now, time.Minute)
 	state.warmupMu.Unlock()
-	if !ok || got.Window.Class != "weekly" {
-		t.Fatalf("stale placeholder warmup was not retried: %#v, ok=%v", got, ok)
+	if ok {
+		t.Fatalf("placeholder must not cause a repeated warmup: %#v, ok=%v", got, ok)
 	}
-	if _, exists := state.warmups[warmupKey("acct", "weekly")]; exists {
-		t.Fatal("stale sibling warmup state was not discarded before retry")
+	if _, exists := state.warmups[warmupKey("acct", "weekly")]; !exists {
+		t.Fatal("sibling suppression was discarded before its deadline")
 	}
 }
 
@@ -1062,7 +987,7 @@ func TestWarmupSuccessDoesNotClearBlockedSibling(t *testing.T) {
 	}
 }
 
-func TestPendingWarmupConfirmsOnlyFromFreshStableKeeperAnchor(t *testing.T) {
+func TestPendingWarmupConfirmsOnlyFromFreshStableQuotaProbeAnchor(t *testing.T) {
 	now := time.Now().UTC()
 	key := warmupKey("acct", "weekly")
 	state := schedulerRuntimeState{warmups: map[string]warmupEntry{
@@ -1074,14 +999,14 @@ func TestPendingWarmupConfirmsOnlyFromFreshStableKeeperAnchor(t *testing.T) {
 	}}
 	stableReset := now.Add(6 * 24 * time.Hour)
 	quotas := map[string]quotaSnapshot{"acct": {
-		AuthID: "acct", RefreshedAt: now,
+		AuthID: "acct", AuthIndex: "idx-acct", RefreshedAt: now,
 		Windows: []quotaWindow{{
 			Class: "weekly", WindowSeconds: int64((7 * 24 * time.Hour).Seconds()),
 			UsedPercent: 0, Allowed: true, ResetAt: stableReset, ObservedAt: now,
 		}},
 	}}
 	if !state.confirmPendingWarmups(quotas, now) {
-		t.Fatal("fresh stable Keeper anchor did not confirm pending warmup")
+		t.Fatal("fresh stable quota probe anchor did not confirm pending warmup")
 	}
 	entry := state.warmups[key]
 	if entry.ActivatedAt.IsZero() || !entry.ResetAt.Equal(stableReset) || !entry.SuppressUntil.Equal(stableReset) {
@@ -1110,6 +1035,7 @@ func TestFindWarmupCandidateSkipsQuarantinedAuth(t *testing.T) {
 	resetBanStoreForTest()
 	now := time.Now()
 	cfg := defaultPluginConfig()
+	cfg.WarmupExecutionMode = "management"
 	cfg.StatePath = ""
 	state := schedulerRuntimeState{
 		cfg: cfg,
@@ -1142,11 +1068,12 @@ func TestFindWarmupCandidateRejectsCarriedStaleRecognizedWindow(t *testing.T) {
 	resetBanStoreForTest()
 	now := time.Now().UTC().Truncate(time.Second)
 	cfg := defaultPluginConfig()
+	cfg.WarmupExecutionMode = "management"
 	cfg.StatePath = ""
 	cfg.StaleAfter = 15 * time.Minute
 
 	// The outer snapshot and weekly row are fresh, but the monthly row was
-	// carried through successive partial Keeper responses. Its own observation
+	// carried through successive partial quota probe responses. Its own observation
 	// is authoritative for warmup and must not be refreshed by the envelope.
 	state := schedulerRuntimeState{
 		cfg: cfg,
@@ -1191,6 +1118,7 @@ func TestWarmupSnapshotFreshRequiresOwnObservationForEveryRecognizedWindow(t *te
 
 func TestExecuteWarmupRejectsUnsafeModelBeforeTransport(t *testing.T) {
 	cfg := defaultPluginConfig()
+	cfg.WarmupExecutionMode = "management"
 	cfg.StatePath = ""
 	cfg.CPAManagementURL = "http://127.0.0.1:1/transport-must-not-run"
 	cfg.WarmupModel = "gpt-safe\r\nX-Injected: true"
@@ -1244,6 +1172,7 @@ func TestWarmupHeaderless429EntersProbation(t *testing.T) {
 	defer server.Close()
 
 	cfg := defaultPluginConfig()
+	cfg.WarmupExecutionMode = "management"
 	cfg.CPAManagementURL = server.URL
 	cfg.CPAManagementKeyFile = keyPath
 	cfg.StatePath = ""

@@ -3,7 +3,7 @@
 // The plugin is limited to Codex credentials. It observes completed requests,
 // quarantines 429 credentials, and requires one serialized half-open success
 // after cooldown before restoring normal traffic. The scheduler also consumes
-// fresh Keeper quota snapshots to keep one global active auth until it reaches
+// fresh native quota snapshots to keep one global active auth until it reaches
 // the configured threshold. Legacy pacing modes remain available for migration.
 //
 // Three capabilities are registered:
@@ -105,7 +105,7 @@ import (
 
 const (
 	pluginName    = "codex-quota-scheduler"
-	pluginVersion = "0.1.24"
+	pluginVersion = "0.2.0"
 
 	// providerCodex is the CPA provider key for OpenAI Codex (ChatGPT backend).
 	providerCodex = "codex"
@@ -538,24 +538,32 @@ func pluginRegistration() registration {
 				{Name: "scheduler_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"serial", "legacy", "shadow", "enforce"}, Description: "Runtime policy mode. Serial keeps one global active Codex auth while balancing 5h and weekly capacity at committed switch boundaries."},
 				{Name: "serial_switch_percent", Type: pluginapi.ConfigFieldTypeNumber, Description: "Soft used-percent switch threshold. Drain mode may cross it; hard limits, disallowed windows, and 429 still force failover."},
 				{Name: "serial_handoff_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"threshold_only", "reserve_aware"}, Description: "Account handoff policy. threshold_only follows serial_switch_percent; reserve_aware also hands off before the configured reserve for the active 5h, weekly, or monthly window is consumed."},
-				{Name: "serial_5h_handoff_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"inherit_global", "custom_threshold", "reserve_aware", "429_only"}, Description: "5h-specific handoff policy. inherit_global keeps the existing global threshold; custom_threshold uses serial_5h_switch_percent; reserve_aware preserves the 5h reserve; 429_only waits for hard limit, disallowed state, or 429."},
+				{Name: "serial_5h_handoff_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"inherit_global", "custom_threshold", "reserve_aware", "429_only"}, Description: "5h-specific handoff policy. Defaults to 429_only: no static, forecast, or cache-age reserve; hard limits, disallowed state, and 429 still trigger handoff. inherit_global uses the global threshold; custom_threshold uses serial_5h_switch_percent; reserve_aware enables the configured reserve and forecast guard."},
 				{Name: "serial_5h_switch_percent", Type: pluginapi.ConfigFieldTypeNumber, Description: "Custom 5h used-percent handoff threshold when serial_5h_handoff_mode is custom_threshold. Defaults to the global serial_switch_percent when omitted."},
 				{Name: "serial_prefer_active_cycle", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Prefer an already-started quota cycle when choosing the next serial auth."},
-				{Name: "keeper_url", Type: pluginapi.ConfigFieldTypeString, Description: "Keeper base URL, for example http://cpa-usage-keeper:8080/keeper."},
-				{Name: "keeper_password_file", Type: pluginapi.ConfigFieldTypeString, Description: "Mounted Keeper login-password file; the password is never placed in YAML."},
-				{Name: "keeper_refresh_cooldown", Type: pluginapi.ConfigFieldTypeString, Description: "Cross-instance minimum cooldown for targeted Keeper quota refresh requests. Defaults to 2m."},
-				{Name: "cpa_management_url", Type: pluginapi.ConfigFieldTypeString, Description: "CPA localhost Management API call endpoint used only for pinned warmup requests."},
+				{Name: "serial_allocation_policy", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"sustainable", "weekly_remaining"}, Description: "Default sustainable uses safe 5h headroom then normalized weekly budget until reset. weekly_remaining retains raw weekly percentage ranking."},
+				{Name: "serial_budget_rebalance_percent", Type: pluginapi.ConfigFieldTypeNumber, Description: "Relative weekly budget advantage before proactive sustainable handoff (default 20 percent, 0 disables); requires independent evidence and minimum hold."},
+				{Name: "serial_soft_continuation", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Legacy session continuation past a soft threshold; defaults false so subsequent session requests follow the replacement."},
+				{Name: "quota_default_plan", Type: pluginapi.ConfigFieldTypeString, Description: "Default capacity prior: team_standard (default), plus, pro_5x, pro_20x or team_premium. Per-auth quota_account_plans YAML overrides are supported; priors are not guaranteed weekly limits."},
+				{Name: "serial_weekly_rebalance_percent", Type: pluginapi.ConfigFieldTypeNumber, Description: "Weekly remaining percentage-point advantage required for proactive serial balancing (default 10, 0 disables). Two distinct fresh observations of both accounts are required."},
+				{Name: "serial_weekly_rebalance_min_hold", Type: pluginapi.ConfigFieldTypeString, Description: "Minimum primary hold before proactive weekly balancing (1m-24h, default 5m). Hard limits, quarantine and other safety handoffs do not wait."},
+				{Name: "quota_refresh_cooldown", Type: pluginapi.ConfigFieldTypeString, Description: "Per-account cooldown for standby native quota queries. Defaults to 2m; the active account uses refresh_interval."},
+				{Name: "quota_url", Type: pluginapi.ConfigFieldTypeString, Description: "Native Codex quota endpoint queried via CPA api-call. Defaults to https://chatgpt.com/backend-api/wham/usage."},
+				{Name: "quota_refresh_batch", Type: pluginapi.ConfigFieldTypeInteger, Description: "Maximum sequential quota queries per refresh tick (1-100, default 8)."},
+				{Name: "cpa_management_url", Type: pluginapi.ConfigFieldTypeString, Description: "CPA Management api-call endpoint for native quota queries and optional management warmup; auth-files is resolved under the same base path."},
 				{Name: "cpa_management_key_file", Type: pluginapi.ConfigFieldTypeString, Description: "Mounted owner-readable CPA management key file; the key is never placed in YAML or logs."},
-				{Name: "warmup_enabled", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Activate Codex accounts with 100% available quota whose Keeper reset is missing, expired, or still a full-duration moving placeholder."},
+				{Name: "warmup_enabled", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Optional budgeted activation of idle Codex quota windows. Requires a writable state file and fresh eligible quota; defaults to false."},
 				{Name: "warmup_execution_mode", Type: pluginapi.ConfigFieldTypeString, Description: "Warmup transport. management is bounded and hot-reload safe; native requires a CPA HostModel implementation with a verified bounded timeout."},
-				{Name: "warmup_model", Type: pluginapi.ConfigFieldTypeString, Description: "Model used for the minimal pinned hello activation request; this does not change any route default."},
+				{Name: "warmup_model", Type: pluginapi.ConfigFieldTypeString, Description: "Model used for the minimal pinned activation request; this does not change any route default."},
 				{Name: "warmup_sidecar_url", Type: pluginapi.ConfigFieldTypeString, Description: "Internal Codex Agent Identity sidecar base URL used by pinned warmup."},
-				{Name: "warmup_retry_after", Type: pluginapi.ConfigFieldTypeString, Description: "Minimum delay before retrying a warmup that did not return a reset window."},
-				{Name: "refresh_interval", Type: pluginapi.ConfigFieldTypeString, Description: "How often to read Keeper's cached Codex quota (for example 30s)."},
+				{Name: "warmup_retry_after", Type: pluginapi.ConfigFieldTypeString, Description: "Base delay for exponential warmup failure backoff. Three failures require explicit repair/retry; uncertain outcomes wait at least 5h."},
+				{Name: "warmup_min_interval", Type: pluginapi.ConfigFieldTypeString, Description: "Durable pool-wide spacing between warmup attempts (1m-24h, default 15m)."},
+				{Name: "warmup_max_per_day", Type: pluginapi.ConfigFieldTypeInteger, Description: "Maximum admitted warmups across the pool in a rolling 24h window (1-1000, default 8), including failures."},
+				{Name: "refresh_interval", Type: pluginapi.ConfigFieldTypeString, Description: "How often to read CPA inventory and due Codex quotas (for example 30s)."},
 				{Name: "stale_after", Type: pluginapi.ConfigFieldTypeString, Description: "Maximum age of a quota snapshot before native CPA scheduling is used."},
-				{Name: "state_path", Type: pluginapi.ConfigFieldTypeString, Description: "Owner-only JSON file for quarantine, serial auth identifiers, hashed session bindings, cycle anchors, and warmup bookkeeping; it contains no credential material."},
+				{Name: "state_path", Type: pluginapi.ConfigFieldTypeString, Description: "Owner-only JSON file for quota cache, per-account polling backoff, quarantine, serial identifiers and warmup bookkeeping; no credential material."},
 				{Name: "soft_limit_percent", Type: pluginapi.ConfigFieldTypeNumber, Description: "Avoid a window at or above this percentage when a healthier same-priority choice exists."},
-				{Name: "reserve_5h_percent", Type: pluginapi.ConfigFieldTypeNumber, Description: "Safety reserve retained in every five-hour quota window."},
+				{Name: "reserve_5h_percent", Type: pluginapi.ConfigFieldTypeNumber, Description: "Optional five-hour safety reserve, default 0. Ignored by serial 429_only handoff and ranking; choose reserve_aware and set a positive value to retain a reserve."},
 				{Name: "reserve_weekly_percent", Type: pluginapi.ConfigFieldTypeNumber, Description: "Hard weekly reserve partition for serial selection; protected accounts are used only when no unprotected candidate remains."},
 				{Name: "reserve_monthly_percent", Type: pluginapi.ConfigFieldTypeNumber, Description: "Safety reserve retained in every monthly quota window."},
 				{Name: "low_quota_percent", Type: pluginapi.ConfigFieldTypeNumber, Description: "Remaining quota threshold that raises request-cost prediction from P75 to P90."},
@@ -838,7 +846,7 @@ func classifyWindowHeadersByDuration(headers http.Header, now time.Time) (banEnt
 }
 
 // handleSchedulerPick applies the Codex-only quota policy. Serial mode keeps a
-// deterministic single active auth even during a Keeper outage; legacy modes
+// deterministic single active auth even during a quota probe outage; legacy modes
 // retain their native-fallback behavior.
 func handleSchedulerPick(raw []byte) ([]byte, error) {
 	var req pluginapi.SchedulerPickRequest
@@ -876,7 +884,7 @@ func managementRegistration() pluginapi.ManagementRegistrationResponse {
 			{
 				Method:      http.MethodGet,
 				Path:        managementRoutePrefix + "/quota",
-				Description: "Show the active serial auth, Keeper freshness, pacing diagnostics, and redacted decisions.",
+				Description: "Show the active serial auth, quota probe freshness, pacing diagnostics, and redacted decisions.",
 			},
 			{
 				Method:      http.MethodPut,
