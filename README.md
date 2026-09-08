@@ -2,7 +2,26 @@
 
 Standalone CPA plugin for serial Codex account selection, native quota polling,
 5h/weekly/monthly windows, persistent 429 quarantine and optional warmup.
-Source version: **0.2.0**. Local builds are not a published release.
+Source version: **0.2.1**. Local builds are not a published release.
+
+## CPA dashboard
+
+After enabling the plugin, refresh CPA Management Center and open **插件 →
+Codex 额度调度**. The plugin management list uses the same display name and the
+stable ID `codex-quota-scheduler`. The dashboard shows the current account,
+5h/weekly remaining quota and resets, daily weekly budget, freshness and warmup
+records. Its 15-second refresh reads the existing cache without upstream or
+model requests. It does not change scheduling or enable warmup.
+
+The standalone resource entry is `/v0/resource/plugins/codex-quota-scheduler/open`.
+It serves static assets only; quota data remains behind CPA management
+authentication. The page reuses a remembered CPA login only when its API origin
+and path match this server. Otherwise it asks for a management key, held in
+page memory only. Keys never appear in links or public resources. Both current
+encrypted and scoped CPA storage formats are supported. No sidecar is needed.
+
+UI authentication regressions: `node --test web/session.test.mjs`.
+Linux release assets use the Debian 12 glibc baseline for CPA compatibility.
 
 ## Dependencies
 

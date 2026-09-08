@@ -56,7 +56,20 @@ jobs:
           go-version: "1.23"
           cache: true
 
-      - name: Build dynamic library
+      # Debian 12's glibc baseline keeps the Linux asset loadable on CPA hosts
+      # running Bookworm; ubuntu-latest can otherwise require a newer glibc.
+      - name: Build Linux dynamic library
+        if: matrix.goos == 'linux'
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work -e CGO_ENABLED=1 -e GOOS -e GOARCH \
+            golang:1.23-bookworm go build -buildmode=c-shared -o codex-quota-scheduler.so .
+        shell: bash
+
+      - name: Build native dynamic library
+        if: matrix.goos != 'linux'
         env:
           CGO_ENABLED: "1"
           GOOS: ${{ matrix.goos }}

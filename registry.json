@@ -3,10 +3,10 @@
   "plugins": [
     {
       "id": "codex-quota-scheduler",
-      "name": "Codex Quota Scheduler",
-      "description": "Standalone CPA Codex quota scheduler with native quota polling, persistent per-account cache/backoff, serial balancing, 429 quarantine, and optional native warmup.",
+      "name": "Codex 额度调度",
+      "description": "Standalone CPA quota scheduler with an integrated 5h/weekly dashboard, native polling, serial balancing, 429 quarantine, and optional warmup.",
       "author": "simplez2",
-      "version": "0.2.0",
+      "version": "0.2.1",
       "repository": "https://github.com/simplez2/cpa-codex-quota-scheduler",
       "homepage": "https://github.com/simplez2/cpa-codex-quota-scheduler",
       "license": "MIT",

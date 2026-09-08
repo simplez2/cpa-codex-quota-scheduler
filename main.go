@@ -105,7 +105,7 @@ import (
 
 const (
 	pluginName    = "codex-quota-scheduler"
-	pluginVersion = "0.2.0"
+	pluginVersion = "0.2.1"
 
 	// providerCodex is the CPA provider key for OpenAI Codex (ChatGPT backend).
 	providerCodex = "codex"
@@ -530,7 +530,7 @@ func pluginRegistration() registration {
 	return registration{
 		SchemaVersion: pluginabi.SchemaVersion,
 		Metadata: pluginapi.Metadata{
-			Name:             pluginName,
+			Name:             "Codex 额度调度",
 			Version:          pluginVersion,
 			Author:           "simplez2",
 			GitHubRepository: "https://github.com/simplez2/cpa-codex-quota-scheduler",
@@ -865,6 +865,7 @@ func handleSchedulerPick(raw []byte) ([]byte, error) {
 // actions that CPA cannot observe; normal cooldown expiry uses half-open probes.
 func managementRegistration() pluginapi.ManagementRegistrationResponse {
 	return pluginapi.ManagementRegistrationResponse{
+		Resources: dashboardResources(),
 		Routes: []pluginapi.ManagementRoute{
 			{
 				Method:      http.MethodGet,
@@ -917,6 +918,9 @@ func dispatchManagement(req pluginapi.ManagementRequest) pluginapi.ManagementRes
 	method := strings.ToUpper(strings.TrimSpace(req.Method))
 	if method == "" {
 		method = http.MethodGet
+	}
+	if response, ok := dashboardResource(method, req.Path); ok {
+		return response
 	}
 
 	switch {

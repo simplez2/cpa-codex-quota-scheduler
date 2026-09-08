@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Codex 额度调度</title>
+  <link rel="stylesheet" href="./dashboard.css">
+  <script type="module" src="./dashboard.mjs"></script>
+</head>
+<body>
+<main class="dashboard">
+  <header class="page-header">
+    <div><div class="eyebrow">CODEX <span>v{{VERSION}}</span></div><h1>额度调度</h1><p>掌握账号余量，让接下来的任务连续运行。</p></div>
+    <div class="toolbar"><span id="connection" role="status">正在连接</span><button id="refresh" type="button">刷新</button></div>
+  </header>
+  <div id="notice" class="notice" role="alert" hidden></div>
+  <form id="login" class="login" hidden>
+    <h2>连接当前 CPA</h2>
+    <p>未找到此 CPA 的已保存登录信息。输入管理密钥后查看额度，密钥仅用于本次页面。</p>
+    <label for="management-key">管理密钥</label>
+    <div class="login-input"><input id="management-key" type="password" autocomplete="off" required maxlength="4096"><button type="submit">连接</button></div>
+  </form>
+  <div id="content" hidden>
+    <section class="overview" aria-label="当前调度">
+      <div class="primary"><div class="section-label">当前账号 <span id="selection-mode" class="badge"></span></div><h2 id="active-account">等待选择</h2><p id="active-detail"></p></div>
+      <dl class="metrics"><div><dt>可用账号</dt><dd id="eligible-count">—</dd></div><div><dt>已切换</dt><dd id="switch-count">—</dd></div><div><dt>冷却中</dt><dd id="cooldown-count">—</dd></div></dl>
+    </section>
+    <section class="accounts" aria-labelledby="accounts-title">
+      <div class="section-header"><div><h2 id="accounts-title">账号额度</h2><p id="updated-at">等待额度快照</p></div><div class="table-tools"><input id="search" type="search" aria-label="筛选账号" placeholder="筛选账号"><label class="auto-refresh"><input id="auto-refresh" type="checkbox" checked>每 15 秒更新</label></div></div>
+      <div class="table-scroll"><table><thead><tr><th scope="col">账号 / 状态</th><th scope="col">5h 剩余</th><th scope="col">周剩余</th><th scope="col">周日均预算<span class="help">各账号自身额度 % / 天</span></th><th scope="col">最近查询</th></tr></thead><tbody id="accounts-body"></tbody></table></div>
+      <p id="empty" class="empty" hidden>尚无额度快照。请检查插件配置中的 CPA 管理连接，以及认证文件是否已启用。</p>
+    </section>
+    <div class="details-grid">
+      <section class="detail-panel" aria-labelledby="policy-title"><h2 id="policy-title">调配安排</h2><dl id="policy" class="policy"></dl><p class="muted">日均预算用于比较周额度消耗节奏，不是每日硬上限，也不表示下一次切换的固定顺序。</p></section>
+      <section class="detail-panel" aria-labelledby="warmup-title"><div class="section-header"><h2 id="warmup-title">预热状态</h2><span id="warmup-enabled" class="badge"></span></div><p id="warmup-description"></p><ul id="warmups" class="warmups"></ul></section>
+    </div>
+    <footer>刷新面板只读取额度缓存，不发起模型请求。<span id="last-read"></span></footer>
+  </div>
+  <noscript>请启用 JavaScript 以读取 CPA 额度状态。</noscript>
+</main>
+</body>
+</html>
