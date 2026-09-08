@@ -37,7 +37,7 @@ func TestDashboardMenuAndAssets(t *testing.T) {
 			}
 		}
 	}
-	if menus != 1 || len(resources) != 4 {
+	if menus != 1 || len(resources) != 5 {
 		t.Fatalf("resources=%d menus=%d", len(resources), menus)
 	}
 	// JSON endpoints must remain behind management authentication, never menus.

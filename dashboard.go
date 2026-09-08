@@ -11,17 +11,18 @@ import (
 // The resource namespace is public. Embed only static assets; account state and
 // credentials must continue to travel through CPA's authenticated management API.
 //
-//go:embed web/index.html web/dashboard.css web/dashboard.mjs web/session.mjs
+//go:embed web/index.html web/dashboard.css web/dashboard.mjs web/session.mjs web/settings.mjs
 var dashboardFiles embed.FS
 
 const dashboardResourcePrefix = "/v0/resource/plugins/" + pluginName
 
 func dashboardResources() []pluginapi.ResourceRoute {
 	return []pluginapi.ResourceRoute{
-		{Path: "/open", Menu: "Codex 额度调度", Description: "查看当前账号、5h / 周额度、重置时间与预热状态。"},
+		{Path: "/open", Menu: "Codex 额度调度", Description: "管理账号与额度、均衡并发调度、套餐分配和预热。"},
 		{Path: "/dashboard.css"},
 		{Path: "/dashboard.mjs"},
 		{Path: "/session.mjs"},
+		{Path: "/settings.mjs"},
 	}
 }
 
@@ -39,6 +40,8 @@ func dashboardResource(method, path string) (pluginapi.ManagementResponse, bool)
 		file, contentType = "dashboard.mjs", "text/javascript; charset=utf-8"
 	case dashboardResourcePrefix + "/session.mjs":
 		file, contentType = "session.mjs", "text/javascript; charset=utf-8"
+	case dashboardResourcePrefix + "/settings.mjs":
+		file, contentType = "settings.mjs", "text/javascript; charset=utf-8"
 	default:
 		return pluginapi.ManagementResponse{}, false
 	}

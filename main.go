@@ -105,7 +105,7 @@ import (
 
 const (
 	pluginName    = "codex-quota-scheduler"
-	pluginVersion = "0.2.1"
+	pluginVersion = "0.3.0"
 
 	// providerCodex is the CPA provider key for OpenAI Codex (ChatGPT backend).
 	providerCodex = "codex"
@@ -535,7 +535,7 @@ func pluginRegistration() registration {
 			Author:           "simplez2",
 			GitHubRepository: "https://github.com/simplez2/cpa-codex-quota-scheduler",
 			ConfigFields: []pluginapi.ConfigField{
-				{Name: "scheduler_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"serial", "legacy", "shadow", "enforce"}, Description: "Runtime policy mode. Serial keeps one global active Codex auth while balancing 5h and weekly capacity at committed switch boundaries."},
+				{Name: "scheduler_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"balanced", "serial", "legacy", "shadow", "enforce"}, Description: "Balanced spreads concurrent work by 5h headroom, weekly daily budget and plan capacity. Serial retains one committed primary. Configure either directly in the quota panel."},
 				{Name: "serial_switch_percent", Type: pluginapi.ConfigFieldTypeNumber, Description: "Soft used-percent switch threshold. Drain mode may cross it; hard limits, disallowed windows, and 429 still force failover."},
 				{Name: "serial_handoff_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"threshold_only", "reserve_aware"}, Description: "Account handoff policy. threshold_only follows serial_switch_percent; reserve_aware also hands off before the configured reserve for the active 5h, weekly, or monthly window is consumed."},
 				{Name: "serial_5h_handoff_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"inherit_global", "custom_threshold", "reserve_aware", "429_only"}, Description: "5h-specific handoff policy. Defaults to 429_only: no static, forecast, or cache-age reserve; hard limits, disallowed state, and 429 still trigger handoff. inherit_global uses the global threshold; custom_threshold uses serial_5h_switch_percent; reserve_aware enables the configured reserve and forecast guard."},
@@ -867,6 +867,8 @@ func managementRegistration() pluginapi.ManagementRegistrationResponse {
 	return pluginapi.ManagementRegistrationResponse{
 		Resources: dashboardResources(),
 		Routes: []pluginapi.ManagementRoute{
+			{Method: http.MethodGet, Path: managementRoutePrefix + "/settings", Description: "Read effective runtime settings and defaults without credential contents."},
+			{Method: http.MethodPost, Path: managementRoutePrefix + "/settings/validate", Description: "Validate changed runtime settings before saving through CPA."},
 			{
 				Method:      http.MethodGet,
 				Path:        managementRoutePrefix + "/bans",
@@ -924,6 +926,10 @@ func dispatchManagement(req pluginapi.ManagementRequest) pluginapi.ManagementRes
 	}
 
 	switch {
+	case method == http.MethodGet && matchesManagementPath(req.Path, "/settings"):
+		return jsonManagementResponse(http.StatusOK, currentPanelSettings())
+	case method == http.MethodPost && matchesManagementPath(req.Path, "/settings/validate"):
+		return handleSettingsValidate(req)
 	case method == http.MethodGet && matchesManagementPath(req.Path, "/bans"):
 		return jsonManagementResponse(http.StatusOK, currentBanStatus())
 	case method == http.MethodPost && matchesManagementPath(req.Path, "/unban"):
@@ -1059,8 +1065,8 @@ func handleManagementWarmupRetry(req pluginapi.ManagementRequest) pluginapi.Mana
 		})
 	}
 	removed := schedulerRuntime.clearBlockedWarmupState(authID, all)
-	if removed > 0 {
-		schedulerRuntime.persistBanState()
+	if removed > 0 && !schedulerRuntime.persistBanState() {
+		return managementRecoveryPersistenceError()
 	}
 	return jsonManagementResponse(http.StatusOK, map[string]any{
 		"ok": true, "auth_id": authID, "all": all, "removed": removed,
@@ -1093,8 +1099,8 @@ func handleManagementUnban(req pluginapi.ManagementRequest) pluginapi.Management
 	}
 
 	entry, removed := banStore.clear(authID)
-	if removed {
-		schedulerRuntime.persistAfterBanChange()
+	if removed && !schedulerRuntime.persistBanState() {
+		return managementRecoveryPersistenceError()
 	}
 	if removed {
 		slog.Info("codex-quota-scheduler: manually re-enabled credential",
@@ -1110,8 +1116,8 @@ func handleManagementUnban(req pluginapi.ManagementRequest) pluginapi.Management
 
 func handleManagementUnbanAll() pluginapi.ManagementResponse {
 	removed := banStore.clearAll()
-	if removed > 0 {
-		schedulerRuntime.persistAfterBanChange()
+	if removed > 0 && !schedulerRuntime.persistBanState() {
+		return managementRecoveryPersistenceError()
 	}
 	if removed > 0 {
 		slog.Info("codex-quota-scheduler: manually re-enabled all credentials", "removed", removed)
@@ -1120,6 +1126,14 @@ func handleManagementUnbanAll() pluginapi.ManagementResponse {
 		"ok":      true,
 		"removed": removed,
 		"status":  currentBanStatus(),
+	})
+}
+
+// Recovery has already changed the in-memory state. Never report durable
+// success when the state file cannot be written; clients should re-read status.
+func managementRecoveryPersistenceError() pluginapi.ManagementResponse {
+	return jsonManagementResponse(http.StatusServiceUnavailable, map[string]any{
+		"error": "recovery_persistence_failed", "memory_changed": true,
 	})
 }
 

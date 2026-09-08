@@ -4,9 +4,9 @@
     {
       "id": "codex-quota-scheduler",
       "name": "Codex 额度调度",
-      "description": "Standalone CPA quota scheduler with an integrated 5h/weekly dashboard, native polling, serial balancing, 429 quarantine, and optional warmup.",
+      "description": "Standalone CPA quota control panel with editable scheduling, per-account plans and selection, cooldown recovery, and warmup management.",
       "author": "simplez2",
-      "version": "0.2.1",
+      "version": "0.3.0",
       "repository": "https://github.com/simplez2/cpa-codex-quota-scheduler",
       "homepage": "https://github.com/simplez2/cpa-codex-quota-scheduler",
       "license": "MIT",

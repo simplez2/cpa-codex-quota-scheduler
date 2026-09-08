@@ -111,7 +111,8 @@ type schedulerRuntimeState struct {
 	lastBanClearReason         string
 	lastBanClearAt             time.Time
 
-	pickCounter uint64
+	pickCounter      uint64
+	balancedAccounts map[string]*balancedAccount
 
 	pricing             map[string]modelPricing
 	costSamples         map[string][]float64
@@ -175,6 +176,7 @@ func configureSchedulerRuntime(raw []byte) {
 	schedulerRuntime.quotaPolls = make(map[string]quotaPollState)
 	schedulerRuntime.quotaRunway = quotaRunwayTracker{}
 	schedulerRuntime.quotaNative = make(map[string]quotaSnapshot)
+	schedulerRuntime.balancedAccounts = make(map[string]*balancedAccount)
 	schedulerRuntime.quotas = make(map[string]quotaSnapshot)
 	schedulerRuntime.identities = make(map[string]string)
 	schedulerRuntime.lastRefresh = time.Time{}
@@ -464,6 +466,7 @@ func (s *schedulerRuntimeState) observeUsage(record pluginapi.UsageRecord) {
 		return
 	}
 	s.observeUsageCost(record)
+	s.observeBalancedUsage(record, time.Now())
 	if len(record.ResponseHeaders) == 0 {
 		return
 	}
@@ -726,6 +729,8 @@ func (s *schedulerRuntimeState) schedulerPick(req pluginapi.SchedulerPickRequest
 		var candidates []pacingCandidate
 		if mode == "serial" {
 			returned = s.serialPick(attempt, now)
+		} else if mode == "balanced" {
+			returned = s.balancedPick(attempt, now)
 		} else {
 			var err error
 			legacy, err = s.legacySchedulerPick(attempt, now)
@@ -1345,87 +1350,88 @@ func (s *schedulerRuntimeState) persistBanState() bool {
 }
 
 type runtimeStatus struct {
-	QuotaPolls                    map[string]quotaPollState  `json:"quota_polls,omitempty"`
-	Enabled                       bool                       `json:"enabled"`
-	SchedulerMode                 string                     `json:"scheduler_mode"`
-	SerialSwitchPercent           float64                    `json:"serial_switch_percent"`
-	SerialHandoffMode             string                     `json:"serial_handoff_mode"`
-	Serial5hHandoffMode           string                     `json:"serial_5h_handoff_mode"`
-	Serial5hSwitchPercent         float64                    `json:"serial_5h_switch_percent"`
-	Reserve5hPercent              float64                    `json:"reserve_5h_percent"`
-	DrainWindowHours              float64                    `json:"drain_window_hours"`
-	WarmupModel                   string                     `json:"warmup_model"`
-	SerialSelectionSource         string                     `json:"serial_selection_source"`
-	SerialManualSelection         bool                       `json:"serial_manual_selection"`
-	SerialManualActiveAuthID      string                     `json:"serial_manual_active_auth_id,omitempty"`
-	SerialActiveAuthID            string                     `json:"serial_active_auth_id,omitempty"`
-	SerialSelectedAt              string                     `json:"serial_selected_at,omitempty"`
-	SerialSwitches                uint64                     `json:"serial_switches"`
-	SerialFallbacks               uint64                     `json:"serial_provisional_fallbacks"`
-	SerialFallbackAuth            string                     `json:"serial_provisional_auth_id,omitempty"`
-	SerialMissingSince            string                     `json:"serial_candidate_missing_since,omitempty"`
-	SerialMissingCount            int                        `json:"serial_candidate_missing_confirmations,omitempty"`
-	SerialLastSwitchAt            string                     `json:"serial_last_switch_at,omitempty"`
-	SerialSwitchReason            string                     `json:"serial_last_switch_reason,omitempty"`
-	SerialOverdraftSessions       int                        `json:"serial_overdraft_sessions"`
-	SerialWeeklyRebalancePercent  float64                    `json:"serial_weekly_rebalance_percent"`
-	SerialWeeklyRebalanceMinHold  string                     `json:"serial_weekly_rebalance_min_hold"`
-	SerialWeeklyRebalanceRequired int                        `json:"serial_weekly_rebalance_required_confirmations"`
-	SerialWeeklyRebalance         serialWeeklyRebalanceState `json:"serial_weekly_rebalance"`
-	SerialAllocationPolicy        string                     `json:"serial_allocation_policy"`
-	SerialBudgetRebalancePercent  float64                    `json:"serial_budget_rebalance_percent"`
-	SerialSoftContinuation        bool                       `json:"serial_soft_continuation"`
-	QuotaDefaultPlan              string                     `json:"quota_default_plan"`
-	ConfigGeneration              uint64                     `json:"config_generation"`
-	RuntimeGeneration             uint64                     `json:"runtime_generation"`
-	GenerationManaged             bool                       `json:"generation_managed"`
-	GenerationClaimed             bool                       `json:"generation_claimed"`
-	GenerationActive              bool                       `json:"generation_active"`
-	GenerationReleased            bool                       `json:"generation_released"`
-	GenerationSuperseded          bool                       `json:"generation_superseded"`
-	GenerationObserved            uint64                     `json:"generation_observed"`
-	GenerationOwner               string                     `json:"generation_owner,omitempty"`
-	GenerationClaimedAt           string                     `json:"generation_claimed_at,omitempty"`
-	GenerationReason              string                     `json:"generation_supersede_reason,omitempty"`
-	CPAConfigured                 bool                       `json:"cpa_configured"`
-	WarmupEnabled                 bool                       `json:"warmup_enabled"`
-	WarmupTraffic                 warmupTrafficStatus        `json:"warmup_traffic"`
-	WarmupExecutionMode           string                     `json:"warmup_execution_mode"`
-	WarmupCandidates              int                        `json:"warmup_candidates"`
-	WarmupSkippedBanned           int                        `json:"warmup_skipped_banned"`
-	WarmupSkippedStale            int                        `json:"warmup_skipped_stale"`
-	WarmupSkippedIneligible       int                        `json:"warmup_skipped_ineligible"`
-	WarmupSkippedNotNeeded        int                        `json:"warmup_skipped_not_unstarted"`
-	WarmupAuthSource              string                     `json:"warmup_auth_source,omitempty"`
-	WarmupAuthCheckedAt           string                     `json:"warmup_auth_checked_at,omitempty"`
-	WarmupAuthFilesSeen           int                        `json:"warmup_auth_files_seen"`
-	WarmupAuthEligible            int                        `json:"warmup_auth_eligible"`
-	WarmupAuthRejected            map[string]int             `json:"warmup_auth_rejected,omitempty"`
-	WarmupAuthLastError           string                     `json:"warmup_auth_last_error,omitempty"`
-	QuotaRefreshTargets           int                        `json:"quota_refresh_targets"`
-	QuotaRefreshRequests          uint64                     `json:"quota_refresh_requests"`
-	QuotaRefreshRequestedAt       string                     `json:"quota_refresh_requested_at,omitempty"`
-	QuotaRefreshError             string                     `json:"quota_refresh_error,omitempty"`
-	BanResetPending               int                        `json:"ban_reset_pending_confirmations"`
-	BanResetEvents                uint64                     `json:"ban_reset_confirmation_events"`
-	BanExternalClears             uint64                     `json:"ban_external_reset_clears"`
-	LastBanClearReason            string                     `json:"last_ban_clear_reason,omitempty"`
-	LastBanClearAt                string                     `json:"last_ban_clear_at,omitempty"`
-	Refreshes                     int                        `json:"refreshes"`
-	LastRefresh                   string                     `json:"last_refresh,omitempty"`
-	LastError                     string                     `json:"last_error,omitempty"`
-	FreshSnapshots                int                        `json:"fresh_snapshots"`
-	WindowOrder                   []string                   `json:"window_order"`
-	PricingModels                 int                        `json:"pricing_models"`
-	CostProfiles                  []runtimeCostProfile       `json:"cost_profiles"`
-	Pacing                        []runtimePacingStatus      `json:"pacing,omitempty"`
-	StickyBindings                int                        `json:"sticky_bindings"`
-	SessionSwitches               uint64                     `json:"session_switches"`
-	ShadowDisagreements           uint64                     `json:"shadow_disagreements"`
-	Quarantine                    runtimeQuarantineStatus    `json:"quarantine"`
-	RecentDecisions               []schedulerDecisionAudit   `json:"recent_decisions,omitempty"`
-	Snapshots                     []runtimeQuotaStatus       `json:"snapshots,omitempty"`
-	Warmups                       []runtimeWarmupStatus      `json:"warmups,omitempty"`
+	BalancedAccounts              map[string]balancedAccountStatus `json:"balanced_accounts,omitempty"`
+	QuotaPolls                    map[string]quotaPollState        `json:"quota_polls,omitempty"`
+	Enabled                       bool                             `json:"enabled"`
+	SchedulerMode                 string                           `json:"scheduler_mode"`
+	SerialSwitchPercent           float64                          `json:"serial_switch_percent"`
+	SerialHandoffMode             string                           `json:"serial_handoff_mode"`
+	Serial5hHandoffMode           string                           `json:"serial_5h_handoff_mode"`
+	Serial5hSwitchPercent         float64                          `json:"serial_5h_switch_percent"`
+	Reserve5hPercent              float64                          `json:"reserve_5h_percent"`
+	DrainWindowHours              float64                          `json:"drain_window_hours"`
+	WarmupModel                   string                           `json:"warmup_model"`
+	SerialSelectionSource         string                           `json:"serial_selection_source"`
+	SerialManualSelection         bool                             `json:"serial_manual_selection"`
+	SerialManualActiveAuthID      string                           `json:"serial_manual_active_auth_id,omitempty"`
+	SerialActiveAuthID            string                           `json:"serial_active_auth_id,omitempty"`
+	SerialSelectedAt              string                           `json:"serial_selected_at,omitempty"`
+	SerialSwitches                uint64                           `json:"serial_switches"`
+	SerialFallbacks               uint64                           `json:"serial_provisional_fallbacks"`
+	SerialFallbackAuth            string                           `json:"serial_provisional_auth_id,omitempty"`
+	SerialMissingSince            string                           `json:"serial_candidate_missing_since,omitempty"`
+	SerialMissingCount            int                              `json:"serial_candidate_missing_confirmations,omitempty"`
+	SerialLastSwitchAt            string                           `json:"serial_last_switch_at,omitempty"`
+	SerialSwitchReason            string                           `json:"serial_last_switch_reason,omitempty"`
+	SerialOverdraftSessions       int                              `json:"serial_overdraft_sessions"`
+	SerialWeeklyRebalancePercent  float64                          `json:"serial_weekly_rebalance_percent"`
+	SerialWeeklyRebalanceMinHold  string                           `json:"serial_weekly_rebalance_min_hold"`
+	SerialWeeklyRebalanceRequired int                              `json:"serial_weekly_rebalance_required_confirmations"`
+	SerialWeeklyRebalance         serialWeeklyRebalanceState       `json:"serial_weekly_rebalance"`
+	SerialAllocationPolicy        string                           `json:"serial_allocation_policy"`
+	SerialBudgetRebalancePercent  float64                          `json:"serial_budget_rebalance_percent"`
+	SerialSoftContinuation        bool                             `json:"serial_soft_continuation"`
+	QuotaDefaultPlan              string                           `json:"quota_default_plan"`
+	ConfigGeneration              uint64                           `json:"config_generation"`
+	RuntimeGeneration             uint64                           `json:"runtime_generation"`
+	GenerationManaged             bool                             `json:"generation_managed"`
+	GenerationClaimed             bool                             `json:"generation_claimed"`
+	GenerationActive              bool                             `json:"generation_active"`
+	GenerationReleased            bool                             `json:"generation_released"`
+	GenerationSuperseded          bool                             `json:"generation_superseded"`
+	GenerationObserved            uint64                           `json:"generation_observed"`
+	GenerationOwner               string                           `json:"generation_owner,omitempty"`
+	GenerationClaimedAt           string                           `json:"generation_claimed_at,omitempty"`
+	GenerationReason              string                           `json:"generation_supersede_reason,omitempty"`
+	CPAConfigured                 bool                             `json:"cpa_configured"`
+	WarmupEnabled                 bool                             `json:"warmup_enabled"`
+	WarmupTraffic                 warmupTrafficStatus              `json:"warmup_traffic"`
+	WarmupExecutionMode           string                           `json:"warmup_execution_mode"`
+	WarmupCandidates              int                              `json:"warmup_candidates"`
+	WarmupSkippedBanned           int                              `json:"warmup_skipped_banned"`
+	WarmupSkippedStale            int                              `json:"warmup_skipped_stale"`
+	WarmupSkippedIneligible       int                              `json:"warmup_skipped_ineligible"`
+	WarmupSkippedNotNeeded        int                              `json:"warmup_skipped_not_unstarted"`
+	WarmupAuthSource              string                           `json:"warmup_auth_source,omitempty"`
+	WarmupAuthCheckedAt           string                           `json:"warmup_auth_checked_at,omitempty"`
+	WarmupAuthFilesSeen           int                              `json:"warmup_auth_files_seen"`
+	WarmupAuthEligible            int                              `json:"warmup_auth_eligible"`
+	WarmupAuthRejected            map[string]int                   `json:"warmup_auth_rejected,omitempty"`
+	WarmupAuthLastError           string                           `json:"warmup_auth_last_error,omitempty"`
+	QuotaRefreshTargets           int                              `json:"quota_refresh_targets"`
+	QuotaRefreshRequests          uint64                           `json:"quota_refresh_requests"`
+	QuotaRefreshRequestedAt       string                           `json:"quota_refresh_requested_at,omitempty"`
+	QuotaRefreshError             string                           `json:"quota_refresh_error,omitempty"`
+	BanResetPending               int                              `json:"ban_reset_pending_confirmations"`
+	BanResetEvents                uint64                           `json:"ban_reset_confirmation_events"`
+	BanExternalClears             uint64                           `json:"ban_external_reset_clears"`
+	LastBanClearReason            string                           `json:"last_ban_clear_reason,omitempty"`
+	LastBanClearAt                string                           `json:"last_ban_clear_at,omitempty"`
+	Refreshes                     int                              `json:"refreshes"`
+	LastRefresh                   string                           `json:"last_refresh,omitempty"`
+	LastError                     string                           `json:"last_error,omitempty"`
+	FreshSnapshots                int                              `json:"fresh_snapshots"`
+	WindowOrder                   []string                         `json:"window_order"`
+	PricingModels                 int                              `json:"pricing_models"`
+	CostProfiles                  []runtimeCostProfile             `json:"cost_profiles"`
+	Pacing                        []runtimePacingStatus            `json:"pacing,omitempty"`
+	StickyBindings                int                              `json:"sticky_bindings"`
+	SessionSwitches               uint64                           `json:"session_switches"`
+	ShadowDisagreements           uint64                           `json:"shadow_disagreements"`
+	Quarantine                    runtimeQuarantineStatus          `json:"quarantine"`
+	RecentDecisions               []schedulerDecisionAudit         `json:"recent_decisions,omitempty"`
+	Snapshots                     []runtimeQuotaStatus             `json:"snapshots,omitempty"`
+	Warmups                       []runtimeWarmupStatus            `json:"warmups,omitempty"`
 }
 
 type runtimeQuotaStatus struct {
@@ -1635,6 +1641,7 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 	quotaRefreshRequests := s.quotaRefreshRequests
 	quotaRefreshRequestedAt := s.quotaRefreshRequestedAt
 	quotaRefreshLastError := s.quotaRefreshLastError
+	balancedAccounts := s.balancedStatusLocked(time.Now())
 	banResetEvents := s.banResetConfirmationEvents
 	banExternalClears := s.banExternalResetClears
 	lastBanClearReason := s.lastBanClearReason
@@ -1848,6 +1855,7 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 	}
 
 	out := runtimeStatus{
+		BalancedAccounts:              balancedAccounts,
 		Enabled:                       cfg.Enabled,
 		SchedulerMode:                 cfg.SchedulerMode,
 		SerialSwitchPercent:           cfg.SerialSwitchPercent,

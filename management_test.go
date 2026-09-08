@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"net/http"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -11,15 +12,24 @@ import (
 
 func withWarmupManagementState(t *testing.T, entries map[string]warmupEntry) {
 	t.Helper()
+	fixture := newManagedRuntimeForTest(t, filepath.Join(t.TempDir(), "state.json"))
+	claimManagedRuntimeForTest(t, fixture)
 	schedulerRuntime.mu.Lock()
 	oldCfg := schedulerRuntime.cfg
-	schedulerRuntime.cfg.StatePath = ""
+	schedulerRuntime.cfg = fixture.cfg
 	schedulerRuntime.mu.Unlock()
+	schedulerRuntime.generationMu.Lock()
+	oldGeneration := schedulerRuntime.generation
+	schedulerRuntime.generation = fixture.generation
+	schedulerRuntime.generationMu.Unlock()
 	schedulerRuntime.warmupMu.Lock()
 	oldWarmups := schedulerRuntime.warmups
 	schedulerRuntime.warmups = entries
 	schedulerRuntime.warmupMu.Unlock()
 	t.Cleanup(func() {
+		schedulerRuntime.generationMu.Lock()
+		schedulerRuntime.generation = oldGeneration
+		schedulerRuntime.generationMu.Unlock()
 		schedulerRuntime.warmupMu.Lock()
 		schedulerRuntime.warmups = oldWarmups
 		schedulerRuntime.warmupMu.Unlock()
@@ -27,6 +37,25 @@ func withWarmupManagementState(t *testing.T, entries map[string]warmupEntry) {
 		schedulerRuntime.cfg = oldCfg
 		schedulerRuntime.mu.Unlock()
 	})
+}
+
+func TestRecoveryRoutesReportPersistenceFailureAfterMemoryChange(t *testing.T) {
+	for _, route := range []string{"unban", "unban-all", "warmup-retry"} {
+		t.Run(route, func(t *testing.T) {
+			resetBanStoreForTest()
+			defer resetBanStoreForTest()
+			withWarmupManagementState(t, map[string]warmupEntry{"acct|5h": {AuthID: "acct", Window: "5h", Blocked: true}})
+			banStore.set("acct", banEntry{ResetAt: time.Now().Add(time.Hour), Window: "weekly"})
+			schedulerRuntime.mu.Lock()
+			schedulerRuntime.cfg.StatePath = t.TempDir() // Rename onto a directory must fail on every OS.
+			schedulerRuntime.mu.Unlock()
+			response := dispatchManagement(pluginapi.ManagementRequest{Method: http.MethodPost, Path: managementRoutePrefix + "/" + route, Body: []byte(`{"auth_id":"acct"}`)})
+			body := managementResponseJSON(t, response)
+			if response.StatusCode != http.StatusServiceUnavailable || body["error"] != "recovery_persistence_failed" || body["memory_changed"] != true {
+				t.Fatalf("false durable success: %d %v", response.StatusCode, body)
+			}
+		})
+	}
 }
 
 func managementResponseJSON(t *testing.T, response pluginapi.ManagementResponse) map[string]any {

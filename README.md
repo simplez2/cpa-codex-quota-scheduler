@@ -1,8 +1,8 @@
 # Codex Quota Scheduler
 
-Standalone CPA plugin for serial Codex account selection, native quota polling,
+Standalone CPA plugin for balanced concurrent or serial Codex account selection, native quota polling,
 5h/weekly/monthly windows, persistent 429 quarantine and optional warmup.
-Source version: **0.2.1**. Local builds are not a published release.
+Source version: **0.3.0**. Local builds are not a published release.
 
 ## CPA dashboard
 
@@ -11,7 +11,29 @@ Codex 额度调度**. The plugin management list uses the same display name and 
 stable ID `codex-quota-scheduler`. The dashboard shows the current account,
 5h/weekly remaining quota and resets, daily weekly budget, freshness and warmup
 records. Its 15-second refresh reads the existing cache without upstream or
-model requests. It does not change scheduling or enable warmup.
+model requests. Opening or refreshing the panel does not change settings.
+
+Daily operations are available directly in this panel; no JSON/YAML editor is
+needed after installation:
+
+- **账号与额度**: choose a current account, restore automatic selection, and
+  clear one or all local cooldowns with confirmation.
+- **调配设置**: edit switching policy, weekly budgeting and default/per-account
+  plans, including **均衡并发** (`balanced`) for simultaneous account use. The
+  default 5h policy remains zero reserve and hard-limit/429 handoff.
+- **预热管理**: enable/disable warmup, select its model, set spacing and daily
+  limits, view cycle confirmation, and unblock failed retries. Unblocking does
+  not erase confirmed cycles or bypass cooldowns and budgets.
+- **连接与高级**: edit polling, cache freshness, recovery timing, CPA connection
+  paths and advanced scheduling parameters using labeled controls.
+
+One draft survives tab switches and quota refreshes. **保存并应用** validates the
+complete resulting settings, PATCHes only edited fields through CPA, then checks
+both saved config and effective runtime values. **放弃并重新读取** discards the
+draft. A pre-save comparison detects changes from other pages; CPA has no atomic
+compare-and-swap API, so avoid simultaneous edits to the same field. Ambiguous
+writes are read back rather than automatically resubmitted. Plugin installation
+and host-level enable/disable remain in CPA's plugin list.
 
 The standalone resource entry is `/v0/resource/plugins/codex-quota-scheduler/open`.
 It serves static assets only; quota data remains behind CPA management
@@ -20,7 +42,7 @@ and path match this server. Otherwise it asks for a management key, held in
 page memory only. Keys never appear in links or public resources. Both current
 encrypted and scoped CPA storage formats are supported. No sidecar is needed.
 
-UI authentication regressions: `node --test web/session.test.mjs`.
+UI authentication and settings regressions: `node --test web/*.test.mjs`.
 Linux release assets use the Debian 12 glibc baseline for CPA compatibility.
 
 ## Dependencies
@@ -54,6 +76,13 @@ Retain state.json and generation files to preserve bans and serial history.
 - The active account uses refresh_interval (30s); standby accounts use
   quota_refresh_cooldown (2m). Up to quota_refresh_batch (8) queries execute
   sequentially per tick, active first and oldest attempts next.
+- In balanced mode, recently used healthy accounts use a one-minute cadence
+  with the default settings; idle accounts use two minutes, and near-depleted
+  accounts return to 30 seconds. Overlapping refresh calls are coalesced.
+- Recent response quota headers can defer a redundant query, but cannot renew
+  the native snapshot. A full probe remains due within the standby interval or
+  half the freshness limit. Errors, near-exhaustion, and resets retain their
+  independent probe/backoff rules.
 - Backoff is per account/auth index and persists across reloads. Failures double
   the interval up to 30 minutes; a longer Retry-After wins. Authentication and
   permission failures wait at least 30 minutes.
@@ -69,6 +98,31 @@ The former external pricing and window-cost calibration are no longer available;
 serial remains the default and pacing retains built-in cost estimates.
 
 ## Routing and recovery
+
+Select **均衡并发** in the panel to spread requests across accounts. This does
+not limit the pool to one active request or one account. Equivalent accounts
+receive even shares; unequal plans and budgets receive weighted shares. Existing
+installations keep their configured mode until it is changed in the panel.
+
+Balanced mode first excludes hard-limited/quarantined accounts and prefers
+fresh usable accounts outside the weekly reserve. It then uses smooth weighted
+work accounting, with weight approximately
+`plan multiplier × min(5h remaining fraction, weekly daily budget / (100/7))`.
+Each pace factor has a 0.01 floor, which changes relative share without reserving
+5h capacity. The weekly reserve becomes spendable when the entire eligible
+pool is inside it. Account-specific pins remain respected.
+
+Every pick immediately debits estimated work under one lock so concurrent
+requests cannot all choose a stale best score. Completion token costs correct
+that estimate with bounded debt; cost estimates never mark quota exhausted.
+The host ABI has no shared selection/completion request ID, so outstanding work
+is labeled an estimate and unmatched/expired completions cannot debit new work.
+Short-lived fairness history resets on reload; quota/bans/warmup history stays
+persisted. Balanced mode postpones optional warmup while foreground requests
+are active and for a one-minute quiet interval. These controls reduce redundant
+traffic and bursts; they do not guarantee avoidance of upstream risk controls.
+
+The following settings apply to the retained **串行调配** mode:
 
 Traffic stays on one committed account. Default `serial_allocation_policy:
 sustainable` first respects hard limits and quarantine, then

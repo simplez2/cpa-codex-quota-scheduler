@@ -56,7 +56,7 @@ button:disabled {
   opacity:.55;
   cursor:wait;
 }
-button:focus-visible,input:focus-visible {
+button:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visible {
   outline:2px solid var(--accent);
   outline-offset:3px;
 }
@@ -484,4 +484,79 @@ footer {
   .primary h2 {
     font-size:15px;
   }
+}
+
+/* Editing stays in the scheduler panel, with one draft across every view. */
+.view-nav { display:flex; gap:6px; padding:5px; background:var(--track); border-radius:10px; margin-bottom:24px; overflow-x:auto; }
+.view-nav button { flex:1; border-color:transparent; background:transparent; white-space:nowrap; font-weight:500; }
+.view-nav button[aria-pressed=true] { background:var(--surface); color:var(--accent); box-shadow:0 1px 3px #00000010; }
+.feedback { padding:12px 16px; border:1px solid var(--danger); color:var(--danger); border-radius:8px; margin-bottom:20px; overflow-wrap:anywhere; background:var(--surface); }
+.feedback[data-kind=success] { border-color:var(--ok); color:var(--ok); }
+.settings-intro { margin:8px 0 20px; }
+.settings-intro h2 { font-size:20px; margin-bottom:6px; }
+.settings-fields { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:0 32px; padding:8px 24px; background:var(--surface); border:1px solid var(--line); border-radius:10px; }
+.setting-field { min-width:0; padding:20px 0; border-bottom:1px solid var(--line); }
+.setting-label { display:block; margin-bottom:10px; font-size:14px; font-weight:600; }
+.setting-field input:not([type=checkbox]),.setting-field select { display:block; width:100%; padding:10px 12px; border:1px solid var(--line); color:var(--ink); background:var(--canvas); border-radius:7px; font:inherit; min-width:0; }
+.setting-field input[type=checkbox] { appearance:none; width:40px; height:22px; border-radius:20px; background:var(--track); border:1px solid var(--line); margin:0; cursor:pointer; position:relative; }
+.setting-field input[type=checkbox]::before { content:''; position:absolute; width:16px; height:16px; left:2px; top:2px; border-radius:50%; background:var(--muted); transition:transform .15s; }
+.setting-field input[type=checkbox]:checked { background:var(--accent); border-color:var(--accent); }
+.setting-field input[type=checkbox]:checked::before { transform:translateX(18px); background:var(--surface); }
+@media(prefers-reduced-motion:reduce) { .setting-field input[type=checkbox]::before { transition:none; } }
+.setting-field:has(input[type=checkbox]) { display:grid; grid-template-columns:1fr auto; align-content:start; column-gap:18px; }
+.setting-field:has(input[type=checkbox]) .field-help { grid-column:1 / -1; }
+.field-help { font-size:12px; line-height:1.6; margin-top:8px; }
+.field-error { color:var(--danger); font-size:12px; margin-top:6px; }
+[aria-invalid=true] { border-color:var(--danger)!important; }
+.duration-input { display:flex; gap:8px; }
+.duration-input input { flex:1; }
+.duration-input select { width:88px; }
+.setting-field[data-field=quota_account_plans] { grid-column:1 / -1; }
+.plan-row { padding:12px 0; border-bottom:1px solid var(--line); }
+.plan-row:last-child { border-bottom:0; }
+.plan-row label { display:grid; grid-template-columns:minmax(0,1fr) 240px; align-items:center; gap:24px; overflow-wrap:anywhere; font:12px "Cascadia Code",Consolas,"Microsoft YaHei",monospace; }
+.plan-row select { font:14px "Segoe UI","Microsoft YaHei",sans-serif; }
+.settings-details { border:1px solid var(--line); border-radius:10px; margin-top:20px; background:var(--surface); padding:18px 22px; }
+.settings-details summary { cursor:pointer; font-size:15px; font-weight:600; }
+.settings-details>p { font-size:12px; margin:10px 0 18px; }
+.settings-details .settings-fields { border:0; padding:0; }
+.warmup-records { margin-top:20px; }
+.warmup-records .warmups { max-height:none; }
+.save-bar { position:sticky; bottom:14px; display:flex; justify-content:space-between; align-items:center; gap:20px; padding:16px 20px; margin-top:24px; border:1px solid var(--accent); border-radius:10px; background:var(--surface); box-shadow:0 8px 30px #00000016; z-index:3; }
+.save-bar p { font-size:12px; margin-top:4px; }
+.primary-button { color:var(--surface); background:var(--accent); border-color:var(--accent); }
+.primary-button:hover { color:var(--surface); filter:brightness(.95); }
+.compact { font-size:12px; padding:6px 9px; }
+.account-actions { min-width:130px; }
+.account-actions button { display:block; margin-bottom:7px; width:100%; }
+.subtle { font-size:12px; margin-top:12px; }
+dialog { color:var(--ink); background:var(--surface); border:1px solid var(--line); border-radius:12px; width:min(480px,calc(100% - 32px)); padding:24px; }
+dialog::backdrop { background:#00000055; }
+dialog p { margin:16px 0 24px; }
+.dialog-actions { display:flex; justify-content:flex-end; gap:10px; }
+:root[data-embedded=true] .page-header>.toolbar { margin-top:42px; }
+@media(max-width:760px) {
+  .settings-fields { grid-template-columns:1fr; padding:4px 18px; }
+  .plan-row label { grid-template-columns:1fr; gap:10px; }
+  .save-bar { flex-wrap:wrap; bottom:8px; padding:14px; }
+  .save-bar .toolbar { width:100%; justify-content:flex-end; }
+}
+@media(max-width:640px) {
+  .view-nav { gap:0; padding:3px; }
+  .view-nav button { padding:9px 8px; font-size:12px; }
+  .accounts .table-scroll { overflow:visible; }
+  .accounts table,.accounts tbody { display:block; }
+  .accounts thead { position:absolute; width:1px; height:1px; padding:0; margin:-1px; clip:rect(0,0,0,0); overflow:hidden; }
+  .accounts tr { display:grid; grid-template-columns:1fr 1fr; border-top:1px solid var(--line); }
+  .accounts td { display:block; min-width:0; border:0; padding:12px 16px; }
+  .accounts td:first-child,.accounts td:last-child { grid-column:1 / -1; }
+  .accounts td:nth-child(2)::before { content:'5h 剩余'; }
+  .accounts td:nth-child(3)::before { content:'周剩余'; }
+  .accounts td:nth-child(4)::before { content:'周日均预算'; }
+  .accounts td:nth-child(5)::before { content:'最近查询'; }
+  .accounts td::before { display:block; color:var(--muted); font-size:11px; margin-bottom:7px; }
+  .account-actions { display:flex!important; gap:8px; }
+  .account-actions button { width:auto; }
+  .account-id { max-width:none; }
+  .warmup-records .section-header { align-items:flex-start; flex-direction:column; }
 }

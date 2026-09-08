@@ -546,6 +546,8 @@ func parseDuration(raw string) (time.Duration, bool) {
 
 func normalizeSchedulerMode(raw string) string {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "balanced":
+		return "balanced"
 	case "serial", "fill-first", "fill_first":
 		return "serial"
 	case "legacy":

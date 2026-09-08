@@ -6,6 +6,8 @@ plugins:
       enabled: true
       priority: 2000
       scheduler_mode: serial
+      # Set balanced for concurrent, quota-weighted distribution across accounts.
+      # This can also be selected in the Codex 额度调度 panel without editing YAML.
       serial_allocation_policy: sustainable
       # Relative improvement in weekly budget per day; two fresh observations and hold still apply.
       serial_budget_rebalance_percent: 20

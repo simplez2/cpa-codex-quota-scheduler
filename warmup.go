@@ -144,8 +144,24 @@ func (s *schedulerRuntimeState) warmupStartupReady(now time.Time) bool {
 func (s *schedulerRuntimeState) scheduleWarmup(parent context.Context, skipAuthIDs map[string]struct{}) {
 	s.mu.RLock()
 	cfg := s.cfg
+	foregroundBusy := false
+	if cfg.SchedulerMode == "balanced" {
+		now := time.Now()
+		for _, account := range s.balancedAccounts {
+			if now.Sub(account.LastPicked) < time.Minute {
+				foregroundBusy = true
+				break
+			}
+			for _, pending := range account.Pending {
+				if now.Sub(pending.At) < balancedPendingTTL {
+					foregroundBusy = true
+					break
+				}
+			}
+		}
+	}
 	s.mu.RUnlock()
-	if !cfg.Enabled || !cfg.WarmupEnabled || strings.TrimSpace(cfg.StatePath) == "" || parent.Err() != nil {
+	if !cfg.Enabled || !cfg.WarmupEnabled || foregroundBusy || strings.TrimSpace(cfg.StatePath) == "" || parent.Err() != nil {
 		return
 	}
 	if !s.generationOwnerActive() {

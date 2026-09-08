@@ -197,7 +197,12 @@ func quotaPollDelay(base time.Duration, failures int) time.Duration {
 }
 
 func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
-	s.quotaRefreshMu.Lock()
+	// Coalesce overlapping background ticks and explicit refresh requests.
+	// Waiting on the mutex would queue redundant inventory reads after a slow
+	// call. The current owner publishes the same shared cache for every reader.
+	if !s.quotaRefreshMu.TryLock() {
+		return
+	}
 	defer s.quotaRefreshMu.Unlock()
 	if ctx.Err() != nil || !s.generationCanRefresh() {
 		return
@@ -259,6 +264,9 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 	s.quotas = next
 	s.identities = identities
 	activeID := s.serialActiveAuthID
+	if cfg.SchedulerMode == "balanced" {
+		activeID = ""
+	}
 	s.mu.Unlock()
 	// Quota polling is read-only; generation ownership is claimed only after a
 	// valid inventory, keeping model warmups fenced by the existing owner lease.
@@ -298,12 +306,15 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 			s.mu.Unlock()
 			continue
 		}
+		interval := s.quotaPollIntervalLocked(id, activeID, now)
+		if deferUntil := quotaHeaderCacheDeadline(s.quotas[id], poll, cfg, interval, now); deferUntil.After(now) {
+			poll.NextAt = deferUntil
+			s.quotaPolls[id] = poll
+			s.mu.Unlock()
+			continue
+		}
 		poll.AuthIndex = auth.AuthIndex
 		poll.AttemptedAt = now
-		interval := cfg.QuotaRefreshCooldown
-		if id == activeID {
-			interval = cfg.RefreshInterval
-		}
 		poll.NextAt = now.Add(interval)
 		// A reset timestamp schedules an observation; it never proves renewed quota.
 		for _, window := range s.quotas[id].Windows {
