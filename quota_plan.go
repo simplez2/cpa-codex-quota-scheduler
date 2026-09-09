@@ -55,7 +55,7 @@ func resolvedQuotaPlan(cfg pluginConfig, id string, snapshot quotaSnapshot, now 
 	if cfg.QuotaAccountPlans[id] != "" {
 		return plan, weight, "account_override"
 	}
-	if snapshot.Plan.fresh(now, cfg.StaleAfter) {
+	if snapshot.Plan.fresh(now, cfg.StaleAfter) || (cfg.QuotaProbeOnDemand && snapshot.Plan.fresh(now, 7*24*time.Hour)) {
 		if detected, ok := nativeQuotaPlan(snapshot.Plan.Type); ok {
 			return detected, quotaPlanWeight(detected), snapshot.Plan.Source
 		}

@@ -44,6 +44,30 @@ function resetText(window) {
   if (reset <= new Date()) return '已到重置时间，等待查询确认';
   return dateText(window.reset_at) + ' 重置';
 }
+function countdown(value, prefix='剩余 ') {
+  const node=element('span','subtext'); node.dataset.countdown=value; node.dataset.prefix=prefix; updateCountdown(node); return node;
+}
+function updateCountdown(node) {
+  const target=timestamp(node.dataset.countdown); if(!target){node.textContent='等待下一轮校验';return;}
+  let seconds=Math.max(0,Math.ceil((target.getTime()-Date.now())/1000));
+  if(!seconds){node.textContent='已到时间，等待调度校验';return;}
+  const days=Math.floor(seconds/86400); seconds%=86400; const hours=Math.floor(seconds/3600); seconds%=3600;
+  node.textContent=node.dataset.prefix+(days?days+'天 ':'')+String(hours).padStart(2,'0')+':'+String(Math.floor(seconds/60)).padStart(2,'0')+':'+String(seconds%60).padStart(2,'0');
+}
+function warmupWait(account, cell) {
+ const five=(account.windows||[]).find(w=>w.window==='5h');
+ if(!five || (five.cycle_started && !five.placeholder_reset))return;
+ if(!state.warmup_enabled){cell.append(element('span','subtext','预热已关闭；实际调用可启动周期'));return;}
+ const entry=(state.warmups||[]).find(w=>w.auth_id===account.auth_id && w.window==='5h');
+ if(entry?.blocked){cell.append(element('span','subtext','预热暂停：需在预热管理允许重试'));return;}
+ if(entry && timestamp(entry.suppress_until)>new Date()) {cell.append(element('span','subtext',entry.error?'预热失败或结果待确认':'已有周期记录，抑制重复预热'),countdown(entry.suppress_until,'最早重新校验 '));return;}
+ const traffic=state.warmup_traffic||{};
+ const reasons={min_interval:'等待全局预热间隔',daily_budget:'等待24小时预热预算恢复',failure_backoff:'等待预热失败退避',uncertain_outcome:'等待前次预热结果确认',manual_retry_required:'预热暂停：需人工确认'};
+ if(traffic.hold_reason){cell.append(element('span','subtext',reasons[traffic.hold_reason]||traffic.hold_reason));if(timestamp(traffic.next_allowed_at))cell.append(countdown(traffic.next_allowed_at,'最早准入 '));return;}
+ cell.append(element('span','subtext','等待额度校验和预热调度；尚未确认启动'));
+ const poll=state.quota_polls?.[account.auth_id];
+ if(poll?.AttemptedAt && !account.fresh){const at=timestamp(poll.AttemptedAt);if(at)cell.append(countdown(new Date(at.getTime()+15*60000).toISOString(),'预热校验最早 '));}
+}
 function pct(value) {
   return typeof value === 'number' && Number.isFinite(value) ? Math.max(0,Math.min(100,value)).toFixed(1).replace(/\.0$/,'') + '%' : '未知';
 }
@@ -110,6 +134,7 @@ function quotaCell(window, weekly) {
   fill.style.width = typeof window.remaining_percent === 'number' ? Math.max(0,Math.min(100,window.remaining_percent)) + '%' : '0%';
   bar.append(fill);
   cell.append(bar,element('div','subtext',resetText(window)));
+  if(window.cycle_started && !window.placeholder_reset && timestamp(window.reset_at))cell.append(countdown(window.reset_at));
   if (window.limit_reached || !window.allowed) cell.append(element('div','subtext error','上游限制中'));
   return cell;
 }
@@ -137,7 +162,7 @@ function renderAccounts() {
     info.append(meta);
     const capacity = (account.five_hour_capacity_weight_prior || 1)+'×';
     const planStatus = automatic ? '自动识别 · 容量参考 '+capacity : account.plan_source==='account_override' ? '手动覆盖 · 容量参考 '+capacity : '默认档位 '+configuredPlan+' · 容量参考 '+capacity;
-    info.append(element('span','subtext',planStatus));
+    info.append(element('span','subtext',planStatus+(automatic&&!account.upstream_plan_fresh?' · 缓存识别':'')));
     if (upstreamPlan && !automatic) info.append(element('span','subtext','上游：'+upstreamPlan+(account.upstream_plan_fresh?'':'（缓存已过期）')));
     if (ban) info.append(element('span','subtext','冷却到期 ' + dateText(ban.reset_at)));
     const pollError=state.quota_polls?.[account.auth_id]?.Error || '';
@@ -152,10 +177,11 @@ function renderAccounts() {
       const labels={not_allowed:'上游暂不可用',limit_reached:'额度已耗尽',serial_threshold:'达到设定阈值',quota_unknown:'等待额度确认'};
       info.append(element('span','subtext',labels[account.reason]||account.reason));
     }
-    row.append(info,quotaCell(account.windows?.find(w => w.window === '5h'),false),quotaCell(account.windows?.find(w => w.window === 'weekly'),true));
+    const fiveCell=quotaCell(account.windows?.find(w => w.window === '5h'),false); warmupWait(account,fiveCell);
+    row.append(info,fiveCell,quotaCell(account.windows?.find(w => w.window === 'weekly'),true));
     const budget = element('td');
     const amount = account.weekly_budget_known && Number.isFinite(account.weekly_budget_percent_per_day) ? account.weekly_budget_percent_per_day.toFixed(1) + '% / 天' : '未知';
-    budget.append(element('strong','',amount),element('span','subtext',account.fresh ? '截至下次周重置' : '快照已过期'));
+    budget.append(element('strong','',amount),element('span','subtext',account.weekly_budget_known ? (account.fresh ? '截至下次周重置' : '缓存估算 · 截至下次周重置') : '缺少有效周窗口或重置时间'));
     row.append(budget);
     const balanced=state.balanced_accounts?.[account.auth_id];
     if(state.scheduler_mode==='balanced')budget.append(element('span','subtext','已分配 '+(balanced?.picks||0)+' 次 · 在途估计 '+(balanced?.pending_estimate||0)));
@@ -206,6 +232,7 @@ function renderWarmups() {
     const outcomeLabel = warmup.state==='failed' && warmup.dispatch_state==='not_sent' ? '未发送 · 等待重试' : warmup.state==='failed' && warmup.dispatch_state==='uncertain' ? '结果未知 · 暂停重复请求' : warmupStates[warmup.state] || warmup.state;
     line.append(element('span','warmup-id',warmup.auth_id + ' · ' + warmup.window),element('span','badge' + (warmup.blocked ? ' warning' : ''),outcomeLabel));
     item.append(line,element('div','subtext','记录于 ' + dateText(warmup.outcome_at || warmup.activated_at || warmup.completed_at || warmup.attempted_at)));
+    if (timestamp(warmup.suppress_until)) item.append(countdown(warmup.suppress_until,'重新校验倒计时 '));
     if (timestamp(warmup.suppress_until)) item.append(element('div','subtext',(warmup.dispatch_state==='not_sent'?'最早重试时间 ':'抑制重复预热至 ') + dateText(warmup.suppress_until)));
     if (warmup.error) {
       const errors={auth_binding_stale:'CPA 中的账号当前不可用，请求尚未发送。',auth_binding_changed:'CPA 账号绑定已变更，等待最新额度确认。',cpa_inventory_unavailable:'CPA 账号列表暂时不可用，请求尚未发送。',management_key_unavailable:'无法读取 CPA 管理密钥，请求尚未发送。',timeout:'请求超时，等待确认是否已执行。',warmup_failed:'旧版未保存具体原因，需核对 CPA 日志。'};
@@ -335,3 +362,5 @@ document.addEventListener('visibilitychange',()=>{clearTimeout(timer); if(!docum
 matchMedia('(prefers-color-scheme: dark)').addEventListener('change',syncTheme);
 try { if(parent !== window) new MutationObserver(syncTheme).observe(parent.document.documentElement,{attributes:true,attributeFilter:['data-theme']}); } catch { /* Same-origin embedding is optional. */ }
 syncTheme(); key = storedKey; refresh();
+
+setInterval(()=>{if(!document.hidden)document.querySelectorAll('[data-countdown]').forEach(updateCountdown);},1000);

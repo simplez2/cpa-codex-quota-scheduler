@@ -69,7 +69,7 @@ func serialWeeklyBudget(choice serialCandidate, cfg pluginConfig, now time.Time)
 		if observed.IsZero() {
 			observed = choice.Snapshot.RefreshedAt
 		}
-		if observed.IsZero() || observed.After(now) || now.Sub(observed) > cfg.StaleAfter {
+		if observed.IsZero() || observed.After(now) || (now.Sub(observed) > cfg.StaleAfter && !(cfg.QuotaProbeOnDemand && !w.ResetAt.IsZero() && now.Before(w.ResetAt))) {
 			return 0, false
 		}
 		remaining := math.Max(0, 100-w.UsedPercent)

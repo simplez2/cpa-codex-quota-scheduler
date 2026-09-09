@@ -38,6 +38,7 @@ func TestNativeQuotaPlanResolution(t *testing.T) {
 			}
 			cfg.QuotaAccountPlans = nil
 			cfg.QuotaDefaultPlan = "pro_5x"
+			cfg.QuotaProbeOnDemand = false
 			for _, at := range []time.Time{now.Add(cfg.StaleAfter + time.Second), now.Add(-time.Second)} {
 				if p, w, s := resolvedQuotaPlan(cfg, "a", q, at); p != "pro_5x" || w != 5 || s != "default" {
 					t.Fatalf("stale/future metadata: %s %v %s", p, w, s)

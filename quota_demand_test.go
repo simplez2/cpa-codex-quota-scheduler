@@ -129,6 +129,9 @@ func TestDemandIdleCachePreservesWeeklySchedulingAndExpiry(t *testing.T) {
 	if !choice.WeeklyKnown || choice.WeeklyRemaining != 40 {
 		t.Fatalf("idle budget discarded: %+v", choice)
 	}
+	if budget, known := serialWeeklyBudget(choice, cfg, now); !known || budget <= 0 {
+		t.Fatalf("idle weekly budget unknown: %v %v", budget, known)
+	}
 	q.Windows[1].UsedPercent = 100
 	if inspectSerialCandidate(candidate, q, true, cfg, now).Eligible {
 		t.Fatal("idle weekly limit discarded")
@@ -143,5 +146,21 @@ func TestDemandIdleCachePreservesWeeklySchedulingAndExpiry(t *testing.T) {
 	cfg.QuotaProbeOnDemand = false
 	if quotaSchedulingUsable(q, now, cfg) {
 		t.Fatal("periodic mode changed")
+	}
+}
+
+func TestDemandRetainsCachedPlanWithoutRefreshingObservation(t *testing.T) {
+	now := time.Now()
+	cfg := defaultPluginConfig()
+	cfg.QuotaProbeOnDemand = true
+	q := quotaSnapshot{Plan: quotaPlanObservation{Type: "self_serve_business_prolite", Source: "cpa_usage", ObservedAt: now.Add(-time.Hour)}}
+	plan, weight, source := resolvedQuotaPlan(cfg, "a", q, now)
+	if plan != "team_premium" || weight != 5 || source != "cpa_usage" || q.Plan.fresh(now, cfg.StaleAfter) {
+		t.Fatal("cached plan lost or made fresh")
+	}
+	cfg.QuotaProbeOnDemand = false
+	_, _, source = resolvedQuotaPlan(cfg, "a", q, now)
+	if source != "default" {
+		t.Fatal("periodic behavior changed")
 	}
 }
