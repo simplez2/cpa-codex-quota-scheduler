@@ -2,7 +2,7 @@
 
 Standalone CPA plugin for balanced concurrent or serial Codex account selection, native quota polling,
 5h/weekly/monthly windows, persistent 429 quarantine and optional warmup.
-Source version: **0.3.6**. Local builds are not a published release.
+Source version: **0.3.7**. Local builds are not a published release.
 
 ## CPA dashboard
 
@@ -330,3 +330,5 @@ CPA 会在调度插件收到候选账号之前排除过期认证。某些明确�
 ### 每账号预热预算（v0.3.6）
 
 滚动24小时预热上限现在按账号独立统计，历史请求按既有账号归属迁移且不退款；账号失败、结果不确定及人工重试阻止仅影响自身。全局保留单次执行和发送间隔，默认1分钟；已保存的间隔配置仍保留。成功周期去重、原生CPA调用和按需探测不变。面板显示本账号预算及阻塞倒计时。
+
+v0.3.7 修正状态列表的账号索引别名重复，预算列表与账号列表一一对应。

@@ -374,3 +374,18 @@ func TestAccountWarmupBudgetAndFailureCannotBlockSibling(t *testing.T) {
 		t.Fatal("global spacing lost")
 	}
 }
+
+func TestWarmupAccountStatusDeduplicatesInventoryAliases(t *testing.T) {
+	now := time.Now()
+	s, _ := balancedFixture(now)
+	q := s.quotas["a"]
+	q.AuthIndex = "index-a"
+	s.quotas["index-a"] = q
+	status := s.status()
+	if len(status.WarmupAccounts) != len(status.Snapshots) {
+		t.Fatalf("aliases exposed: %d accounts, %d snapshots", len(status.WarmupAccounts), len(status.Snapshots))
+	}
+	if _, ok := status.WarmupAccounts["index-a"]; ok {
+		t.Fatal("index counted as independent account")
+	}
+}

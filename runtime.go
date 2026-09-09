@@ -1670,8 +1670,14 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 	s.warmupMu.Lock()
 	warmupTraffic := s.warmupTrafficStatusLocked(cfg, time.Now())
 	warmupAccounts := make(map[string]warmupTrafficStatus)
-	for id := range quotas {
-		warmupAccounts[id] = s.warmupTrafficStatusLocked(cfg, time.Now(), id)
+	for _, snapshot := range quotas {
+		id := strings.TrimSpace(snapshot.AuthID)
+		if id == "" {
+			id = strings.TrimSpace(snapshot.AuthIndex)
+		}
+		if id != "" {
+			warmupAccounts[id] = s.warmupTrafficStatusLocked(cfg, time.Now(), id)
+		}
 	}
 	warmups := make(map[string]warmupEntry, len(s.warmups))
 	for key, entry := range s.warmups {
