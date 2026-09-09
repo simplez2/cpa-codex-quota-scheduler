@@ -17,6 +17,7 @@ const maxWarmupModelLength = 256
 // duration values are most convenient and least surprising when written as
 // strings ("30s", "15m", ...).
 type pluginConfig struct {
+	QuotaProbeOnDemand           bool
 	AuthExpiryAutoRepair         bool
 	QuotaURL                     string
 	QuotaRefreshBatch            int
@@ -70,6 +71,7 @@ type pluginConfig struct {
 }
 
 type yamlPluginConfig struct {
+	QuotaProbeOnDemand           *bool             `yaml:"quota_probe_on_demand"`
 	AuthExpiryAutoRepair         *bool             `yaml:"auth_expiry_auto_repair"`
 	QuotaURL                     string            `yaml:"quota_url"`
 	QuotaRefreshBatch            *int              `yaml:"quota_refresh_batch"`
@@ -124,6 +126,7 @@ type yamlPluginConfig struct {
 
 func defaultPluginConfig() pluginConfig {
 	return pluginConfig{
+		QuotaProbeOnDemand:           true,
 		AuthExpiryAutoRepair:         true,
 		QuotaURL:                     "https://chatgpt.com/backend-api/wham/usage",
 		QuotaRefreshBatch:            8,
@@ -277,6 +280,9 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 	}
 	if strings.TrimSpace(in.CPAManagementKeyFile) != "" {
 		cfg.CPAManagementKeyFile = strings.TrimSpace(in.CPAManagementKeyFile)
+	}
+	if in.QuotaProbeOnDemand != nil {
+		cfg.QuotaProbeOnDemand = *in.QuotaProbeOnDemand
 	}
 	if in.AuthExpiryAutoRepair != nil {
 		cfg.AuthExpiryAutoRepair = *in.AuthExpiryAutoRepair

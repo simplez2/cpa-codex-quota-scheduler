@@ -18,6 +18,8 @@ import (
 // quotaPollState is per credential, so changes elsewhere in the pool cannot
 // reset its backoff. It contains no upstream credentials.
 type quotaPollState struct {
+	LastUsageAt time.Time
+	Reason      string
 	AuthIndex   string
 	AttemptedAt time.Time
 	NextAt      time.Time
@@ -320,6 +322,13 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 		}
 		auth := inventory[id]
 		now := time.Now()
+		reason := s.quotaProbeReason(id, now)
+		if reason == "warmup" && (auth.Unavailable || auth.Status != "active") {
+			continue
+		}
+		if reason == "" {
+			continue
+		}
 		s.mu.Lock()
 		poll := s.quotaPolls[id]
 		if now.Before(poll.NextAt) {
@@ -333,6 +342,7 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 			s.mu.Unlock()
 			continue
 		}
+		poll.Reason = reason
 		poll.AuthIndex = auth.AuthIndex
 		poll.AttemptedAt = now
 		poll.NextAt = now.Add(interval)
@@ -439,6 +449,7 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 	if s.confirmPendingWarmups(snapshotCopy, time.Now()) {
 		s.persistBanState()
 	}
+	s.releaseElapsedQuotaCooldowns(snapshotCopy, time.Now())
 	s.reconcileExternallyResetQuotaBans(snapshotCopy, time.Now())
 	s.persistBanState()
 	if batchCtx.Err() == nil {

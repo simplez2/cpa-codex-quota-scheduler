@@ -477,6 +477,7 @@ func (s *schedulerRuntimeState) observeUsage(record pluginapi.UsageRecord) {
 	if !record.Generate || !strings.EqualFold(strings.TrimSpace(record.Provider), providerCodex) {
 		return
 	}
+	s.recordQuotaDemand(record, time.Now())
 	s.observeUsageCost(record)
 	s.observeBalancedUsage(record, time.Now())
 	if len(record.ResponseHeaders) == 0 {
@@ -914,9 +915,9 @@ func quotaSnapshotFresh(snapshot quotaSnapshot, now time.Time, staleAfter time.D
 
 func (s *schedulerRuntimeState) snapshotFresh(snapshot quotaSnapshot, now time.Time) bool {
 	s.mu.RLock()
-	staleAfter := s.cfg.StaleAfter
+	cfg := s.cfg
 	s.mu.RUnlock()
-	return quotaSnapshotFresh(snapshot, now, staleAfter)
+	return quotaSchedulingUsable(snapshot, now, cfg)
 }
 
 func (s *schedulerRuntimeState) softLimit() float64 {
@@ -1349,6 +1350,7 @@ func (s *schedulerRuntimeState) persistBanState() bool {
 }
 
 type runtimeStatus struct {
+	QuotaProbeOnDemand            bool                             `json:"quota_probe_on_demand"`
 	AuthExpiryAutoRepair          bool                             `json:"auth_expiry_auto_repair"`
 	BalancedStickyBindings        int                              `json:"balanced_sticky_bindings"`
 	BalancedSessionHits           uint64                           `json:"balanced_session_hits"`
@@ -1884,6 +1886,7 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 	}
 
 	out := runtimeStatus{
+		QuotaProbeOnDemand:            cfg.QuotaProbeOnDemand,
 		AuthExpiryAutoRepair:          cfg.AuthExpiryAutoRepair,
 		BalancedAccounts:              balancedAccounts,
 		Enabled:                       cfg.Enabled,

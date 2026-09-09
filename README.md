@@ -2,7 +2,7 @@
 
 Standalone CPA plugin for balanced concurrent or serial Codex account selection, native quota polling,
 5h/weekly/monthly windows, persistent 429 quarantine and optional warmup.
-Source version: **0.3.1**. Local builds are not a published release.
+Source version: **0.3.4**. Local builds are not a published release.
 
 ## CPA dashboard
 
@@ -307,3 +307,18 @@ CPA 会在调度插件收到候选账号之前排除过期认证。某些明确�
   失败或结果不确定后至少等待 30 分钟，不清除真实额度冷却，不额外发起生成或预热。
 - 面板显示认证阻断、等待确认、自动恢复和查询网络故障；额度余量与认证状态分别展示。
   本功能修复本地元数据冲突，不保证上游网络或模型服务可用。
+
+
+### 按需探测与定时恢复（v0.3.4）
+
+“调配设置 → 按需探测额度”默认开启。没有新生成调用时停止周期性上游查询，
+面板刷新只读取缓存，不改变快照的观测时间。新调用的探测按已有冷却间隔合并；
+初始化、真实周期重置、认证恢复确认以及预热前的必要校验按事件触发。
+初始化和恢复事件的普通失败最多自动尝试三次；预热校验继续遵循预热间隔与预算。
+空闲缓存仍作为重置前的调度估计参与周额度均衡，但不会被标记成新鲜观测。
+
+权威额度冷却到期后，自动解除已到期的本地限制；仍在限制中的周/月窗口、
+没有权威重置时间的临时封禁和在途恢复探测继续保留。计时到期不会伪造上游
+快照或新的周期锚点，也不会删除其他周期已成功的预热记录。
+预热仍受全局最小间隔、每日预算和周期去重约束；重新导入账号或更换工作区后，
+旧的成功记录只说明当时成功，当前周期是否启动以对应额度窗口为准。

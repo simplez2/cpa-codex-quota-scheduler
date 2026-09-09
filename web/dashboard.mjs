@@ -127,7 +127,7 @@ function renderAccounts() {
     const ban = banFor(account);
     if (active) meta.append(element('span','badge active','当前'));
     const banLabels = {cooldown:'冷却中',probe_ready:'待恢复探测',half_open:'恢复探测中',probation:'恢复观察中'};
-    meta.append(element('span','badge' + (usable(account) ? ' good' : ' warning'),ban ? banLabels[ban.state] || '恢复观察中' : !account.fresh ? '待更新' : account.auth_health?.blocked ? '认证受阻' : account.eligible ? '可用' : '暂不可用'));
+    meta.append(element('span','badge' + (usable(account) ? ' good' : ' warning'),ban ? banLabels[ban.state] || '恢复观察中' : !account.fresh ? (state.quota_probe_on_demand ? '缓存 · 调用时更新' : '待更新') : account.auth_health?.blocked ? '认证受阻' : account.eligible ? '可用' : '暂不可用'));
     const configuredPlan = plans[account.plan_prior] || account.plan_prior || '套餐未知';
     const upstreamPlan = upstreamPlans[account.upstream_plan_type] || account.upstream_plan_type;
     const automatic = ['cpa_usage','cpa_auth_files'].includes(account.plan_source);
@@ -241,7 +241,8 @@ function render() {
   $('eligible-count').replaceChildren(document.createTextNode(String(accounts.filter(usable).length)),element('small','', ' / ' + accounts.length));
   $('switch-count').textContent = String(state.serial_switches ?? 0);
   $('cooldown-count').textContent = String(state.quarantine?.cooldown ?? 0);
-  $('updated-at').textContent = '最近额度查询 ' + dateText(state.last_refresh) + ' · ' + String(state.fresh_snapshots ?? 0) + ' 个新鲜快照';
+  const observed = (state.snapshots || []).flatMap(a=>a.windows || []).map(w=>w.observed_at).filter(v=>timestamp(v)).sort().at(-1);
+  $('updated-at').textContent = '最近额度观测 ' + dateText(observed) + ' · ' + String(state.fresh_snapshots ?? 0) + ' 个新鲜快照' + (state.quota_probe_on_demand ? ' · 按需探测，空闲读取缓存' : ' · 周期探测');
   renderAccounts(); renderPolicy(); renderWarmups();renderBans();
   editor.setAccounts(accounts.map(a=>a.auth_id));
 }

@@ -105,7 +105,7 @@ import (
 
 const (
 	pluginName    = "codex-quota-scheduler"
-	pluginVersion = "0.3.3"
+	pluginVersion = "0.3.4"
 
 	// providerCodex is the CPA provider key for OpenAI Codex (ChatGPT backend).
 	providerCodex = "codex"
@@ -551,6 +551,7 @@ func pluginRegistration() registration {
 				{Name: "quota_refresh_batch", Type: pluginapi.ConfigFieldTypeInteger, Description: "Maximum sequential quota queries per refresh tick (1-100, default 8)."},
 				{Name: "cpa_management_url", Type: pluginapi.ConfigFieldTypeString, Description: "CPA Management api-call endpoint shared by quota polling and warmup; auth-files is resolved under the same base path. No separate warmup endpoint is required."},
 				{Name: "cpa_management_key_file", Type: pluginapi.ConfigFieldTypeString, Description: "Mounted owner-readable CPA management key file; the key is never placed in YAML or logs."},
+				{Name: "quota_probe_on_demand", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Suspend idle quota polling; query after new usage or bounded initialization/reset/warmup events."},
 				{Name: "auth_expiry_auto_repair", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Repair stale top-level expiry on explicit opaque personal access tokens only after two unchanged native quota authentications. OAuth and JWT expiry remain authoritative."},
 				{Name: "warmup_enabled", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Optional budgeted activation of idle Codex quota windows. Requires a writable state file and fresh eligible quota; defaults to false."},
 				{Name: "warmup_model", Type: pluginapi.ConfigFieldTypeString, Description: "Model used for the minimal pinned activation request; this does not change any route default."},

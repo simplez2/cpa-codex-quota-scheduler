@@ -496,7 +496,7 @@ func windowRankInOrder(class string, order []string) int {
 }
 
 func snapshotFreshWithConfig(snapshot quotaSnapshot, now time.Time, cfg pluginConfig) bool {
-	return quotaSnapshotFresh(snapshot, now, cfg.StaleAfter)
+	return quotaSchedulingUsable(snapshot, now, cfg)
 }
 
 func (s *schedulerRuntimeState) pacingPick(req pluginapi.SchedulerPickRequest, now time.Time) (pluginapi.SchedulerPickResponse, []pacingCandidate) {

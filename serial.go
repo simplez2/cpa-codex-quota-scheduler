@@ -147,7 +147,7 @@ func inspectSerialCandidate(candidate pluginapi.SchedulerAuthCandidate, snapshot
 				observed = snapshot.RefreshedAt
 			}
 			age := now.Sub(observed)
-			if observed.IsZero() || age < 0 || age > cfg.StaleAfter || (!w.ResetAt.IsZero() && !now.Before(w.ResetAt)) {
+			if observed.IsZero() || age < 0 || (age > cfg.StaleAfter && !(cfg.QuotaProbeOnDemand && !w.ResetAt.IsZero())) || (!w.ResetAt.IsZero() && !now.Before(w.ResetAt)) {
 				continue
 			}
 			if !w.Allowed || w.LimitReached || w.UsedPercent >= usedPercentThreshold {
@@ -165,7 +165,7 @@ func inspectSerialCandidate(candidate pluginapi.SchedulerAuthCandidate, snapshot
 			return choice
 		}
 	}
-	if !found || !quotaSnapshotFresh(snapshot, now, cfg.StaleAfter) {
+	if !found || !quotaSchedulingUsable(snapshot, now, cfg) {
 		return choice
 	}
 
