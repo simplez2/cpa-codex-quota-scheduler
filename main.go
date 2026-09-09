@@ -105,7 +105,7 @@ import (
 
 const (
 	pluginName    = "codex-quota-scheduler"
-	pluginVersion = "0.3.5"
+	pluginVersion = "0.3.6"
 
 	// providerCodex is the CPA provider key for OpenAI Codex (ChatGPT backend).
 	providerCodex = "codex"
@@ -556,8 +556,8 @@ func pluginRegistration() registration {
 				{Name: "warmup_enabled", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Optional budgeted activation of idle Codex quota windows. Requires a writable state file and fresh eligible quota; defaults to false."},
 				{Name: "warmup_model", Type: pluginapi.ConfigFieldTypeString, Description: "Model used for the minimal pinned activation request; this does not change any route default."},
 				{Name: "warmup_retry_after", Type: pluginapi.ConfigFieldTypeString, Description: "Base delay for exponential warmup failure backoff. Three failures require explicit repair/retry; uncertain outcomes wait at least 5h."},
-				{Name: "warmup_min_interval", Type: pluginapi.ConfigFieldTypeString, Description: "Durable pool-wide spacing between warmup attempts (1m-24h, default 15m)."},
-				{Name: "warmup_max_per_day", Type: pluginapi.ConfigFieldTypeInteger, Description: "Maximum admitted warmups across the pool in a rolling 24h window (1-1000, default 8), including failures."},
+				{Name: "warmup_min_interval", Type: pluginapi.ConfigFieldTypeString, Description: "Durable pool-wide spacing between warmup attempts (1m-24h, default 1m)."},
+				{Name: "warmup_max_per_day", Type: pluginapi.ConfigFieldTypeInteger, Description: "Maximum admitted warmups per account in a rolling 24h window (1-1000, default 8), including failures."},
 				{Name: "refresh_interval", Type: pluginapi.ConfigFieldTypeString, Description: "How often to read CPA inventory and due Codex quotas (for example 30s)."},
 				{Name: "stale_after", Type: pluginapi.ConfigFieldTypeString, Description: "Maximum age of a quota snapshot before native CPA scheduling is used."},
 				{Name: "state_path", Type: pluginapi.ConfigFieldTypeString, Description: "Owner-only JSON file for quota cache, per-account polling backoff, quarantine, serial identifiers and warmup bookkeeping; no credential material."},

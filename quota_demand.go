@@ -87,7 +87,7 @@ func (s *schedulerRuntimeState) quotaProbeReason(id string, now time.Time) strin
 	}
 	s.warmupMu.Lock()
 	defer s.warmupMu.Unlock()
-	if s.warmupRunning || s.warmupTrafficStatusLocked(cfg, now).HoldReason != "" {
+	if s.warmupRunning || s.warmupTrafficStatusLocked(cfg, now).HoldReason != "" || s.warmupTrafficStatusLocked(cfg, now, id).HoldReason != "" {
 		return ""
 	}
 	window, needs := unstartedWarmupWindow(q, now)

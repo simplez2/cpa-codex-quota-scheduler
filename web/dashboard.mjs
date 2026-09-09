@@ -61,8 +61,10 @@ function warmupWait(account, cell) {
  const entry=(state.warmups||[]).find(w=>w.auth_id===account.auth_id && w.window==='5h');
  if(entry?.blocked){cell.append(element('span','subtext','预热暂停：需在预热管理允许重试'));return;}
  if(entry && timestamp(entry.suppress_until)>new Date()) {cell.append(element('span','subtext',entry.error?'预热失败或结果待确认':'已有周期记录，抑制重复预热'),countdown(entry.suppress_until,'最早重新校验 '));return;}
- const traffic=state.warmup_traffic||{};
- const reasons={min_interval:'等待全局预热间隔',daily_budget:'等待24小时预热预算恢复',failure_backoff:'等待预热失败退避',uncertain_outcome:'等待前次预热结果确认',manual_retry_required:'预热暂停：需人工确认'};
+ const own=state.warmup_accounts?.[account.auth_id]||{};
+ cell.append(element('span','subtext','本账号24小时预热 '+(own.attempts_last_24h??0)+' / '+(own.max_per_day??'—')));
+ const traffic=own.hold_reason?own:(state.warmup_traffic||{});
+ const reasons={min_interval:'等待全局预热间隔',daily_budget:'等待本账号24小时预热预算恢复',failure_backoff:'等待预热失败退避',uncertain_outcome:'等待前次预热结果确认',manual_retry_required:'预热暂停：需人工确认'};
  if(traffic.hold_reason){cell.append(element('span','subtext',reasons[traffic.hold_reason]||traffic.hold_reason));if(timestamp(traffic.next_allowed_at))cell.append(countdown(traffic.next_allowed_at,'最早准入 '));return;}
  cell.append(element('span','subtext','等待额度校验和预热调度；尚未确认启动'));
  const poll=state.quota_polls?.[account.auth_id];

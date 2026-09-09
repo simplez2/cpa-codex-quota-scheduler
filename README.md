@@ -2,7 +2,7 @@
 
 Standalone CPA plugin for balanced concurrent or serial Codex account selection, native quota polling,
 5h/weekly/monthly windows, persistent 429 quarantine and optional warmup.
-Source version: **0.3.5**. Local builds are not a published release.
+Source version: **0.3.6**. Local builds are not a published release.
 
 ## CPA dashboard
 
@@ -224,8 +224,8 @@ the global attempt ledger and does not clear account bans or successful cycles.
 
 Warmup uses conservative admission controls, separate from client failover:
 
-- `warmup_min_interval: 15m` spaces attempts across the entire pool;
-  `warmup_max_per_day: 8` caps admissions in a rolling 24-hour window.
+- `warmup_min_interval: 1m` spaces attempts across the entire pool;
+  `warmup_max_per_day: 8` caps admissions per account in a rolling 24-hour window.
   Failures count. The ledger survives restarts, hot reloads and manual retries.
 - Each recognized quota window must be allowed, above its configured reserve and
   observed within the last 2 minutes (or a shorter `stale_after`). Active serial
@@ -234,7 +234,7 @@ Warmup uses conservative admission controls, separate from client failover:
 - State must be writable: admission is persisted before dispatch. Quota and
   quarantine are checked again immediately before execution. A failed commit
   sends no generation request.
-- Retryable failures pause the entire warmup pool with exponential backoff
+- Retryable failures pause only the affected account with exponential backoff
   starting at `warmup_retry_after` (15m), capped at 6h. A longer Retry-After/reset
   wins. Three failures for an account, or a nonretryable auth/policy failure,
   require explicit repair and `POST /warmup-retry` before auto-warmup resumes.
@@ -326,3 +326,7 @@ CPA 会在调度插件收到候选账号之前排除过期认证。某些明确�
 ### 缓存预算与倒计时（v0.3.5）
 
 按需模式保留尚未重置的周窗口预算估算；自动套餐识别缓存最长保留七天，新的上游结果仍可替换它。面板注明缓存估算并显示额度重置、预热间隔及去重倒计时。倒计时只在浏览器本地更新，不触发额度查询；最早准入时间不是执行成功承诺。
+
+### 每账号预热预算（v0.3.6）
+
+滚动24小时预热上限现在按账号独立统计，历史请求按既有账号归属迁移且不退款；账号失败、结果不确定及人工重试阻止仅影响自身。全局保留单次执行和发送间隔，默认1分钟；已保存的间隔配置仍保留。成功周期去重、原生CPA调用和按需探测不变。面板显示本账号预算及阻塞倒计时。

@@ -31,25 +31,25 @@ func TestWarmupTrafficBudgetIsRollingAndSurvivesStateReload(t *testing.T) {
 	state := newManagedRuntimeForTest(t, cfg.StatePath)
 	state.cfg = cfg
 	claimManagedRuntimeForTest(t, state)
-	state.warmupAttempts = []warmupAttempt{{AuthID: "a", At: now.Add(-23 * time.Hour)}, {AuthID: "b", At: now.Add(-time.Hour)}}
-	state.warmups["b|5h"] = warmupEntry{AuthID: "b", Window: "5h", AttemptedAt: now.Add(-time.Hour), ResetAt: now.Add(-time.Minute)}
+	state.warmupAttempts = []warmupAttempt{{AuthID: "a", At: now.Add(-23 * time.Hour)}, {AuthID: "a", At: now.Add(-time.Hour)}}
+	state.warmups["b|5h"] = warmupEntry{AuthID: "a", Window: "5h", AttemptedAt: now.Add(-time.Hour), ResetAt: now.Add(-time.Minute)}
 	if !state.pruneExpiredWarmups(now) || !state.persistBanState() {
 		t.Fatal("could not save pruned state")
 	}
 	loaded := schedulerRuntimeState{cfg: cfg}
 	loaded.loadBanState(cfg.StatePath)
 	loaded.loadBanState(cfg.StatePath)
-	status := loaded.warmupTrafficStatusLocked(cfg, now)
+	status := loaded.warmupTrafficStatusLocked(cfg, now, "a")
 	if status.AttemptsLast24h != 2 || status.HoldReason != "daily_budget" || !status.NextAllowedAt.Equal(now.Add(time.Hour)) {
 		t.Fatalf("reloaded budget: %#v", status)
 	}
-	if status = loaded.warmupTrafficStatusLocked(cfg, now.Add(time.Hour)); status.HoldReason != "" || status.AttemptsLast24h != 1 {
+	if status = loaded.warmupTrafficStatusLocked(cfg, now.Add(time.Hour), "a"); status.HoldReason != "" || status.AttemptsLast24h != 1 {
 		t.Fatalf("rolling expiry: %#v", status)
 	}
 	// A clock rollback must wait; it must not erase a future admission.
 	loaded.warmupAttempts = []warmupAttempt{{AuthID: "a", At: now.Add(time.Minute)}}
 	status = loaded.warmupTrafficStatusLocked(cfg, now)
-	if status.HoldReason != "min_interval" || !status.NextAllowedAt.Equal(now.Add(16*time.Minute)) {
+	if status.HoldReason != "min_interval" || !status.NextAllowedAt.Equal(now.Add(2*time.Minute)) {
 		t.Fatalf("clock rollback bypassed spacing: %#v", status)
 	}
 }
@@ -68,12 +68,12 @@ func TestWarmupFailureBackoffAndManualRecoveryPreserveBudget(t *testing.T) {
 		if entry.Failures != failure || entry.SuppressUntil.Sub(entry.OutcomeAt) != want || entry.Blocked != (failure == 3) {
 			t.Fatalf("failure %d: %#v", failure, entry)
 		}
-		status := state.warmupTrafficStatusLocked(cfg, entry.OutcomeAt)
+		status := state.warmupTrafficStatusLocked(cfg, entry.OutcomeAt, "a")
 		if failure < 3 && status.HoldReason != "failure_backoff" {
 			t.Fatalf("pool did not back off: %#v", status)
 		}
 	}
-	status := state.warmupTrafficStatusLocked(cfg, time.Now())
+	status := state.warmupTrafficStatusLocked(cfg, time.Now(), "a")
 	if status.HoldReason != "manual_retry_required" {
 		t.Fatalf("retry cap did not stop pool: %#v", status)
 	}
@@ -81,7 +81,7 @@ func TestWarmupFailureBackoffAndManualRecoveryPreserveBudget(t *testing.T) {
 	if state.clearBlockedWarmupState("a", false) != 1 {
 		t.Fatal("explicit recovery did not clear block")
 	}
-	if after := state.warmupTrafficStatusLocked(cfg, time.Now()); after.AttemptsLast24h != before || after.HoldReason != "min_interval" {
+	if after := state.warmupTrafficStatusLocked(cfg, time.Now(), "a"); after.AttemptsLast24h != before || after.HoldReason != "" {
 		t.Fatalf("recovery refunded traffic budget: %#v", after)
 	}
 }
@@ -154,7 +154,7 @@ func TestWarmupPolicyFailureJournalStopsAnotherAccount(t *testing.T) {
 	if _, merged, err := state.mergePersistedWarmupsLocked(path); err != nil || !merged {
 		t.Fatalf("merge=%v, err=%v", merged, err)
 	}
-	status := state.warmupTrafficStatusLocked(defaultPluginConfig(), now.Add(time.Hour))
+	status := state.warmupTrafficStatusLocked(defaultPluginConfig(), now.Add(time.Hour), "a")
 	if status.HoldReason != "manual_retry_required" || status.AttemptsLast24h != 1 {
 		t.Fatalf("retired failure lost: %#v", status)
 	}
@@ -181,7 +181,7 @@ func TestWarmupHonorsRetryAfterAndSSEQuotaFailure(t *testing.T) {
 		t.Fatalf("quota Retry-After lost: %#v", entry)
 	}
 	banStore.clear("a")
-	if status := state.warmupTrafficStatusLocked(cfg, now.Add(time.Hour)); status.HoldReason != "failure_backoff" {
+	if status := state.warmupTrafficStatusLocked(cfg, now.Add(time.Hour), "a"); status.HoldReason != "failure_backoff" {
 		t.Fatalf("clearing quarantine bypassed warmup backoff: %#v", status)
 	}
 }
@@ -351,5 +351,26 @@ func TestWarmupConfirmationRequiresNewObservationAndMatchingIdentity(t *testing.
 		if confirmed := state.confirmPendingWarmups(map[string]quotaSnapshot{"a": q}, now); confirmed != (scenario == "fresh") {
 			t.Fatalf("confirmation=%v for %s", confirmed, scenario)
 		}
+	}
+}
+
+func TestAccountWarmupBudgetAndFailureCannotBlockSibling(t *testing.T) {
+	now := time.Now()
+	cfg := defaultPluginConfig()
+	cfg.WarmupMaxPerDay = 2
+	s := schedulerRuntimeState{cfg: cfg, warmups: map[string]warmupEntry{"a|5h": {AuthID: "a", Blocked: true, Error: "http_401", AttemptedAt: now.Add(-time.Hour)}}}
+	s.warmupAttempts = []warmupAttempt{{AuthID: "a", At: now.Add(-2 * time.Hour)}, {AuthID: "a", At: now.Add(-time.Hour)}}
+	if s.warmupTrafficStatusLocked(cfg, now, "a").HoldReason != "manual_retry_required" {
+		t.Fatal("account hold lost")
+	}
+	if s.warmupTrafficStatusLocked(cfg, now).HoldReason != "" || s.warmupTrafficStatusLocked(cfg, now, "b").HoldReason != "" {
+		t.Fatal("sibling blocked")
+	}
+	if s.warmupTrafficStatusLocked(cfg, now, "b").AttemptsLast24h != 0 {
+		t.Fatal("budget shared")
+	}
+	s.warmupAttempts = append(s.warmupAttempts, warmupAttempt{AuthID: "b", At: now})
+	if s.warmupTrafficStatusLocked(cfg, now).HoldReason != "min_interval" {
+		t.Fatal("global spacing lost")
 	}
 }

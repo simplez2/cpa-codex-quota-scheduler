@@ -63,31 +63,50 @@ func (s *schedulerRuntimeState) mergeWarmupAttemptsLocked(incoming []warmupAttem
 	})
 }
 
-// Global holds prevent sequential account rotation from turning one upstream
-// failure into a pool-wide probe burst. Ordinary client routing is unaffected.
-func (s *schedulerRuntimeState) warmupTrafficStatusLocked(cfg pluginConfig, now time.Time) warmupTrafficStatus {
+// The pool controls spacing only. Budgets and failure holds belong to an account.
+func (s *schedulerRuntimeState) warmupTrafficStatusLocked(cfg pluginConfig, now time.Time, authIDs ...string) warmupTrafficStatus {
 	interval, maxPerDay := cfg.WarmupMinInterval, cfg.WarmupMaxPerDay
 	if interval < time.Minute {
-		interval = 15 * time.Minute
+		interval = time.Minute
 	}
 	if maxPerDay < 1 {
 		maxPerDay = 8
 	}
 	s.mergeWarmupAttemptsLocked(nil, now)
-	out := warmupTrafficStatus{MinInterval: interval.String(), MaxPerDay: maxPerDay, AttemptsLast24h: len(s.warmupAttempts)}
+	attempts := s.warmupAttempts
+	id := ""
+	if len(authIDs) > 0 {
+		id = authIDs[0]
+		attempts = nil
+		for _, a := range s.warmupAttempts {
+			if a.AuthID == id {
+				attempts = append(attempts, a)
+			}
+		}
+	}
+	out := warmupTrafficStatus{MinInterval: interval.String(), AttemptsLast24h: len(attempts)}
+	if id != "" {
+		out.MaxPerDay = maxPerDay
+	}
 	hold := func(until time.Time, reason string) {
 		if now.Before(until) && !until.Before(out.NextAllowedAt) {
 			out.NextAllowedAt, out.HoldReason = until, reason
 		}
 	}
-	if n := len(s.warmupAttempts); n > 0 {
+	if n := len(s.warmupAttempts); n > 0 && id == "" {
 		hold(s.warmupAttempts[n-1].At.Add(interval), "min_interval")
-		if n >= maxPerDay {
-			hold(s.warmupAttempts[n-maxPerDay].At.Add(warmupBudgetWindow), "daily_budget")
-		}
+	}
+	if id == "" {
+		return out
+	}
+	if n := len(attempts); n >= maxPerDay {
+		hold(attempts[n-maxPerDay].At.Add(warmupBudgetWindow), "daily_budget")
 	}
 	blocked := false
 	for _, entry := range s.warmups {
+		if entry.AuthID != id {
+			continue
+		}
 		if entry.Blocked {
 			blocked = true
 		}

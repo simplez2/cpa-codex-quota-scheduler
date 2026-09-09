@@ -234,7 +234,13 @@ func (s *schedulerRuntimeState) scheduleWarmup(parent context.Context, skipAuthI
 		releaseInstanceLease()
 		return
 	}
-	candidate, key, ok := s.nextWarmupCandidateForGenerationLocked(candidates, now, cfg.WarmupRetryAfter, generationClaimedAt)
+	admitted := candidates[:0]
+	for _, candidate := range candidates {
+		if s.warmupTrafficStatusLocked(cfg, now, candidate.Snapshot.AuthID).HoldReason == "" {
+			admitted = append(admitted, candidate)
+		}
+	}
+	candidate, key, ok := s.nextWarmupCandidateForGenerationLocked(admitted, now, cfg.WarmupRetryAfter, generationClaimedAt)
 	if !ok {
 		s.warmupMu.Unlock()
 		releaseInstanceLease()

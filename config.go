@@ -147,7 +147,7 @@ func defaultPluginConfig() pluginConfig {
 		CPAManagementKeyFile:         "/run/secrets/management_key",
 		WarmupModel:                  "gpt-5.6-luna",
 		WarmupRetryAfter:             15 * time.Minute,
-		WarmupMinInterval:            15 * time.Minute,
+		WarmupMinInterval:            time.Minute,
 		WarmupMaxPerDay:              8,
 		QuotaRefreshCooldown:         2 * time.Minute,
 		RefreshInterval:              30 * time.Second,

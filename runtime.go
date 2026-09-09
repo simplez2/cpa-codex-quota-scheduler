@@ -1402,6 +1402,7 @@ type runtimeStatus struct {
 	GenerationReason              string                           `json:"generation_supersede_reason,omitempty"`
 	CPAConfigured                 bool                             `json:"cpa_configured"`
 	WarmupEnabled                 bool                             `json:"warmup_enabled"`
+	WarmupAccounts                map[string]warmupTrafficStatus   `json:"warmup_accounts"`
 	WarmupTraffic                 warmupTrafficStatus              `json:"warmup_traffic"`
 	WarmupExecutionMode           string                           `json:"warmup_execution_mode"`
 	WarmupCandidates              int                              `json:"warmup_candidates"`
@@ -1668,6 +1669,10 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 
 	s.warmupMu.Lock()
 	warmupTraffic := s.warmupTrafficStatusLocked(cfg, time.Now())
+	warmupAccounts := make(map[string]warmupTrafficStatus)
+	for id := range quotas {
+		warmupAccounts[id] = s.warmupTrafficStatusLocked(cfg, time.Now(), id)
+	}
 	warmups := make(map[string]warmupEntry, len(s.warmups))
 	for key, entry := range s.warmups {
 		warmups[key] = entry
@@ -1929,6 +1934,7 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 		CPAConfigured:                 strings.TrimSpace(cfg.CPAManagementURL) != "",
 		WarmupEnabled:                 cfg.WarmupEnabled,
 		WarmupTraffic:                 warmupTraffic,
+		WarmupAccounts:                warmupAccounts,
 		WarmupExecutionMode:           "cpa_api_call",
 		Refreshes:                     refreshes,
 		FreshSnapshots:                count,
