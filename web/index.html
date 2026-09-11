@@ -38,6 +38,12 @@
       <div class="table-scroll"><table><thead><tr><th scope="col">账号 / 状态</th><th scope="col">5h 剩余</th><th scope="col">周剩余</th><th scope="col">周日均预算<span class="help">各账号自身额度 % / 天</span></th><th scope="col">最近查询</th><th scope="col">操作</th></tr></thead><tbody id="accounts-body"></tbody></table></div>
       <p id="empty" class="empty" hidden>尚无额度快照。请在“连接与高级”检查 CPA 管理连接，并确认认证文件已启用。</p>
     </section>
+    <section id="adq-diagnostics" class="detail-panel adq-diagnostics" aria-labelledby="adq-title">
+      <div class="section-header"><div><h2 id="adq-title">ADQ 调度诊断</h2><p id="adq-status-text">等待调度状态</p></div><span id="adq-mode" class="badge">—</span></div>
+      <dl id="adq-metrics" class="policy adq-metrics"></dl>
+      <div id="adq-circuits" class="adq-circuits" hidden></div>
+      <details id="adq-account-details" class="adq-account-details"><summary>查看账号级指标</summary><div class="table-scroll"><table class="adq-table"><thead><tr><th scope="col">账号</th><th scope="col">容量 / 有效额度</th><th scope="col">阶段 / 缓存</th><th scope="col">填满概率 / 锁定成本</th><th scope="col">Runway / Provider</th></tr></thead><tbody id="adq-accounts"></tbody></table></div></details>
+    </section>
     <div class="details-grid">
       <section class="detail-panel" aria-labelledby="policy-title"><div class="section-header"><h2 id="policy-title">调配安排</h2><button type="button" data-view="allocation">调整安排</button></div><dl id="policy" class="policy"></dl><p class="muted">日均预算用于比较周额度消耗节奏，不是每日硬上限，也不表示下一次切换的固定顺序。</p></section>
       <section class="detail-panel" aria-labelledby="bans-title"><div class="section-header"><h2 id="bans-title">账号恢复</h2><button id="unban-all" class="runtime-action" type="button" disabled>解除全部冷却</button></div><p class="muted">确认上游额度已恢复后，可解除本地冷却。正常到期后会自动探测恢复。</p><ul id="bans-list" class="warmups"></ul></section>

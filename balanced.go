@@ -13,10 +13,11 @@ import (
 const balancedPendingTTL = 2 * time.Hour
 
 type balancedPending struct {
-	Session string
-	At      time.Time
-	Model   string
-	Cost    float64
+	Session       string
+	At            time.Time
+	Model         string
+	Cost          float64
+	ReservationID string
 }
 
 // Credits are local fair-share work units, never an upstream quota reservation.
@@ -109,7 +110,7 @@ func (s *schedulerRuntimeState) balancedPick(req pluginapi.SchedulerPickRequest,
 			continue
 		}
 		seen[candidate.ID] = true
-		snapshot, found := s.quotas[candidate.ID]
+		snapshot, found := s.lookupQuotaLocked(candidate.ID, candidateAuthIndex(candidate))
 		snapshot = s.serialConservativeQuotaLocked(snapshot, now)
 		choice := inspectSerialCandidate(candidate, snapshot, found, s.cfg, now)
 		if !choice.Eligible && choice.Reason != "serial_threshold" {
@@ -177,22 +178,43 @@ func (s *schedulerRuntimeState) balancedPick(req pluginapi.SchedulerPickRequest,
 		account.prune(now)
 	}
 	selected := ""
-	bestScore := math.Inf(-1)
-	for _, choice := range choices {
-		id := choice.Candidate.ID
-		account := s.balancedAccounts[id]
-		account.Credit = math.Max(-limit, math.Min(limit, account.Credit+cost*account.Weight/total))
-		// Capped credits can tie after many cheap sticky continuations. Prefer
-		// the least recently selected account instead of permanently favoring
-		// the lexicographically first credential at that ceiling.
-		if account.Credit > bestScore || (account.Credit == bestScore && selected != "" && account.LastPicked.Before(s.balancedAccounts[selected].LastPicked)) {
-			selected = id
-			bestScore = account.Credit
+	reservation := adqReservation{}
+	adqSelected, adqReservation, adqOK := s.adqRouteChoicesLocked(req, choices, cost, now, session, func() string {
+		if sticky == nil {
+			return ""
+		}
+		return sticky.Candidate.ID
+	}())
+	if adqOK {
+		// ADQ owns the final choice whenever both windows have observed absolute
+		// capacities. The legacy credit score remains a fallback and is never
+		// allowed to overwrite a reserved decision.
+		selected = adqSelected
+		reservation = adqReservation
+		if sticky != nil {
+			s.balancedSessionHits++
+		}
+	} else {
+		bestScore := math.Inf(-1)
+		for _, choice := range choices {
+			id := choice.Candidate.ID
+			account := s.balancedAccounts[id]
+			account.Credit = math.Max(-limit, math.Min(limit, account.Credit+cost*account.Weight/total))
+			// Capped credits can tie after many cheap sticky continuations. Prefer
+			// the least recently selected account instead of permanently favoring
+			// the lexicographically first credential at that ceiling.
+			if account.Credit > bestScore || (account.Credit == bestScore && selected != "" && account.LastPicked.Before(s.balancedAccounts[selected].LastPicked)) {
+				selected = id
+				bestScore = account.Credit
+			}
+		}
+		if sticky != nil {
+			selected = sticky.Candidate.ID
+			s.balancedSessionHits++
 		}
 	}
-	if sticky != nil {
-		selected = sticky.Candidate.ID
-		s.balancedSessionHits++
+	if selected == "" {
+		return pluginapi.SchedulerPickResponse{}
 	}
 	account := s.balancedAccounts[selected]
 	account.Credit -= cost
@@ -201,7 +223,7 @@ func (s *schedulerRuntimeState) balancedPick(req pluginapi.SchedulerPickRequest,
 	if len(account.Pending) >= 256 {
 		account.Pending = account.Pending[1:]
 	}
-	account.Pending = append(account.Pending, balancedPending{At: now, Model: normalizeModelName(req.Model), Cost: cost, Session: session})
+	account.Pending = append(account.Pending, balancedPending{At: now, Model: normalizeModelName(req.Model), Cost: cost, Session: session, ReservationID: reservation.ID})
 	if session != "" {
 		var index string
 		for _, choice := range choices {
@@ -236,11 +258,24 @@ func (s *schedulerRuntimeState) observeBalancedUsage(record pluginapi.UsageRecor
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now = s.balancedTimeLocked(now)
-	id := strings.TrimSpace(record.AuthID)
+	rawID := strings.TrimSpace(record.AuthID)
+	id := s.canonicalAuthIDLocked(rawID, record.AuthIndex)
 	if id == "" {
-		id = s.identities[strings.TrimSpace(record.AuthIndex)]
+		id = rawID
 	}
-	account := s.balancedAccounts[id]
+	accountID := rawID
+	if accountID == "" {
+		accountID = id
+	}
+	account := s.balancedAccounts[accountID]
+	if account == nil && id != accountID {
+		accountID = id
+		account = s.balancedAccounts[accountID]
+	}
+	if account == nil && strings.TrimSpace(record.AuthIndex) != "" {
+		accountID = strings.TrimSpace(record.AuthIndex)
+		account = s.balancedAccounts[accountID]
+	}
 	if account == nil || record.RequestedAt.IsZero() {
 		return
 	}
@@ -272,7 +307,7 @@ func (s *schedulerRuntimeState) observeBalancedUsage(record pluginapi.UsageRecor
 		return
 	}
 	pending := account.Pending[index]
-	if binding, ok := s.balancedSessions[pending.Session]; ok && binding.AuthID == id &&
+	if binding, ok := s.balancedSessions[pending.Session]; ok && (binding.AuthID == accountID || binding.AuthID == id || binding.AuthID == rawID) &&
 		(record.AuthIndex == "" || binding.AuthIndex == "" || record.AuthIndex == binding.AuthIndex) && now.After(binding.LastUsedAt) {
 		binding.LastUsedAt = now
 		s.balancedSessions[pending.Session] = binding
@@ -294,8 +329,20 @@ func (s *schedulerRuntimeState) observeBalancedUsage(record pluginapi.UsageRecor
 		delete(account.Completed, oldestKey)
 	}
 	account.Completed[key] = now
+
 	actual, known := usageCredits(record, s.pricing)
-	if known && actual >= 0 && !math.IsNaN(actual) && !math.IsInf(actual, 0) {
+	validActual := known && !record.Failed && actual >= 0 && finiteADQ(actual)
+	if reservationID := strings.TrimSpace(pending.ReservationID); reservationID != "" && s.adqReservations != nil {
+		// A reservation is only held until CPA reports the matching request. Any
+		// failure or token-less completion releases the speculative debit; a
+		// successful tokenized completion reconciles both quota windows once.
+		if validActual {
+			s.adqReservations.Reconcile(reservationID, actual, actual)
+		} else {
+			s.adqReservations.Release(reservationID)
+		}
+	}
+	if validActual {
 		// A very large completion changes future share without starving an
 		// account forever. This estimate cannot mark its quota exhausted.
 		limit := math.Max(predicted, .001) * 16

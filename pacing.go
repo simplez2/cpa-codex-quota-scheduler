@@ -514,7 +514,7 @@ func (s *schedulerRuntimeState) pacingPick(req pluginapi.SchedulerPickRequest, n
 		if banned[candidate.ID] {
 			continue
 		}
-		snapshot, found := s.quotas[strings.TrimSpace(candidate.ID)]
+		snapshot, found := s.lookupQuotaLocked(candidate.ID, candidateAuthIndex(candidate))
 		if !found || !snapshotFreshWithConfig(snapshot, now, s.cfg) {
 			continue
 		}

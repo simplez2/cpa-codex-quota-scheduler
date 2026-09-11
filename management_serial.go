@@ -158,10 +158,7 @@ func (s *schedulerRuntimeState) setManualSerialActive(requestedAuthID string, no
 	}
 
 	s.mu.RLock()
-	snapshot, found := s.quotas[canonicalAuthID]
-	if !found {
-		snapshot, found = s.quotas[strings.TrimSpace(binding.AuthIndex)]
-	}
+	snapshot, found := s.lookupQuotaLocked(canonicalAuthID, binding.AuthIndex)
 	s.mu.RUnlock()
 	if !found || !quotaSnapshotFresh(snapshot, now, cfg.StaleAfter) {
 		return manualSerialActiveResult{}, &managementSerialActiveError{

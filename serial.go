@@ -507,7 +507,7 @@ func (s *schedulerRuntimeState) serialRequestLocalPickLocked(
 		if _, unavailable := blocked[candidate.ID]; unavailable {
 			continue
 		}
-		snapshot, found := s.quotas[candidate.ID]
+		snapshot, found := s.lookupQuotaLocked(candidate.ID, candidateAuthIndex(candidate))
 		snapshot = s.serialConservativeQuotaLocked(snapshot, now)
 		choice := inspectSerialCandidate(candidate, snapshot, found, cfg, now)
 		s.annotateSerialCandidateLocked(&choice, now)
@@ -553,7 +553,7 @@ func (s *schedulerRuntimeState) serialOverdraftPickLocked(
 		// Never bypass a fresh hard quota result: routing an already exhausted
 		// 5h auth back into the same conversation turns a recoverable handoff
 		// into the upstream "usage limit reached" interruption.
-		snapshot, found := s.quotas[candidate.ID]
+		snapshot, found := s.lookupQuotaLocked(candidate.ID, candidateAuthIndex(candidate))
 		if found {
 			snapshot = s.serialConservativeQuotaLocked(snapshot, now)
 			choice := inspectSerialCandidate(candidate, snapshot, true, cfg, now)
@@ -635,7 +635,7 @@ func (s *schedulerRuntimeState) serialPick(req pluginapi.SchedulerPickRequest, n
 			}
 			continue
 		}
-		snapshot, found := s.quotas[candidate.ID]
+		snapshot, found := s.lookupQuotaLocked(candidate.ID, candidateAuthIndex(candidate))
 		snapshot = s.serialConservativeQuotaLocked(snapshot, now)
 		choice := inspectSerialCandidate(candidate, snapshot, found, cfg, now)
 		s.annotateSerialCandidateLocked(&choice, now)

@@ -6,7 +6,7 @@
       "name": "Codex 额度调度",
       "description": "Standalone CPA quota control panel with editable scheduling, per-account plans and selection, cooldown recovery, and warmup management.",
       "author": "simplez2",
-      "version": "0.3.0",
+      "version": "0.3.8",
       "repository": "https://github.com/simplez2/cpa-codex-quota-scheduler",
       "homepage": "https://github.com/simplez2/cpa-codex-quota-scheduler",
       "license": "MIT",

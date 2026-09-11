@@ -70,6 +70,83 @@ function warmupWait(account, cell) {
  const poll=state.quota_polls?.[account.auth_id];
  if(poll?.AttemptedAt && !account.fresh){const at=timestamp(poll.AttemptedAt);if(at)cell.append(countdown(new Date(at.getTime()+15*60000).toISOString(),'预热校验最早 '));}
 }
+function adqNumber(value, digits=2) {
+  return typeof value === 'number' && Number.isFinite(value) ? value.toFixed(digits).replace(/\.?0+$/,'') : '未知';
+}
+function adqPercent(value) {
+  return typeof value === 'number' && Number.isFinite(value) ? (value * 100).toFixed(1).replace(/\.0$/,'') + '%' : '未知';
+}
+function durationText(seconds) {
+  if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds < 0) return '未知';
+  let remaining = Math.ceil(seconds);
+  const days = Math.floor(remaining / 86400); remaining %= 86400;
+  const hours = Math.floor(remaining / 3600); remaining %= 3600;
+  const minutes = Math.floor(remaining / 60); const secs = remaining % 60;
+  return (days ? days + '天 ' : '') + String(hours).padStart(2,'0') + ':' + String(minutes).padStart(2,'0') + ':' + String(secs).padStart(2,'0');
+}
+function adqProviderText(value) {
+  const labels = {healthy:'正常',overload:'上游过载',auth_failed:'认证失败',quota_exhausted:'额度耗尽',unknown:'未知'};
+  return labels[value] || value || '正常';
+}
+function adqBottleneckText(value) {
+  const labels = {BALANCED:'均衡',WEEK_CONSTRAINED:'周额度受限',PHASE_CONSTRAINED:'阶段受限',RISK:'风险区',TAIL_DRAIN:'尾部消耗',CAPACITY_FAILURE:'容量不足'};
+  return labels[value] || value || '未知';
+}
+function adqMetricPairs(adq) {
+  const pool = adq.pool || {};
+  const mode = adq.enabled ? (adq.using_fallback ? '等待容量校准，当前使用兼容路径' : 'ADQ 原子预留已启用') : '当前调度模式未启用 ADQ';
+  return [
+    ['状态', mode],
+    ['FullWidth / EffectiveWidth', String(pool.FullWidth ?? 0) + ' / ' + adqNumber(pool.EffectiveWidth)],
+    ['风险水位', '周 ' + adqNumber(pool.M_week) + ' · 5h ' + adqNumber(pool.M_5h) + ' · 阶段 ' + adqNumber(pool.M_phase)],
+    ['系统瓶颈', adqBottleneckText(pool.bottleneck) + (pool.capacity_failure ? ' · 真实容量不足' : '')],
+    ['需求估计', adqNumber(pool.current_demand_per_hour) + ' / 小时 · P95 ' + adqNumber(pool.forecast_demand_p95)],
+    ['Reservation', String(adq.reservations_active ?? 0) + ' 个在途 · ' + String(adq.reservation_collisions ?? 0) + ' 次冲突'],
+    ['容量校准', String(adq.calibrated_accounts ?? 0) + ' / ' + String(adq.accounts_total ?? 0) + ' 个账号'],
+    ['最近决策', adq.last_decision_auth_id ? adq.last_decision_auth_id + ' · ' + (adq.last_decision_reason || '已路由') : '尚无 ADQ 路由记录']
+  ];
+}
+function renderADQ() {
+  const metrics = $('adq-metrics');
+  if (!metrics) return;
+  const adq = state?.adq || {};
+  const enabled = adq.enabled === true;
+  const fallback = adq.using_fallback === true;
+  const mode = $('adq-mode');
+  mode.className = 'badge' + (enabled && !fallback ? ' good' : ' warning');
+  mode.textContent = enabled ? (fallback ? '等待校准' : '已启用') : '兼容调度';
+  $('adq-status-text').textContent = enabled ? (fallback ? (adq.fallback_reason || '等待每个账号完成真实容量校准。') : '并发请求使用原子 Reservation；会话仍保持粘性。') : '串行或传统模式沿用对应调度器，ADQ 仅在均衡并发模式接管。';
+  metrics.replaceChildren();
+  for (const [label, value] of adqMetricPairs(adq)) {
+    const row = element('div'); row.append(element('dt','',label), element('dd','',value)); metrics.append(row);
+  }
+  const circuitBox = $('adq-circuits'); circuitBox.replaceChildren();
+  const circuits = Object.entries(adq.provider_circuits || {});
+  const active = circuits.filter(([, circuit]) => circuit?.active);
+  circuitBox.hidden = circuits.length === 0;
+  if (circuits.length) {
+    circuitBox.append(element('strong','',active.length ? 'Provider 暂停账号' : 'Provider 电路记录'));
+    for (const [authID, circuit] of circuits.sort((a,b)=>a[0].localeCompare(b[0]))) {
+      const line = element('div','adq-circuit-line');
+      line.append(element('span','account-id',authID), element('span','badge' + (circuit.active ? ' warning' : ' good'), adqProviderText(circuit.state)));
+      if (circuit.active && timestamp(circuit.retry_at)) line.append(countdown(circuit.retry_at,'恢复探测 '));
+      else if (circuit.retry_at) line.append(element('span','subtext','下次恢复探测 ' + dateText(circuit.retry_at)));
+      circuitBox.append(line);
+    }
+  }
+  const body = $('adq-accounts'); body.replaceChildren();
+  const accounts = (state?.snapshots || []).map(account => ({account, metrics:account.adq})).filter(item=>item.metrics).sort((a,b)=>a.account.auth_id.localeCompare(b.account.auth_id));
+  $('adq-account-details').hidden = accounts.length === 0;
+  for (const {account,metrics:metric} of accounts) {
+    const row = element('tr');
+    const info = element('td'); info.append(element('div','account-id',account.auth_id),element('span','subtext',metric.state + ' · ' + (metric.reason || ''))); row.append(info);
+    const capacity = element('td'); capacity.append(element('span','subtext','W '+adqNumber(metric.weekly_capacity)+' → '+adqNumber(metric.weekly_effective)),element('span','subtext','H '+adqNumber(metric.five_hour_capacity)+' → '+adqNumber(metric.five_hour_effective)),element('span','subtext','κ '+adqNumber(metric.kappa))); row.append(capacity);
+    const phase = element('td'); phase.append(element('span','subtext','phase #'+String(metric.phase_bucket ?? '—')+' · '+(metric.phase_anchor_mode || 'auto')),element('span','subtext','缓存 '+(metric.cache_state || '未知')+' · 命中 '+adqPercent(metric.cache_hit_probability))); row.append(phase);
+    const fill = element('td'); fill.append(element('span','subtext','当前 '+adqPercent(metric.p_fill_current)+' · 完整 '+adqPercent(metric.p_fill_full)),element('span','subtext','Q_lock P95 '+adqNumber(metric.q_lock_p95))); row.append(fill);
+    const runway = element('td'); runway.append(element('span','subtext','Runway '+durationText(metric.runway_final_seconds)),element('span','subtext','Provider '+adqProviderText(metric.provider_state))); if(timestamp(metric.provider_retry_at)) runway.append(countdown(metric.provider_retry_at,'恢复探测 ')); row.append(runway);
+    body.append(row);
+  }
+}
 function pct(value) {
   return typeof value === 'number' && Number.isFinite(value) ? Math.max(0,Math.min(100,value)).toFixed(1).replace(/\.0$/,'') + '%' : '未知';
 }
@@ -272,7 +349,7 @@ function render() {
   $('cooldown-count').textContent = String(state.quarantine?.cooldown ?? 0);
   const observed = (state.snapshots || []).flatMap(a=>a.windows || []).map(w=>w.observed_at).filter(v=>timestamp(v)).sort().at(-1);
   $('updated-at').textContent = '最近额度观测 ' + dateText(observed) + ' · ' + String(state.fresh_snapshots ?? 0) + ' 个新鲜快照' + (state.quota_probe_on_demand ? ' · 按需探测，空闲读取缓存' : ' · 周期探测');
-  renderAccounts(); renderPolicy(); renderWarmups();renderBans();
+  renderAccounts(); renderPolicy(); renderADQ(); renderWarmups();renderBans();
   editor.setAccounts(accounts.map(a=>a.auth_id));
 }
 function notice(message) { $('notice').textContent = message; $('notice').hidden = !message; }
@@ -280,6 +357,7 @@ function login(message) {
   authEpoch++; key = ''; state = null; manual = false;
   editor.reset();$('feedback').hidden=true;$('operation-dialog').close();pendingOperation=null;$('bans-list').replaceChildren();
   $('accounts-body').replaceChildren(); $('warmups').replaceChildren();
+  $('adq-metrics')?.replaceChildren(); $('adq-circuits')?.replaceChildren(); $('adq-accounts')?.replaceChildren();
   $('active-account').textContent = ''; $('content').hidden = true; $('login').hidden = false;
   showView('overview');
   $('connection').textContent = '等待登录'; $('connection').dataset.state = '';

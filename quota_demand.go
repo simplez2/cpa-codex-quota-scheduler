@@ -1,7 +1,6 @@
 package main
 
 import (
-	"strings"
 	"time"
 
 	"github.com/simplez2/cpa-codex-quota-scheduler/cpasdk/pluginapi"
@@ -10,10 +9,7 @@ import (
 func (s *schedulerRuntimeState) recordQuotaDemand(record pluginapi.UsageRecord, now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	id := strings.TrimSpace(record.AuthID)
-	if id == "" {
-		id = s.identities[strings.TrimSpace(record.AuthIndex)]
-	}
+	id := s.canonicalAuthIDLocked(record.AuthID, record.AuthIndex)
 	if id == "" {
 		return
 	}
