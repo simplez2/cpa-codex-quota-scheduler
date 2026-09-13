@@ -81,13 +81,13 @@ func warmupResponseFailureCode(body []byte) string {
 	return preferredWarmupMetadataCode(values...)
 }
 
-// preferredWarmupMetadataCode gives any terminal policy/auth marker precedence
+// preferredWarmupMetadataCode gives any terminal policy/auth/provider marker precedence
 // over generic transport metadata at every envelope depth. Responses and proxy
 // wrappers can duplicate error metadata; a later server_error must never hide an
-// earlier cyber_policy/auth_unavailable marker and make the request retryable.
+// earlier cyber_policy/auth_unavailable marker.
 func preferredWarmupMetadataCode(values ...string) string {
 	for _, value := range values {
-		if canonical := canonicalNonRetryableWarmupCode(sanitizeWarmupCode(value)); canonical != "" {
+		if canonical := canonicalPriorityWarmupCode(sanitizeWarmupCode(value)); canonical != "" {
 			return canonical
 		}
 	}
@@ -105,7 +105,7 @@ func preferredWarmupMetadataCode(values ...string) string {
 // state. HTTP status remains the fallback diagnostic for unknown metadata.
 func safeWarmupResponseMetadataCode(raw string) string {
 	code := sanitizeWarmupCode(raw)
-	if canonical := canonicalNonRetryableWarmupCode(code); canonical != "" {
+	if canonical := canonicalPriorityWarmupCode(code); canonical != "" {
 		return canonical
 	}
 	switch code {
@@ -114,6 +114,21 @@ func safeWarmupResponseMetadataCode(raw string) string {
 		"request_timeout", "bad_gateway", "gateway_timeout", "not_found",
 		"response_failed", "response_incomplete":
 		return code
+	default:
+		return ""
+	}
+}
+
+func canonicalPriorityWarmupCode(code string) string {
+	if canonical := canonicalNonRetryableWarmupCode(code); canonical != "" {
+		return canonical
+	}
+	code = strings.ReplaceAll(strings.ToLower(strings.TrimSpace(code)), "-", "_")
+	switch {
+	case strings.Contains(code, "auth_unavailable"):
+		return "auth_unavailable"
+	case strings.Contains(code, "no_auth_available"):
+		return "no_auth_available"
 	default:
 		return ""
 	}

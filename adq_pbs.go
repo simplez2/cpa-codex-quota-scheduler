@@ -40,6 +40,7 @@ type adqPolicy struct {
 	BridgeModeThreshold   float64
 	MonteCarloScenarios   int
 	ReservationTimeout    time.Duration
+	SettlementTimeout     time.Duration
 	ResetJitterPercentile float64
 }
 
@@ -66,6 +67,7 @@ func defaultADQPolicy() adqPolicy {
 		BridgeModeThreshold:   1,
 		MonteCarloScenarios:   128,
 		ReservationTimeout:    45 * time.Second,
+		SettlementTimeout:     2 * time.Minute,
 		ResetJitterPercentile: 0.95,
 	}
 }
@@ -99,7 +101,9 @@ func classifyADQProviderError(status int, code, message string) adqProviderState
 	}
 	// For status-less executor errors, retain explicit semantic markers.
 	switch {
-	case strings.Contains(text, "auth_unavailable"), strings.Contains(text, "invalid_token"), strings.Contains(text, "authentication"):
+	case strings.Contains(text, "auth_unavailable"), strings.Contains(text, "no_auth_available"), strings.Contains(text, "no auth available"):
+		return adqProviderOverload
+	case strings.Contains(text, "invalid_token"), strings.Contains(text, "authentication"):
 		return adqProviderAuth
 	case strings.Contains(text, "usage_limit"), strings.Contains(text, "quota"), strings.Contains(text, "rate_limit"):
 		return adqProviderQuota
@@ -131,6 +135,8 @@ type adqAccountInput struct {
 	CacheColdBurn         float64
 	ReservationFiveHour   float64
 	ReservationWeekly     float64
+	SettlingFiveHour      float64
+	SettlingWeekly        float64
 	PendingFiveHour       float64
 	PendingWeekly         float64
 	ProviderState         adqProviderState
@@ -142,12 +148,14 @@ type adqAccountInput struct {
 	WeeklyDebt            float64
 	LastRoutingReason     string
 	AbsoluteCapacityKnown bool
+	CapacitySource        string
 }
 
 type adqAccountMetrics struct {
 	AuthID                     string           `json:"auth_id"`
 	AuthIndex                  string           `json:"auth_index,omitempty"`
 	Plan                       string           `json:"plan,omitempty"`
+	CapacitySource             string           `json:"capacity_source,omitempty"`
 	State                      string           `json:"state"`
 	W                          float64          `json:"weekly_capacity"`
 	w                          float64          `json:"-"`
@@ -186,6 +194,8 @@ type adqAccountMetrics struct {
 	Reason                     string           `json:"reason,omitempty"`
 	ReservationFiveHour        float64          `json:"reservation_5h"`
 	ReservationWeekly          float64          `json:"reservation_weekly"`
+	SettlingFiveHour           float64          `json:"settling_5h"`
+	SettlingWeekly             float64          `json:"settling_weekly"`
 }
 
 type adqPoolMetrics struct {
@@ -251,15 +261,29 @@ func adqFiveHourSafety(p adqPolicy) float64 {
 	return clampADQ(p.FiveHourSafetyMargin, 0, .5)
 }
 
-// adqEffectiveQuota implements the hard weekly gate and local reservation
-// deduction. A negative effective value is always clamped to zero.
-func adqEffectiveQuota(in adqAccountInput, p adqPolicy) (w, h float64) {
+// adqHardEffectiveQuota is the actual admission gate. It accounts for work
+// that is still running, but it intentionally excludes completed requests
+// whose provider telemetry has not caught up yet. That distinction lets a
+// healthy sticky conversation continue without treating telemetry lag as a
+// provider hard limit.
+func adqHardEffectiveQuota(in adqAccountInput, p adqPolicy) (w, h float64) {
 	weeklyCap := maxADQ(in.WeeklyCapacity, 0)
 	fiveCap := maxADQ(in.FiveHourCapacity, weeklyCap*p.MaxQuotaRatio5h)
 	weeklySafety := weeklyCap * adqWeeklySafety(p)
 	fiveSafety := fiveCap * adqFiveHourSafety(p)
 	w = maxADQ(0, in.WeeklyRemaining-in.ReservationWeekly-in.PendingWeekly-weeklySafety)
 	h = maxADQ(0, in.FiveHourRemaining-in.ReservationFiveHour-in.PendingFiveHour-fiveSafety)
+	return w, h
+}
+
+// adqEffectiveQuota is the scheduling waterline. A completed request remains a
+// bounded local debt until a newer quota observation acknowledges it or the
+// settlement timeout expires. This prevents stale provider percentages from
+// repeatedly sending fresh sessions to the same account.
+func adqEffectiveQuota(in adqAccountInput, p adqPolicy) (w, h float64) {
+	w, h = adqHardEffectiveQuota(in, p)
+	w = maxADQ(0, w-in.SettlingWeekly)
+	h = maxADQ(0, h-in.SettlingFiveHour)
 	return w, h
 }
 
@@ -403,28 +427,30 @@ func adqPhaseBucket(anchor, now time.Time, p adqPolicy) int {
 }
 
 func adqAssessAccount(in adqAccountInput, p adqPolicy, now time.Time) adqAccountMetrics {
-	m := adqAccountMetrics{AuthID: strings.TrimSpace(in.ID), AuthIndex: strings.TrimSpace(in.AuthIndex), Plan: in.Plan,
+	m := adqAccountMetrics{AuthID: strings.TrimSpace(in.ID), AuthIndex: strings.TrimSpace(in.AuthIndex), Plan: in.Plan, CapacitySource: in.CapacitySource,
 		W: maxADQ(in.WeeklyCapacity, 0), H: maxADQ(in.FiveHourCapacity, maxADQ(in.WeeklyCapacity, 0)*p.MaxQuotaRatio5h),
 		Next5hReset: in.FiveHourResetAt, NextWeekReset: in.WeeklyResetAt, PhaseAnchorMode: in.PhaseAnchorMode,
-		WeeklyDebt: in.WeeklyDebt, ProviderState: in.ProviderState, ProviderRetryAt: in.ProviderRetryAt, ReservationFiveHour: in.ReservationFiveHour, ReservationWeekly: in.ReservationWeekly}
+		WeeklyDebt: in.WeeklyDebt, ProviderState: in.ProviderState, ProviderRetryAt: in.ProviderRetryAt,
+		ReservationFiveHour: in.ReservationFiveHour, ReservationWeekly: in.ReservationWeekly,
+		SettlingFiveHour: in.SettlingFiveHour, SettlingWeekly: in.SettlingWeekly}
 	if m.H <= 0 {
 		m.H = m.W * p.MaxQuotaRatio5h
 	}
+	hardW, hardH := adqHardEffectiveQuota(in, p)
 	m.w, m.h = adqEffectiveQuota(in, p)
 	m.WEffective, m.HEffective = m.w, m.h
 	m.Kappa = 0
 	if m.H > 0 {
-		// Both windows are hard limits. A high weekly balance cannot compensate
-		// for a depleted 5h window, so the common headroom is the minimum of the
-		// two normalized balances.
-		m.Kappa = minADQ(m.w, m.h) / m.H
+		// Kappa describes future complete 5h chunks backed by the weekly
+		// reservoir. Current 5h headroom remains an independent hard gate.
+		m.Kappa = m.w / m.H
 	}
 	m.FullWidthContribution = 0
-	if m.H > 0 && m.w >= m.H-1e-9 && m.h >= m.H-1e-9 {
+	if m.H > 0 && m.w >= m.H-1e-9 {
 		m.FullWidthContribution = 1
 	}
 	if m.H > 0 {
-		m.EffectiveWidthContribution = clampADQ(minADQ(m.w, m.h)/m.H, 0, 1)
+		m.EffectiveWidthContribution = clampADQ(m.w/m.H, 0, 1)
 	}
 	m.WeeklyWaterline = 0
 	if m.W > 0 {
@@ -505,14 +531,18 @@ func adqAssessAccount(in adqAccountInput, p adqPolicy, now time.Time) adqAccount
 		m.ProviderState = providerState
 	}
 	providerReady := providerState == "" || providerState == adqProviderHealthy
-	m.Eligible = in.Healthy && providerReady && m.w > 0 && m.h > 0
+	gateW, gateH := m.w, m.h
+	if in.Sticky {
+		gateW, gateH = hardW, hardH
+	}
+	m.Eligible = in.Healthy && providerReady && gateW > 0 && gateH > 0
 	if !in.Healthy {
 		m.Reason = "unhealthy"
 		m.State = "UNHEALTHY"
-	} else if m.w <= 0 {
+	} else if gateW <= 0 {
 		m.Reason = "weekly_exhausted"
 		m.State = "ACCOUNT_DEAD"
-	} else if m.h <= 0 {
+	} else if gateH <= 0 {
 		m.Reason = "five_hour_exhausted"
 		m.State = "5H_COOLDOWN"
 	} else if providerState == adqProviderOverload && now.Before(in.ProviderRetryAt) {
@@ -521,6 +551,9 @@ func adqAssessAccount(in adqAccountInput, p adqPolicy, now time.Time) adqAccount
 	} else if providerState == adqProviderQuota {
 		m.Reason = "quota_exhausted"
 		m.State = "ACCOUNT_DEAD"
+	} else if in.Sticky && (m.w <= 0 || m.h <= 0) {
+		m.State = "READY"
+		m.Reason = "sticky_settlement_pending"
 	} else {
 		m.State = "READY"
 		m.Reason = "eligible"
@@ -569,13 +602,12 @@ func adqProjectedMetrics(accounts []adqAccountMetrics, candidate string, debitWe
 		m.FullWidthContribution = 0
 		m.EffectiveWidthContribution = 0
 		if m.H > 0 {
-			common := minADQ(m.WEffective, m.HEffective)
-			m.ProjectedKappa = common / m.H
+			m.ProjectedKappa = m.WEffective / m.H
 			m.Kappa = m.ProjectedKappa
-			if common >= m.H-1e-9 {
+			if m.WEffective >= m.H-1e-9 {
 				m.FullWidthContribution = 1
 			}
-			m.EffectiveWidthContribution = clampADQ(common/m.H, 0, 1)
+			m.EffectiveWidthContribution = clampADQ(m.WEffective/m.H, 0, 1)
 		}
 		m.Tail = m.WEffective > 0 && m.HEffective > 0 && m.H > 0 && (m.WEffective < m.H || m.HEffective < m.H)
 	}
@@ -771,7 +803,7 @@ func adqResetTransition(previous, current adqAccountMetrics, now time.Time) bool
 	if !previous.NextWeekReset.After(now) || current.NextWeekReset.After(previous.NextWeekReset.Add(2*time.Minute)) {
 		return true
 	}
-	return current.w < previous.w-0.10*maxADQ(previous.W, 1) && current.w > 0.5*maxADQ(current.W, 1)
+	return current.w > previous.w+0.10*maxADQ(previous.W, 1) && current.w > 0.5*maxADQ(current.W, 1)
 }
 
 func adqEpochID(resetAt time.Time, fallback time.Time) string {
@@ -789,22 +821,41 @@ type adqReservationStatus string
 const (
 	adqReservationActive     adqReservationStatus = "active"
 	adqReservationReleased   adqReservationStatus = "released"
+	adqReservationSettling   adqReservationStatus = "settling"
 	adqReservationReconciled adqReservationStatus = "reconciled"
 	adqReservationExpired    adqReservationStatus = "expired"
 )
 
+type adqSettlementWindowBaseline struct {
+	Known             bool
+	ObservedAt        time.Time
+	ResetAt           time.Time
+	UsedPercent       float64
+	UsageCredits      float64
+	UsageCreditsKnown bool
+}
+
+type adqSettlementBaseline struct {
+	FiveHour adqSettlementWindowBaseline
+	Weekly   adqSettlementWindowBaseline
+}
+
 type adqReservation struct {
-	ID             string               `json:"reservation_id"`
-	AuthID         string               `json:"auth_id"`
-	SessionKey     string               `json:"session_key,omitempty"`
-	Model          string               `json:"model,omitempty"`
-	FiveHour       float64              `json:"reserved_5h"`
-	Weekly         float64              `json:"reserved_week"`
-	CreatedAt      time.Time            `json:"created_at"`
-	ExpiresAt      time.Time            `json:"expires_at"`
-	Status         adqReservationStatus `json:"status"`
-	ActualFiveHour float64              `json:"actual_5h,omitempty"`
-	ActualWeekly   float64              `json:"actual_week,omitempty"`
+	ID               string                `json:"reservation_id"`
+	AuthID           string                `json:"auth_id"`
+	SessionKey       string                `json:"session_key,omitempty"`
+	Model            string                `json:"model,omitempty"`
+	FiveHour         float64               `json:"reserved_5h"`
+	Weekly           float64               `json:"reserved_week"`
+	CreatedAt        time.Time             `json:"created_at"`
+	ExpiresAt        time.Time             `json:"expires_at"`
+	Status           adqReservationStatus  `json:"status"`
+	ActualFiveHour   float64               `json:"actual_5h,omitempty"`
+	ActualWeekly     float64               `json:"actual_week,omitempty"`
+	SettledAt        time.Time             `json:"settled_at,omitempty"`
+	SettleExpiresAt  time.Time             `json:"settle_expires_at,omitempty"`
+	SettlementReason string                `json:"settlement_reason,omitempty"`
+	Baseline         adqSettlementBaseline `json:"-"`
 }
 
 type adqReservationCapacity struct{ FiveHour, Weekly float64 }
@@ -850,10 +901,23 @@ func (b *adqReservationBook) expireLocked(now time.Time) int {
 	}
 	n := 0
 	for id, r := range b.reservations {
-		if r.Status != adqReservationActive || r.ExpiresAt.IsZero() || now.Before(r.ExpiresAt) {
+		switch r.Status {
+		case adqReservationActive:
+			if r.ExpiresAt.IsZero() || now.Before(r.ExpiresAt) {
+				continue
+			}
+			r.Status = adqReservationExpired
+		case adqReservationSettling:
+			if r.SettleExpiresAt.IsZero() || now.Before(r.SettleExpiresAt) {
+				continue
+			}
+			r.Status = adqReservationReconciled
+			r.ActualFiveHour = 0
+			r.ActualWeekly = 0
+			r.SettlementReason = "ttl"
+		default:
 			continue
 		}
-		r.Status = adqReservationExpired
 		b.reservations[id] = r
 		n++
 	}
@@ -881,6 +945,39 @@ func (b *adqReservationBook) Reserved(authID string, now time.Time) (float64, fl
 	b.ensure()
 	return b.reservedLocked(strings.TrimSpace(authID), now)
 }
+
+func (b *adqReservationBook) settlingLocked(authID string, now time.Time) (fiveHour, weekly float64) {
+	b.expireLocked(now)
+	all := strings.TrimSpace(authID) == ""
+	for _, r := range b.reservations {
+		if (!all && r.AuthID != strings.TrimSpace(authID)) || r.Status != adqReservationSettling {
+			continue
+		}
+		fiveHour += r.ActualFiveHour
+		weekly += r.ActualWeekly
+	}
+	return
+}
+
+func (b *adqReservationBook) Settling(authID string, now time.Time) (float64, float64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.ensure()
+	return b.settlingLocked(strings.TrimSpace(authID), now)
+}
+
+// CoversPending reports whether the reservation still represents a running
+// request. Once the short reservation lease expires, balanced pending state
+// resumes the predicted debit until the matching completion arrives.
+func (b *adqReservationBook) CoversPending(id string, now time.Time) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.ensure()
+	b.expireLocked(now)
+	r, ok := b.reservations[strings.TrimSpace(id)]
+	return ok && r.Status == adqReservationActive
+}
+
 func (b *adqReservationBook) TryReserve(req adqReservationRequest, now time.Time) (adqReservation, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -915,12 +1012,16 @@ func (b *adqReservationBook) transition(id string, status adqReservationStatus, 
 	if !ok {
 		return false
 	}
-	if r.Status != adqReservationActive {
+	if r.Status == adqReservationReleased || r.Status == adqReservationReconciled {
 		return true
 	}
 	r.Status = status
 	r.ActualFiveHour = maxADQ(actualFive, 0)
 	r.ActualWeekly = maxADQ(actualWeek, 0)
+	if status == adqReservationReleased || status == adqReservationReconciled {
+		r.ActualFiveHour = 0
+		r.ActualWeekly = 0
+	}
 	b.reservations[id] = r
 	b.version++
 	return true
@@ -931,9 +1032,168 @@ func (b *adqReservationBook) Release(id string) bool {
 	return b.transition(strings.TrimSpace(id), adqReservationReleased, 0, 0)
 }
 func (b *adqReservationBook) Reconcile(id string, actualFive, actualWeek float64) bool {
+	return b.Settle(id, actualFive, actualWeek, quotaSnapshot{}, time.Now(), 2*time.Minute)
+}
+
+func adqSettlementBaselineForClass(snapshot quotaSnapshot, class string) adqSettlementWindowBaseline {
+	class = normalizeWindowClass(class)
+	for _, window := range snapshot.Windows {
+		if normalizeWindowClass(window.Class) != class {
+			continue
+		}
+		observedAt := window.ObservedAt
+		if observedAt.IsZero() {
+			observedAt = snapshot.RefreshedAt
+		}
+		return adqSettlementWindowBaseline{
+			Known: true, ObservedAt: observedAt, ResetAt: window.ResetAt,
+			UsedPercent: window.UsedPercent, UsageCredits: window.WindowUsageCredits,
+			UsageCreditsKnown: window.WindowUsageCreditsKnown,
+		}
+	}
+	return adqSettlementWindowBaseline{}
+}
+
+func adqSettlementBaselineFromSnapshot(snapshot quotaSnapshot) adqSettlementBaseline {
+	return adqSettlementBaseline{
+		FiveHour: adqSettlementBaselineForClass(snapshot, "5h"),
+		Weekly:   adqSettlementBaselineForClass(snapshot, "weekly"),
+	}
+}
+
+func adqSettlementTTL(cooldown time.Duration) time.Duration {
+	if cooldown <= 0 {
+		cooldown = 2 * time.Minute
+	}
+	if cooldown < 30*time.Second {
+		return 30 * time.Second
+	}
+	if cooldown > 10*time.Minute {
+		return 10 * time.Minute
+	}
+	return cooldown
+}
+
+// Settle converts an active or lease-expired reservation into a bounded local
+// debt. The caller passes actual usage when CPA reported tokens, otherwise its
+// original prediction. A later quota observation clears each quota layer
+// independently.
+func (b *adqReservationBook) Settle(id string, actualFive, actualWeek float64, snapshot quotaSnapshot, now time.Time, ttl time.Duration) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.transition(strings.TrimSpace(id), adqReservationReconciled, actualFive, actualWeek)
+	b.ensure()
+	id = strings.TrimSpace(id)
+	r, ok := b.reservations[id]
+	if !ok {
+		return false
+	}
+	if r.Status == adqReservationReleased || r.Status == adqReservationReconciled {
+		return true
+	}
+	if r.Status == adqReservationSettling {
+		return true
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	actualFive = maxADQ(actualFive, 0)
+	actualWeek = maxADQ(actualWeek, 0)
+	if actualFive <= 0 && actualWeek <= 0 {
+		r.Status = adqReservationReconciled
+		r.ActualFiveHour = 0
+		r.ActualWeekly = 0
+		r.SettlementReason = "zero"
+		b.reservations[id] = r
+		b.version++
+		return true
+	}
+	r.Status = adqReservationSettling
+	r.ActualFiveHour = actualFive
+	r.ActualWeekly = actualWeek
+	r.SettledAt = now
+	r.SettleExpiresAt = now.Add(adqSettlementTTL(ttl))
+	r.SettlementReason = ""
+	r.Baseline = adqSettlementBaselineFromSnapshot(snapshot)
+	b.reservations[id] = r
+	b.version++
+	return true
+}
+
+func adqSettlementWindowObserved(baseline adqSettlementWindowBaseline, current quotaWindow, fallbackObservedAt, settledAt time.Time) bool {
+	if !baseline.Known {
+		return false
+	}
+	observedAt := current.ObservedAt
+	if observedAt.IsZero() {
+		observedAt = fallbackObservedAt
+	}
+	boundary := baseline.ObservedAt
+	if settledAt.After(boundary) {
+		boundary = settledAt
+	}
+	if observedAt.IsZero() || !observedAt.After(boundary) {
+		return false
+	}
+	if current.UsedPercent > baseline.UsedPercent+1e-9 || current.UsedPercent < baseline.UsedPercent-1e-9 {
+		return true
+	}
+	if baseline.UsageCreditsKnown && current.WindowUsageCreditsKnown && current.WindowUsageCredits > baseline.UsageCredits+1e-9 {
+		return true
+	}
+	if !baseline.ResetAt.IsZero() && !current.ResetAt.IsZero() && !sameQuotaCycle(baseline.ResetAt, current.ResetAt) {
+		return true
+	}
+	return false
+}
+
+func adqSettlementCurrentWindow(snapshot quotaSnapshot, class string) (quotaWindow, bool) {
+	class = normalizeWindowClass(class)
+	for _, window := range snapshot.Windows {
+		if normalizeWindowClass(window.Class) == class {
+			return window, true
+		}
+	}
+	return quotaWindow{}, false
+}
+
+// ObserveQuota acknowledges settling debt only when a strictly newer
+// observation changes usage, usage credits, or the reset cycle. An unchanged
+// snapshot therefore cannot erase local debt merely because it was polled.
+func (b *adqReservationBook) ObserveQuota(authID string, snapshot quotaSnapshot, now time.Time) int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.ensure()
+	b.expireLocked(now)
+	authID = strings.TrimSpace(authID)
+	changed := 0
+	for id, r := range b.reservations {
+		if r.Status != adqReservationSettling || r.AuthID != authID {
+			continue
+		}
+		if r.ActualFiveHour > 0 {
+			if current, ok := adqSettlementCurrentWindow(snapshot, "5h"); ok &&
+				adqSettlementWindowObserved(r.Baseline.FiveHour, current, snapshot.RefreshedAt, r.SettledAt) {
+				r.ActualFiveHour = 0
+				changed++
+			}
+		}
+		if r.ActualWeekly > 0 {
+			if current, ok := adqSettlementCurrentWindow(snapshot, "weekly"); ok &&
+				adqSettlementWindowObserved(r.Baseline.Weekly, current, snapshot.RefreshedAt, r.SettledAt) {
+				r.ActualWeekly = 0
+				changed++
+			}
+		}
+		if r.ActualFiveHour <= 0 && r.ActualWeekly <= 0 {
+			r.Status = adqReservationReconciled
+			r.SettlementReason = "telemetry"
+		}
+		b.reservations[id] = r
+	}
+	if changed > 0 {
+		b.version++
+	}
+	return changed
 }
 func (b *adqReservationBook) Expire(now time.Time) int {
 	b.mu.Lock()

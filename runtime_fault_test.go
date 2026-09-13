@@ -253,7 +253,7 @@ func TestConcurrentPersistenceKeepsLatestQuarantineState(t *testing.T) {
 	if err := json.Unmarshal(raw, &persisted); err != nil {
 		t.Fatal(err)
 	}
-	if persisted.Version != 6 || len(persisted.Bans) != entries {
-		t.Fatalf("persisted state version=%d bans=%d; want version 6 and %d bans", persisted.Version, len(persisted.Bans), entries)
+	if persisted.Version != 7 || len(persisted.Bans) != entries {
+		t.Fatalf("persisted state version=%d bans=%d; want version 7 and %d bans", persisted.Version, len(persisted.Bans), entries)
 	}
 }

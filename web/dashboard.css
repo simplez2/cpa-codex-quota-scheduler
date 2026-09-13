@@ -588,6 +588,9 @@ footer {
 .settings-details .settings-fields { border:0; padding:0; }
 .warmup-records { margin-top:20px; }
 .warmup-records .warmups { max-height:none; }
+.epoch-status { margin-top:20px; }
+.epoch-metrics { margin-bottom:16px; }
+.epoch-status .warmups { max-height:360px; }
 .save-bar { position:sticky; bottom:14px; display:flex; justify-content:space-between; align-items:center; gap:20px; padding:16px 20px; margin-top:24px; border:1px solid var(--accent); border-radius:10px; background:var(--surface); box-shadow:0 8px 30px #00000016; z-index:3; }
 .save-bar p { font-size:12px; margin-top:4px; }
 .primary-button { color:var(--surface); background:var(--accent); border-color:var(--accent); }

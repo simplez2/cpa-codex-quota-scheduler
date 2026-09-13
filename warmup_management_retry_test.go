@@ -18,7 +18,6 @@ func TestManagementWarmupNonRetryableFailuresStayBlocked(t *testing.T) {
 	for _, errorCode := range []string{
 		"cyber_policy",
 		"cyber_abuse",
-		"auth_unavailable",
 		"deactivated_workspace",
 	} {
 		t.Run(errorCode, func(t *testing.T) {
@@ -76,6 +75,40 @@ func TestManagementWarmupNonRetryableFailuresStayBlocked(t *testing.T) {
 				t.Fatalf("blocked error %q retried immediately: api-calls=%d", errorCode, got)
 			}
 		})
+	}
+}
+
+func TestManagementWarmupAuthUnavailableRemainsRetryable(t *testing.T) {
+	resetBanStoreForTest()
+	t.Cleanup(resetBanStoreForTest)
+	keyPath := filepath.Join(t.TempDir(), "management-key")
+	if err := os.WriteFile(keyPath, []byte("test-key\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v0/management/auth-files":
+			_ = json.NewEncoder(w).Encode(map[string]any{"files": []map[string]any{{
+				"id": "acct", "auth_index": "idx-acct", "provider": providerCodex, "status": "active",
+			}}})
+		case "/v0/management/api-call":
+			_ = json.NewEncoder(w).Encode(cpaAPICallResponse{
+				StatusCode: http.StatusServiceUnavailable,
+				Body:       `{"status":"failed","error":{"code":"auth_unavailable"}}`,
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	state := newManagementWarmupRuntimeForRetryTest(t, server.URL, keyPath)
+	defer state.stop()
+	state.scheduleWarmup(context.Background(), nil)
+	state.wg.Wait()
+	entry := state.warmups[warmupKey("acct", "5h")]
+	if entry.Error != "auth_unavailable" || entry.Blocked {
+		t.Fatalf("temporary CPA auth availability became a permanent block: %#v", entry)
 	}
 }
 

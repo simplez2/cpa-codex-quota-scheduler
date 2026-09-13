@@ -651,7 +651,7 @@ func TestSerialStatePersistenceIncludesActiveAuth(t *testing.T) {
 	if err := json.Unmarshal(raw, &persisted); err != nil {
 		t.Fatal(err)
 	}
-	if persisted.Version != 6 || persisted.SerialActiveAuthID != "primary" || persisted.SerialSwitches != 3 || persisted.SerialFallbacks != 7 {
+	if persisted.Version != 7 || persisted.SerialActiveAuthID != "primary" || persisted.SerialSwitches != 3 || persisted.SerialFallbacks != 7 {
 		t.Fatalf("serial persistence = %#v", persisted)
 	}
 }

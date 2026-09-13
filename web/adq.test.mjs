@@ -14,10 +14,11 @@ test('ADQ diagnostics format capacity, percentages and countdowns',()=>{
   assert.equal(context.adqBottleneckText('WEEK_CONSTRAINED'),'周额度受限');
 });
 test('ADQ metric pairs expose width, waterline, reservations and last decision',()=>{
-  const pairs=context.adqMetricPairs({enabled:true,using_fallback:false,reservations_active:2,reservation_collisions:1,calibrated_accounts:3,accounts_total:4,last_decision_auth_id:'a',last_decision_reason:'保持粘性',pool:{FullWidth:2,EffectiveWidth:2.5,M_week:1.2,M_5h:.9,M_phase:1.1,bottleneck:'RISK',current_demand_per_hour:3,forecast_demand_p95:15}});
+  const pairs=context.adqMetricPairs({enabled:true,using_fallback:false,reservations_active:2,reservations_settling:3,settling_5h:.4,settling_weekly:.5,reservation_collisions:1,calibrated_accounts:3,estimated_accounts:1,accounts_total:4,last_decision_auth_id:'a',last_decision_reason:'保持粘性',pool:{FullWidth:2,EffectiveWidth:2.5,M_week:1.2,M_5h:.9,M_phase:1.1,bottleneck:'RISK',current_demand_per_hour:3,forecast_demand_p95:15}});
   const map=Object.fromEntries(pairs);
   assert.equal(map['FullWidth / EffectiveWidth'],'2 / 2.5');
   assert.match(map['风险水位'],/周 1.2 · 5h 0.9 · 阶段 1.1/);
-  assert.match(map.Reservation,/2 个在途 · 1 次冲突/);
+  assert.match(map.Reservation,/2 个在途 · 3 个待额度确认（5h 0.4 \/ 周 0.5）· 1 次冲突/);
+  assert.match(map['容量来源'],/真实校准 3 · 套餐先验 1 · 共 4/);
   assert.match(map['最近决策'],/a · 保持粘性/);
 });

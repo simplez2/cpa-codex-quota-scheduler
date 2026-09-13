@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-func TestClassifyWarmupFailureBlocksPolicyAndAuthenticationErrors(t *testing.T) {
+func TestClassifyWarmupFailureSeparatesHardAuthFromTemporaryProviderAvailability(t *testing.T) {
 	tests := []struct {
 		name        string
 		status      int
@@ -21,7 +21,7 @@ func TestClassifyWarmupFailureBlocksPolicyAndAuthenticationErrors(t *testing.T) 
 		{name: "unauthorized", status: http.StatusUnauthorized, err: errors.New("request failed"), wantCode: "http_401", wantBlocked: true},
 		{name: "forbidden", status: http.StatusForbidden, err: errors.New("request failed"), wantCode: "http_403", wantBlocked: true},
 		{name: "quota", status: http.StatusTooManyRequests, err: errors.New("request failed"), wantCode: "http_429", wantBlocked: false},
-		{name: "auth unavailable", status: http.StatusServiceUnavailable, err: errors.New("auth_unavailable: no auth available"), wantCode: "auth_unavailable", wantBlocked: true},
+		{name: "auth unavailable", status: http.StatusServiceUnavailable, err: errors.New("auth_unavailable: no auth available"), wantCode: "auth_unavailable", wantBlocked: false},
 		{name: "incomplete", err: errWarmupStreamIncomplete, wantCode: "response_incomplete", wantBlocked: false},
 		{name: "timeout", err: context.DeadlineExceeded, wantCode: "timeout", wantBlocked: false},
 		{name: "server error", status: http.StatusServiceUnavailable, err: errors.New("temporary upstream failure"), wantCode: "http_503", wantBlocked: false},
@@ -65,7 +65,7 @@ func TestWarmupHTTPStatusErrorUsesOnlyBoundedStructuredMetadata(t *testing.T) {
 			name:     "nested auth code",
 			status:   http.StatusServiceUnavailable,
 			body:     `{"error":{"code":"auth_unavailable","message":"Bearer must-not-be-persisted"}}`,
-			wantCode: "auth_unavailable", wantBlocked: true,
+			wantCode: "auth_unavailable", wantBlocked: false,
 		},
 		{
 			name:     "nested policy type",
@@ -107,7 +107,7 @@ func TestWarmupHTTPStatusErrorUsesOnlyBoundedStructuredMetadata(t *testing.T) {
 			name:     "inner terminal overrides outer generic",
 			status:   http.StatusServiceUnavailable,
 			body:     `{"code":"server_error","error":{"code":"auth_unavailable"}}`,
-			wantCode: "auth_unavailable", wantBlocked: true,
+			wantCode: "auth_unavailable", wantBlocked: false,
 		},
 		{
 			name:     "message is never classified",
@@ -199,8 +199,8 @@ func TestWarmupParsersNeverLetGenericMetadataHideTerminalCode(t *testing.T) {
 	if err == nil || out.ErrorCode != "auth_unavailable" {
 		t.Fatalf("conflicting SSE metadata = %#v, err=%v; terminal code must win", out, err)
 	}
-	if code, blocked := classifyWarmupFailure(http.StatusOK, err); code != "auth_unavailable" || !blocked {
-		t.Fatalf("conflicting SSE classify = %q blocked=%v; want auth_unavailable blocked", code, blocked)
+	if code, blocked := classifyWarmupFailure(http.StatusOK, err); code != "auth_unavailable" || blocked {
+		t.Fatalf("conflicting SSE classify = %q blocked=%v; want retryable auth_unavailable", code, blocked)
 	}
 }
 

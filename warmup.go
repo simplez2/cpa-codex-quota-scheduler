@@ -37,12 +37,14 @@ type warmupEntry struct {
 	Error         string    `json:"error,omitempty"`
 	DispatchState string    `json:"dispatch_state,omitempty"`
 	Blocked       bool      `json:"blocked,omitempty"`
+	EpochID       string    `json:"epoch_id,omitempty"`
 }
 
 type warmupCandidate struct {
 	Snapshot quotaSnapshot
 	Window   quotaWindow
 	RetryAt  time.Time
+	EpochID  string
 }
 
 type warmupAuthBinding struct {
@@ -126,23 +128,25 @@ func (s *schedulerRuntimeState) scheduleWarmup(parent context.Context, skipAuthI
 	s.mu.RLock()
 	cfg := s.cfg
 	foregroundBusy := false
+	foregroundAuthIDs := make(map[string]struct{})
+	epochPending := s.quotaEpochHasPendingLocked()
 	if cfg.SchedulerMode == "balanced" {
 		now := time.Now()
-		for _, account := range s.balancedAccounts {
+		for authID, account := range s.balancedAccounts {
 			if now.Sub(account.LastPicked) < time.Minute {
 				foregroundBusy = true
-				break
+				foregroundAuthIDs[authID] = struct{}{}
 			}
 			for _, pending := range account.Pending {
 				if now.Sub(pending.At) < balancedPendingTTL {
 					foregroundBusy = true
-					break
+					foregroundAuthIDs[authID] = struct{}{}
 				}
 			}
 		}
 	}
 	s.mu.RUnlock()
-	if !cfg.Enabled || !cfg.WarmupEnabled || foregroundBusy || strings.TrimSpace(cfg.StatePath) == "" || parent.Err() != nil {
+	if !cfg.Enabled || !cfg.WarmupEnabled || (foregroundBusy && !epochPending) || strings.TrimSpace(cfg.StatePath) == "" || parent.Err() != nil {
 		return
 	}
 	if !s.generationOwnerActive() {
@@ -222,7 +226,14 @@ func (s *schedulerRuntimeState) scheduleWarmup(parent context.Context, skipAuthI
 		slog.Warn("codex-quota-scheduler: warmup skipped because CPA auth status is unavailable", "error_code", code)
 		return
 	}
-	candidates := s.findWarmupCandidates(eligible, skipAuthIDs, time.Now())
+	effectiveSkip := make(map[string]struct{}, len(skipAuthIDs)+len(foregroundAuthIDs))
+	for id := range skipAuthIDs {
+		effectiveSkip[id] = struct{}{}
+	}
+	for id := range foregroundAuthIDs {
+		effectiveSkip[id] = struct{}{}
+	}
+	candidates := s.findWarmupCandidates(eligible, effectiveSkip, time.Now())
 	if len(candidates) == 0 || parent.Err() != nil || !s.generationOwnerActive() {
 		releaseInstanceLease()
 		return
@@ -258,6 +269,7 @@ func (s *schedulerRuntimeState) scheduleWarmup(parent context.Context, skipAuthI
 		Window:      candidate.Window.Class,
 		AttemptedAt: now,
 		Failures:    failures,
+		EpochID:     candidate.EpochID,
 		// A crash after admission gives no proof that upstream did not execute.
 		SuppressUntil: now.Add(warmupUncertainDelay),
 	}
@@ -318,6 +330,7 @@ func (s *schedulerRuntimeState) findWarmupCandidates(eligible map[string]warmupA
 	for key, poll := range s.quotaPolls {
 		polls[key] = poll
 	}
+	epoch := cloneQuotaEpochState(s.quotaEpoch)
 	s.mu.RUnlock()
 
 	seen := make(map[string]struct{})
@@ -336,11 +349,12 @@ func (s *schedulerRuntimeState) findWarmupCandidates(eligible map[string]warmupA
 			continue
 		}
 		seen[authID] = struct{}{}
-		if authID == activeID || polls[authID].Error != "" || !warmupQuotaHasHeadroom(snapshot, cfg) {
+		epochID, epochAllowed := quotaEpochWarmupAllowance(epoch, snapshot, polls[authID], now)
+		if (authID == activeID && !epochAllowed) || polls[authID].Error != "" || !warmupQuotaHasHeadroom(snapshot, cfg) {
 			skippedIneligible++
 			continue
 		}
-		if !warmupSnapshotFresh(snapshot, now, cfg.StaleAfter) {
+		if !warmupSnapshotFreshForEpoch(snapshot, now, cfg.StaleAfter, epochAllowed) {
 			skippedStale++
 			continue
 		}
@@ -370,7 +384,7 @@ func (s *schedulerRuntimeState) findWarmupCandidates(eligible map[string]warmupA
 			continue
 		}
 		if window, ok := unstartedWarmupWindow(snapshot, now); ok {
-			candidates = append(candidates, warmupCandidate{Snapshot: snapshot, Window: window})
+			candidates = append(candidates, warmupCandidate{Snapshot: snapshot, Window: window, EpochID: epochID})
 		} else {
 			skippedNotNeeded++
 		}
@@ -418,11 +432,10 @@ func (s *schedulerRuntimeState) countActionableWarmupCandidates(candidates []war
 	s.warmupMu.Lock()
 	defer s.warmupMu.Unlock()
 	count := 0
-	suppressed := s.warmupSuppressedAccountsLocked(now, retryAfter)
 	for _, candidate := range candidates {
 		key := warmupKey(candidate.Snapshot.AuthID, candidate.Window.Class)
 		entry, ok := s.warmups[key]
-		if !suppressed[candidate.Snapshot.AuthID] &&
+		if !s.warmupAccountSuppressesCandidateLocked(candidate, now, retryAfter) &&
 			(!ok || staleWarmupState(entry, candidate, now, retryAfter) || !warmupEntrySuppressesNow(entry, now, retryAfter)) {
 			count++
 		}
@@ -470,6 +483,26 @@ func warmupSnapshotFresh(snapshot quotaSnapshot, now time.Time, staleAfter time.
 		}
 		observedAt := window.ObservedAt
 		if observedAt.IsZero() || now.Before(observedAt) || now.Sub(observedAt) > staleAfter {
+			return false
+		}
+	}
+	return true
+}
+
+func warmupSnapshotFreshForEpoch(snapshot quotaSnapshot, now time.Time, staleAfter time.Duration, epoch bool) bool {
+	if !epoch {
+		return warmupSnapshotFresh(snapshot, now, staleAfter)
+	}
+	maxAge := quotaEpochWarmupSnapshotAge
+	if snapshot.RefreshedAt.IsZero() || now.Before(snapshot.RefreshedAt) || now.Sub(snapshot.RefreshedAt) > maxAge {
+		return false
+	}
+	for _, window := range snapshot.Windows {
+		if normalizeWindowClass(window.Class) == "" {
+			continue
+		}
+		observedAt := window.ObservedAt
+		if observedAt.IsZero() || now.Before(observedAt) || now.Sub(observedAt) > maxAge {
 			return false
 		}
 	}
@@ -598,9 +631,8 @@ func (s *schedulerRuntimeState) nextWarmupCandidateLocked(candidates []warmupCan
 
 // Generation changes never shorten a persisted request's suppression period.
 func (s *schedulerRuntimeState) nextWarmupCandidateForGenerationLocked(candidates []warmupCandidate, now time.Time, retryAfter time.Duration, generationClaimedAt time.Time) (warmupCandidate, string, bool) {
-	suppressed := s.warmupSuppressedAccountsLocked(now, retryAfter)
 	for _, candidate := range candidates {
-		if suppressed[candidate.Snapshot.AuthID] {
+		if s.warmupAccountSuppressesCandidateLocked(candidate, now, retryAfter) {
 			continue
 		}
 		key := warmupKey(candidate.Snapshot.AuthID, candidate.Window.Class)
@@ -621,6 +653,9 @@ func (s *schedulerRuntimeState) nextWarmupCandidateForGenerationLocked(candidate
 func staleWarmupState(entry warmupEntry, candidate warmupCandidate, now time.Time, retryAfter time.Duration) bool {
 	if entry.Blocked {
 		return false
+	}
+	if candidate.EpochID != "" && entry.EpochID != "" && candidate.EpochID != entry.EpochID {
+		return true
 	}
 	// A drifting zero-usage placeholder is not proof that a completed request
 	// failed. Keep the original suppression deadline, including pending rows.
@@ -726,6 +761,24 @@ func (s *schedulerRuntimeState) warmupSuppressedForGenerationLocked(key string, 
 		return true
 	}
 	return warmupEntrySuppressesNow(entry, now, retryAfter)
+}
+
+func (s *schedulerRuntimeState) warmupAccountSuppressesCandidateLocked(candidate warmupCandidate, now time.Time, retryAfter time.Duration) bool {
+	for _, entry := range s.warmups {
+		if strings.TrimSpace(entry.AuthID) != strings.TrimSpace(candidate.Snapshot.AuthID) {
+			continue
+		}
+		if entry.Blocked && quotaEpochHardWarmupBlock(entry) {
+			return true
+		}
+		if candidate.EpochID != "" && entry.EpochID != "" && entry.EpochID != candidate.EpochID {
+			continue
+		}
+		if entry.Blocked || ((entry.Error != "" || entry.CompletedAt.IsZero()) && warmupEntrySuppressesNow(entry, now, retryAfter)) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *schedulerRuntimeState) executeWarmup(parent context.Context, cfg pluginConfig, candidate warmupCandidate) {
@@ -961,6 +1014,7 @@ func (s *schedulerRuntimeState) recordWarmupOutcome(candidate warmupCandidate, s
 	target.AuthID = candidate.Snapshot.AuthID
 	target.AuthIndex = candidate.Snapshot.AuthIndex
 	target.Window = candidate.Window.Class
+	target.EpochID = candidate.EpochID
 	target.Status = status
 	target.OutcomeAt = now
 	if err != nil {
@@ -1035,6 +1089,7 @@ func (s *schedulerRuntimeState) recordWarmupOutcome(candidate warmupCandidate, s
 			entry.AuthID = candidate.Snapshot.AuthID
 			entry.AuthIndex = candidate.Snapshot.AuthIndex
 			entry.Window = class
+			entry.EpochID = candidate.EpochID
 			entry.AttemptedAt = target.AttemptedAt
 			entry.CompletedAt = target.CompletedAt
 			entry.OutcomeAt = target.OutcomeAt
@@ -1061,6 +1116,7 @@ func (s *schedulerRuntimeState) recordWarmupOutcome(candidate warmupCandidate, s
 		entry.AuthID = candidate.Snapshot.AuthID
 		entry.AuthIndex = candidate.Snapshot.AuthIndex
 		entry.Window = window.Class
+		entry.EpochID = candidate.EpochID
 		entry.AttemptedAt = target.AttemptedAt
 		entry.CompletedAt = target.CompletedAt
 		entry.OutcomeAt = target.OutcomeAt
@@ -1080,7 +1136,10 @@ func (s *schedulerRuntimeState) recordWarmupOutcome(candidate warmupCandidate, s
 	// local suppress_until prevents duplicate low-cost calls, while the next
 	// fresh quota probe snapshot supplies the real reset anchor shown in status.
 	s.warmups[targetKey] = target
+	epochSuccess := err == nil && status >= 200 && status < 300
+	epochCode, epochBlocked := classifyWarmupFailure(status, err)
 	s.warmupMu.Unlock()
+	s.recordQuotaEpochWarmupOutcome(candidate.Snapshot.AuthID, candidate.EpochID, epochSuccess, epochBlocked, epochCode, now)
 	s.persistBanState()
 }
 
@@ -1146,12 +1205,17 @@ func classifyWarmupFailure(status int, err error) (string, bool) {
 			return code, false
 		}
 	}
+	for _, code := range []string{"auth_unavailable", "no_auth_available"} {
+		if strings.Contains(lower, code) || (code == "no_auth_available" && strings.Contains(lower, "no auth available")) {
+			return code, false
+		}
+	}
 	for _, code := range []string{
 		"cyber_policy", "cyber_abuse", "abuse", "deactivated_workspace",
 		"workspace_deactivated", "account_deactivated", "invalid_refresh_token",
-		"invalid_api_key", "auth_unavailable", "no_auth_available", "unauthorized", "forbidden",
+		"invalid_api_key", "unauthorized", "forbidden",
 	} {
-		if strings.Contains(lower, code) || (code == "no_auth_available" && strings.Contains(lower, "no auth available")) {
+		if strings.Contains(lower, code) {
 			return code, true
 		}
 	}
@@ -1174,7 +1238,7 @@ func canonicalNonRetryableWarmupCode(code string) string {
 	for _, marker := range []string{
 		"cyber_policy", "cyber_abuse", "abuse", "deactivated_workspace",
 		"workspace_deactivated", "account_deactivated", "invalid_refresh_token",
-		"invalid_api_key", "auth_unavailable", "no_auth_available", "unauthorized", "forbidden",
+		"invalid_api_key", "unauthorized", "forbidden",
 	} {
 		if strings.Contains(code, marker) {
 			return marker

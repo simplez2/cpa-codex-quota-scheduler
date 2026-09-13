@@ -141,6 +141,45 @@ func TestWarmupEligibilityRejectsUnsafeOrUnnecessaryRequests(t *testing.T) {
 	}
 }
 
+func TestEpochWarmupDispatchUsesTenMinuteSnapshotAndAllowsSerialActiveAccount(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	observedAt := now.Add(-5 * time.Minute)
+	q := readyWarmupQuota("a", observedAt)
+	cfg := defaultPluginConfig()
+	cfg.StaleAfter = 2 * time.Minute
+	state := schedulerRuntimeState{
+		cfg: cfg, serialActiveAuthID: "a",
+		quotas:     map[string]quotaSnapshot{"a": q},
+		quotaPolls: make(map[string]quotaPollState),
+		quotaEpoch: quotaEpochState{
+			ID: "week-1",
+			Accounts: map[string]quotaEpochAccountState{
+				"a": {AuthID: "a", AuthIndex: q.AuthIndex, State: quotaEpochAccountPending, ObservedAt: observedAt},
+			},
+			Sweep: quotaEpochSweepState{Targets: make(map[string]quotaEpochSweepTarget)},
+		},
+	}
+	candidate := warmupCandidate{Snapshot: q, Window: q.Windows[0], EpochID: "week-1"}
+	if !state.warmupCandidateStillEligible(candidate, now) {
+		t.Fatal("current epoch rejected its five-minute snapshot or active serial account")
+	}
+	ordinary := candidate
+	ordinary.EpochID = ""
+	if state.warmupCandidateStillEligible(ordinary, now) {
+		t.Fatal("ordinary warmup bypassed the two-minute freshness and active-account rules")
+	}
+	if state.warmupCandidateStillEligible(candidate, observedAt.Add(11*time.Minute)) {
+		t.Fatal("epoch warmup admitted a snapshot older than ten minutes")
+	}
+	state.quotaEpoch.Accounts["a"] = quotaEpochAccountState{
+		AuthID: "a", AuthIndex: q.AuthIndex, State: quotaEpochAccountWarmed,
+		ObservedAt: observedAt, LastWarmEpoch: "week-1", LastWarmAt: now,
+	}
+	if state.warmupCandidateStillEligible(candidate, now) {
+		t.Fatal("same epoch was preheated twice")
+	}
+}
+
 func TestWarmupPolicyFailureJournalStopsAnotherAccount(t *testing.T) {
 	resetBanStoreForTest()
 	t.Cleanup(resetBanStoreForTest)

@@ -9,6 +9,7 @@ const plans = {team_standard:'Team Standard',team_premium:'Team Premium',plus:'P
 const upstreamPlans = {team:'Team Standard',self_serve_business_prolite:'Team Premium',plus:'Plus'};
 const reasons = {weekly_budget_rebalance:'按周日均预算重新平衡',weekly_remaining_rebalance:'按周余量重新平衡',manual:'手动选择',manual_selection:'手动选择',manual_cleared:'恢复自动调配',initial:'首次选择',active_missing:'当前账号已不可用',quota_exhausted:'额度已用尽'};
 const warmupStates = {confirmed:'已确认激活',pending_confirmation:'等待额度确认',attempted:'已尝试',blocked:'已停止重试',failed:'等待重试'};
+const epochAccountStates = {pending:'等待预热',natural:'真实调用已激活',warmed:'自动预热已完成',blocked:'需处理后重试'};
 let state = null, key = '', manual = false, busy = false, timer = null, failures = 0, authEpoch = 0, operating = false;
 let storedKey = readStoredKey();
 let currentView = 'overview', pendingOperation = null;
@@ -59,6 +60,9 @@ function warmupWait(account, cell) {
  if(!five || (five.cycle_started && !five.placeholder_reset))return;
  if(!state.warmup_enabled){cell.append(element('span','subtext','预热已关闭；实际调用可启动周期'));return;}
  const entry=(state.warmups||[]).find(w=>w.auth_id===account.auth_id && w.window==='5h');
+ const epochAccount=(state.quota_epoch?.accounts||[]).find(item=>item.auth_id===account.auth_id);
+ if(epochAccount?.state==='natural'||epochAccount?.state==='warmed')return;
+ if(epochAccount?.state==='pending')cell.append(element('span','subtext','当前最大周期已确认，正在等待本账号激活'));
  if(entry?.blocked){cell.append(element('span','subtext','预热暂停：需在预热管理允许重试'));return;}
  if(entry && timestamp(entry.suppress_until)>new Date()) {cell.append(element('span','subtext',entry.error?'预热失败或结果待确认':'已有周期记录，抑制重复预热'),countdown(entry.suppress_until,'最早重新校验 '));return;}
  const own=state.warmup_accounts?.[account.auth_id]||{};
@@ -101,8 +105,8 @@ function adqMetricPairs(adq) {
     ['风险水位', '周 ' + adqNumber(pool.M_week) + ' · 5h ' + adqNumber(pool.M_5h) + ' · 阶段 ' + adqNumber(pool.M_phase)],
     ['系统瓶颈', adqBottleneckText(pool.bottleneck) + (pool.capacity_failure ? ' · 真实容量不足' : '')],
     ['需求估计', adqNumber(pool.current_demand_per_hour) + ' / 小时 · P95 ' + adqNumber(pool.forecast_demand_p95)],
-    ['Reservation', String(adq.reservations_active ?? 0) + ' 个在途 · ' + String(adq.reservation_collisions ?? 0) + ' 次冲突'],
-    ['容量校准', String(adq.calibrated_accounts ?? 0) + ' / ' + String(adq.accounts_total ?? 0) + ' 个账号'],
+    ['Reservation', String(adq.reservations_active ?? 0) + ' 个在途 · ' + String(adq.reservations_settling ?? 0) + ' 个待额度确认（5h ' + adqNumber(adq.settling_5h) + ' / 周 ' + adqNumber(adq.settling_weekly) + '）· ' + String(adq.reservation_collisions ?? 0) + ' 次冲突'],
+    ['容量来源', '真实校准 ' + String(adq.calibrated_accounts ?? 0) + ' · 套餐先验 ' + String(adq.estimated_accounts ?? 0) + ' · 共 ' + String(adq.accounts_total ?? 0)],
     ['最近决策', adq.last_decision_auth_id ? adq.last_decision_auth_id + ' · ' + (adq.last_decision_reason || '已路由') : '尚无 ADQ 路由记录']
   ];
 }
@@ -140,7 +144,8 @@ function renderADQ() {
   for (const {account,metrics:metric} of accounts) {
     const row = element('tr');
     const info = element('td'); info.append(element('div','account-id',account.auth_id),element('span','subtext',metric.state + ' · ' + (metric.reason || ''))); row.append(info);
-    const capacity = element('td'); capacity.append(element('span','subtext','W '+adqNumber(metric.weekly_capacity)+' → '+adqNumber(metric.weekly_effective)),element('span','subtext','H '+adqNumber(metric.five_hour_capacity)+' → '+adqNumber(metric.five_hour_effective)),element('span','subtext','κ '+adqNumber(metric.kappa))); row.append(capacity);
+    const sourceLabels={observed:'真实校准',observed_weekly:'周额度校准',observed_5h:'5h 额度校准',plan_prior:'套餐先验'};
+    const capacity = element('td'); capacity.append(element('span','subtext','W '+adqNumber(metric.weekly_capacity)+' → '+adqNumber(metric.weekly_effective)),element('span','subtext','H '+adqNumber(metric.five_hour_capacity)+' → '+adqNumber(metric.five_hour_effective)),element('span','subtext','κ '+adqNumber(metric.kappa)+' · '+(sourceLabels[metric.capacity_source]||metric.capacity_source||'来源未知'))); if((metric.settling_5h||0)>0||(metric.settling_weekly||0)>0)capacity.append(element('span','subtext','待确认扣减：5h '+adqNumber(metric.settling_5h)+' · 周 '+adqNumber(metric.settling_weekly))); row.append(capacity);
     const phase = element('td'); phase.append(element('span','subtext','phase #'+String(metric.phase_bucket ?? '—')+' · '+(metric.phase_anchor_mode || 'auto')),element('span','subtext','缓存 '+(metric.cache_state || '未知')+' · 命中 '+adqPercent(metric.cache_hit_probability))); row.append(phase);
     const fill = element('td'); fill.append(element('span','subtext','当前 '+adqPercent(metric.p_fill_current)+' · 完整 '+adqPercent(metric.p_fill_full)),element('span','subtext','Q_lock P95 '+adqNumber(metric.q_lock_p95))); row.append(fill);
     const runway = element('td'); runway.append(element('span','subtext','Runway '+durationText(metric.runway_final_seconds)),element('span','subtext','Provider '+adqProviderText(metric.provider_state))); if(timestamp(metric.provider_retry_at)) runway.append(countdown(metric.provider_retry_at,'恢复探测 ')); row.append(runway);
@@ -324,6 +329,45 @@ function renderWarmups() {
   if (!list.children.length) list.append(element('li','subtext','暂无预热记录'));
   $('retry-all').disabled=operating||editor.isSaving()||!(state.warmups||[]).some(w=>w.blocked);
 }
+function renderQuotaEpoch() {
+  const epoch=state.quota_epoch||{}, badge=$('epoch-badge'), description=$('epoch-description'), metrics=$('epoch-metrics'), accounts=$('epoch-accounts');
+  if(!badge||!description||!metrics||!accounts)return;
+  metrics.replaceChildren();accounts.replaceChildren();
+  const total=epoch.accounts?.length||epoch.sweep_targets||0;
+  if(epoch.sweep_active){
+    badge.className='badge warning';badge.textContent='重置确认中';
+    description.textContent='正在对账号做一次强制额度复核；达到 quorum 后创建新周期，随后按账号幂等预热。';
+  }else if((epoch.pending||0)>0){
+    badge.className='badge warning';badge.textContent='预热推进中';
+    description.textContent='新最大周期已经确认。真实调用优先计为自然激活，其余账号按全局最小间隔逐个预热。';
+  }else if(epoch.id){
+    badge.className='badge good';badge.textContent='本轮已覆盖';
+    description.textContent='本轮账号均已自然激活、自动预热或明确阻止；成功账号不会在同一 epoch 重复预热。';
+  }else{
+    badge.className='badge';badge.textContent='等待确认';
+    description.textContent='尚未形成最大周期 epoch；启动后会先读取全部 CPA 账号的原生额度。';
+  }
+  const pairs=[
+    ['Epoch',epoch.id||'尚未确认'],
+    ['确认时间',dateText(epoch.confirmed_at)],
+    ['重置锚点',dateText(epoch.reset_at)],
+    ['Sweep quorum',String(epoch.sweep_evidence||0)+' / '+String(epoch.sweep_required||0)+' · 已观测 '+String(epoch.sweep_observed||0)+' / '+String(epoch.sweep_targets||0)],
+    ['账号覆盖','等待 '+String(epoch.pending||0)+' · 自然 '+String(epoch.natural||0)+' · 自动 '+String(epoch.warmed||0)+' · 阻止 '+String(epoch.blocked||0)+' / '+String(total)]
+  ];
+  for(const [label,value] of pairs){const row=element('div');row.append(element('dt','',label),element('dd','',value));metrics.append(row);}
+  if(epoch.sweep_active&&timestamp(epoch.sweep_deadline))accounts.append(countdown(epoch.sweep_deadline,'本轮复核窗口 '));
+  for(const account of epoch.accounts||[]){
+    const item=element('li'),line=element('div','warmup-line'),label=epochAccountStates[account.state]||account.state||'未知';
+    line.append(element('span','warmup-id',account.auth_id),element('span','badge'+(account.state==='blocked'?' warning':account.state==='pending'?'':' good'),label));
+    item.append(line);
+    if(account.observed_at)item.append(element('div','subtext','额度观测 '+dateText(account.observed_at)));
+    if(account.last_usage_at)item.append(element('div','subtext','最近真实调用 '+dateText(account.last_usage_at)));
+    if(account.last_warm_at)item.append(element('div','subtext','本轮自动预热 '+dateText(account.last_warm_at)));
+    if(account.error)item.append(element('div','subtext error',account.error));
+    accounts.append(item);
+  }
+  if(!accounts.children.length)accounts.append(element('li','subtext','等待账号额度复核'));
+}
 function renderBans() {
   const list=$('bans-list');list.replaceChildren();
   for(const ban of state.bans||[]) {
@@ -349,7 +393,7 @@ function render() {
   $('cooldown-count').textContent = String(state.quarantine?.cooldown ?? 0);
   const observed = (state.snapshots || []).flatMap(a=>a.windows || []).map(w=>w.observed_at).filter(v=>timestamp(v)).sort().at(-1);
   $('updated-at').textContent = '最近额度观测 ' + dateText(observed) + ' · ' + String(state.fresh_snapshots ?? 0) + ' 个新鲜快照' + (state.quota_probe_on_demand ? ' · 按需探测，空闲读取缓存' : ' · 周期探测');
-  renderAccounts(); renderPolicy(); renderADQ(); renderWarmups();renderBans();
+  renderAccounts(); renderPolicy(); renderADQ(); renderQuotaEpoch(); renderWarmups();renderBans();
   editor.setAccounts(accounts.map(a=>a.auth_id));
 }
 function notice(message) { $('notice').textContent = message; $('notice').hidden = !message; }
@@ -357,6 +401,7 @@ function login(message) {
   authEpoch++; key = ''; state = null; manual = false;
   editor.reset();$('feedback').hidden=true;$('operation-dialog').close();pendingOperation=null;$('bans-list').replaceChildren();
   $('accounts-body').replaceChildren(); $('warmups').replaceChildren();
+  $('epoch-metrics')?.replaceChildren(); $('epoch-accounts')?.replaceChildren();
   $('adq-metrics')?.replaceChildren(); $('adq-circuits')?.replaceChildren(); $('adq-accounts')?.replaceChildren();
   $('active-account').textContent = ''; $('content').hidden = true; $('login').hidden = false;
   showView('overview');

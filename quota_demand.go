@@ -29,9 +29,13 @@ func (s *schedulerRuntimeState) quotaProbeReason(id string, now time.Time) strin
 	p := s.quotaPolls[id]
 	q := s.quotas[id]
 	health := s.authExpiry[id]
+	epochReason := s.quotaEpochProbeReasonLocked(id, now)
 	s.mu.RUnlock()
 	if !cfg.QuotaProbeOnDemand {
 		return "periodic"
+	}
+	if epochReason != "" && !now.Before(p.NextAt) {
+		return epochReason
 	}
 	if now.Before(p.NextAt) {
 		return ""

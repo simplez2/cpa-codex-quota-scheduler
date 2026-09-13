@@ -53,6 +53,7 @@
     <form id="settings-form" novalidate>
       <section id="view-allocation" class="settings-page" data-panel hidden><div class="settings-intro"><h2>调配设置</h2><p>配置何时切号、怎样分配周额度，以及每个账号的套餐参考。</p></div><div id="fields-allocation" class="settings-fields"></div></section>
       <section id="view-warmup" class="settings-page" data-panel hidden><div class="settings-intro"><h2>预热管理</h2><p>设置预热频率，查看每个账号周期的确认结果。</p></div><div id="fields-warmup" class="settings-fields"></div>
+        <section class="detail-panel epoch-status" aria-labelledby="epoch-title"><div class="section-header"><div><h2 id="epoch-title">当前最大周期</h2><p id="epoch-description">等待最大周期状态</p></div><span id="epoch-badge" class="badge">—</span></div><dl id="epoch-metrics" class="policy epoch-metrics"></dl><ul id="epoch-accounts" class="warmups"></ul></section>
         <section class="detail-panel warmup-records" aria-labelledby="warmup-title"><div class="section-header"><h2 id="warmup-title">预热记录</h2><div class="toolbar"><span id="warmup-enabled" class="badge"></span><button id="retry-all" class="runtime-action" type="button" disabled>恢复已阻止的重试</button></div></div><p id="warmup-description"></p><ul id="warmups" class="warmups"></ul></section>
       </section>
       <section id="view-advanced" class="settings-page" data-panel hidden><div class="settings-intro"><h2>查询与恢复</h2><p>调整额度查询节奏、缓存有效期和限额恢复等待时间。</p></div><div id="fields-advanced" class="settings-fields"></div>

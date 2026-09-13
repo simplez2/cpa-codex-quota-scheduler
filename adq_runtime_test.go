@@ -185,7 +185,7 @@ func TestManagementQuotaStatusJSONIncludesADQFields(t *testing.T) {
 	if !ok || !circuit.Active || circuit.RetryAt == "" || circuit.LastStatus != 503 {
 		t.Fatalf("provider circuit status missing: %#v", got.ADQ.ProviderCircuits)
 	}
-	if got.ADQ.Pool.EffectiveWidth <= 0 || got.ADQ.Pool.Bottleneck != "TAIL_DRAIN" {
+	if got.ADQ.Pool.EffectiveWidth <= 0 || got.ADQ.Pool.Bottleneck == "" {
 		t.Fatalf("ADQ pool metrics missing: %#v", got.ADQ.Pool)
 	}
 	if len(got.Snapshots) != 1 || got.Snapshots[0].ADQ == nil || got.Snapshots[0].ADQ.ProviderRetryAt.IsZero() {

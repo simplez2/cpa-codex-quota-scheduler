@@ -333,13 +333,22 @@ func (s *schedulerRuntimeState) observeBalancedUsage(record pluginapi.UsageRecor
 	actual, known := usageCredits(record, s.pricing)
 	validActual := known && !record.Failed && actual >= 0 && finiteADQ(actual)
 	if reservationID := strings.TrimSpace(pending.ReservationID); reservationID != "" && s.adqReservations != nil {
-		// A reservation is only held until CPA reports the matching request. Any
-		// failure or token-less completion releases the speculative debit; a
-		// successful tokenized completion reconciles both quota windows once.
-		if validActual {
-			s.adqReservations.Reconcile(reservationID, actual, actual)
-		} else {
+		if record.Failed {
 			s.adqReservations.Release(reservationID)
+		} else {
+			// Completion ends the concurrency reservation, but provider quota
+			// percentages can lag behind it. Retain actual usage when available
+			// and the original prediction otherwise until a newer quota
+			// observation acknowledges the burn or the bounded TTL expires.
+			debit := predicted
+			if validActual {
+				debit = actual
+			}
+			snapshot := s.quotas[id]
+			if strings.TrimSpace(snapshot.AuthID) == "" {
+				snapshot = s.quotas[accountID]
+			}
+			s.adqReservations.Settle(reservationID, debit, debit, snapshot, now, s.adqPolicyLocked().SettlementTimeout)
 		}
 	}
 	if validActual {

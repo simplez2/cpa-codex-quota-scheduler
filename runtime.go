@@ -130,6 +130,7 @@ type schedulerRuntimeState struct {
 	adqReservationCollisions uint64
 	adqDecisions             uint64
 	adqLastDecision          adqDecision
+	quotaEpoch               quotaEpochState
 
 	pricing             map[string]modelPricing
 	costSamples         map[string][]float64
@@ -206,6 +207,7 @@ func configureSchedulerRuntime(raw []byte) {
 	schedulerRuntime.adqReservationCollisions = 0
 	schedulerRuntime.adqDecisions = 0
 	schedulerRuntime.adqLastDecision = adqDecision{}
+	schedulerRuntime.quotaEpoch = newQuotaEpochState()
 	schedulerRuntime.quotas = make(map[string]quotaSnapshot)
 	schedulerRuntime.identities = make(map[string]string)
 	schedulerRuntime.lastRefresh = time.Time{}
@@ -378,7 +380,8 @@ func (s *schedulerRuntimeState) recordRefreshError(err error) {
 func mergePartialQuotaSnapshot(previous, current quotaSnapshot, now time.Time, staleAfter time.Duration) quotaSnapshot {
 	current.Plan = mergeQuotaPlanObservation(previous, current, now, staleAfter)
 	incomingSnapshotAt := current.RefreshedAt
-	current.Windows = append([]quotaWindow(nil), current.Windows...)
+	previous.Windows = normalizeQuotaWindowSet(previous.Windows, previous.RefreshedAt, now, staleAfter)
+	current.Windows = normalizeQuotaWindowSet(current.Windows, current.RefreshedAt, now, staleAfter)
 	if previous.RefreshedAt.After(current.RefreshedAt) && !now.Before(previous.RefreshedAt) {
 		current.RefreshedAt = previous.RefreshedAt
 		current.ResetCredits = previous.ResetCredits
@@ -388,7 +391,7 @@ func mergePartialQuotaSnapshot(previous, current quotaSnapshot, now time.Time, s
 	}
 	present := make(map[string]int, len(current.Windows))
 	for i, window := range current.Windows {
-		present[window.Class] = i
+		present[normalizeWindowClass(window.Class)] = i
 	}
 	for _, window := range previous.Windows {
 		if window.ObservedAt.IsZero() {
@@ -398,7 +401,8 @@ func mergePartialQuotaSnapshot(previous, current quotaSnapshot, now time.Time, s
 		if window.ObservedAt.IsZero() || age < 0 || age > staleAfter {
 			continue
 		}
-		if i, ok := present[window.Class]; ok {
+		class := normalizeWindowClass(window.Class)
+		if i, ok := present[class]; ok {
 			incoming := current.Windows[i].ObservedAt
 			if incoming.IsZero() {
 				incoming = incomingSnapshotAt
@@ -418,8 +422,9 @@ func mergePartialQuotaSnapshot(previous, current quotaSnapshot, now time.Time, s
 			window.ObservedAt = previous.RefreshedAt
 		}
 		current.Windows = append(current.Windows, window)
-		present[window.Class] = len(current.Windows) - 1
+		present[class] = len(current.Windows) - 1
 	}
+	current.Windows = normalizeQuotaWindowSet(current.Windows, current.RefreshedAt, now, staleAfter)
 	return current
 }
 
@@ -501,6 +506,9 @@ func (s *schedulerRuntimeState) observeUsage(record pluginapi.UsageRecord) {
 	// Observe it even when the response has no quota headers so the next pick
 	// can fail over before CPA retries the same account.
 	s.observeADQProviderOutcome(record, now)
+	if !record.Failed && s.markQuotaEpochNatural(record.AuthID, record.AuthIndex, now) {
+		s.persistBanState()
+	}
 	if len(record.ResponseHeaders) == 0 {
 		return
 	}
@@ -516,7 +524,6 @@ func (s *schedulerRuntimeState) observeUsage(record pluginapi.UsageRecord) {
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	authID = s.canonicalAuthIDLocked(authID, authIndex)
 	old, ok := s.quotas[authID]
 	if !ok && authIndex != "" {
@@ -525,10 +532,13 @@ func (s *schedulerRuntimeState) observeUsage(record pluginapi.UsageRecord) {
 	if !ok {
 		// Headers expose only a subset of all possible windows.  Creating a
 		// schedulable snapshot from them alone could hide a monthly limit.
+		s.mu.Unlock()
 		return
 	}
+	previous := old
 	merged, changed, quotaSignal := mergeQuotaWindows(old.Windows, patches, now)
 	if !changed && !quotaSignal {
+		s.mu.Unlock()
 		return
 	}
 	if old.AuthID == "" {
@@ -549,6 +559,16 @@ func (s *schedulerRuntimeState) observeUsage(record pluginapi.UsageRecord) {
 	}
 	if authIndex != "" {
 		s.quotas[authIndex] = old
+	}
+	epochSweepStarted := s.beginQuotaEpochResetFromHeadersLocked(authID, previous, old, now)
+	reservations := s.adqReservations
+	s.mu.Unlock()
+	if reservations != nil {
+		reservations.ObserveQuota(authID, old, now)
+	}
+	if epochSweepStarted {
+		s.persistBanState()
+		s.requestQuotaEpochRefresh()
 	}
 }
 
@@ -593,14 +613,14 @@ func quotaWindowPatchesFromHeaders(headers http.Header, now time.Time) []quotaWi
 }
 
 func mergeQuotaWindows(existing []quotaWindow, patches []quotaWindowPatch, observedAt time.Time) ([]quotaWindow, bool, bool) {
-	out := append([]quotaWindow(nil), existing...)
+	out := normalizeQuotaWindowSet(existing, observedAt, observedAt, 15*time.Minute)
 	changed := false
 	quotaSignal := false
 	for _, patch := range patches {
 		quotaSignal = quotaSignal || patch.hasQuotaSignal()
 		index := -1
 		for i := range out {
-			if out[i].Class == patch.Class {
+			if normalizeWindowClass(out[i].Class) == normalizeWindowClass(patch.Class) {
 				index = i
 				break
 			}
@@ -653,7 +673,11 @@ func mergeQuotaWindows(existing []quotaWindow, patches []quotaWindowPatch, obser
 		}
 		out[index] = window
 	}
-	return out, changed, quotaSignal
+	normalized := normalizeQuotaWindowSet(out, observedAt, observedAt, 15*time.Minute)
+	if len(normalized) != len(out) {
+		changed = true
+	}
+	return normalized, changed, quotaSignal
 }
 
 func mergeQuotaSource(current, incoming quotaSource) quotaSource {
@@ -1101,6 +1125,7 @@ type persistedBanState struct {
 	SerialOverdraft        map[string]serialOverdraftBinding `json:"serial_overdraft,omitempty"`
 	SerialLastSelected     map[string]time.Time              `json:"serial_last_selected,omitempty"`
 	SerialFiveHourCycle    map[string]time.Time              `json:"serial_five_hour_cycle,omitempty"`
+	QuotaEpoch             quotaEpochState                   `json:"quota_epoch,omitempty"`
 	SavedAt                time.Time                         `json:"saved_at"`
 }
 
@@ -1208,6 +1233,9 @@ func (s *schedulerRuntimeState) loadBanStateWithConfirmationMode(path string, re
 		} else {
 			s.quotas[id] = mergePartialQuotaSnapshot(q, old, time.Now(), s.cfg.StaleAfter)
 		}
+	}
+	if restored := normalizeQuotaEpochState(state.QuotaEpoch); restored.Sequence >= s.quotaEpoch.Sequence {
+		s.quotaEpoch = restored
 	}
 	s.authExpiry = cloneAuthExpiryStates(state.AuthExpiry)
 	s.restoreBalancedSessionsLocked(state.BalancedSessions, time.Now())
@@ -1328,6 +1356,7 @@ func (s *schedulerRuntimeState) persistBanState() bool {
 		}
 		serialOverdraft[session] = binding
 	}
+	quotaEpoch := cloneQuotaEpochState(s.quotaEpoch)
 	s.mu.RUnlock()
 	if path == "" {
 		return false
@@ -1348,7 +1377,7 @@ func (s *schedulerRuntimeState) persistBanState() bool {
 	s.banResetMu.Unlock()
 	state := persistedBanState{
 		QuotaPolls: polls, Quotas: quotas, BalancedSessions: balancedSessions, AuthExpiry: authExpiry,
-		Version:                6,
+		Version:                7,
 		Bans:                   banStore.snapshot(),
 		Warmups:                warmups,
 		WarmupAttempts:         warmupAttempts,
@@ -1363,6 +1392,7 @@ func (s *schedulerRuntimeState) persistBanState() bool {
 		SerialOverdraft:        serialOverdraft,
 		SerialLastSelected:     serialLastSelected,
 		SerialFiveHourCycle:    serialFiveHourCycle,
+		QuotaEpoch:             quotaEpoch,
 		SavedAt:                time.Now(),
 	}
 	raw, err := json.MarshalIndent(state, "", "  ")
@@ -1430,7 +1460,11 @@ type runtimeADQStatus struct {
 	Decisions             uint64                                     `json:"decisions"`
 	ReservationCollisions uint64                                     `json:"reservation_collisions"`
 	ReservationsActive    int                                        `json:"reservations_active"`
+	ReservationsSettling  int                                        `json:"reservations_settling"`
+	SettlingFiveHour      float64                                    `json:"settling_5h"`
+	SettlingWeekly        float64                                    `json:"settling_weekly"`
 	CalibratedAccounts    int                                        `json:"calibrated_accounts"`
+	EstimatedAccounts     int                                        `json:"estimated_accounts"`
 	AccountsTotal         int                                        `json:"accounts_total"`
 	Pool                  adqPoolMetrics                             `json:"pool"`
 	LastDecisionAuthID    string                                     `json:"last_decision_auth_id,omitempty"`
@@ -1523,6 +1557,7 @@ type runtimeStatus struct {
 	CostProfiles                  []runtimeCostProfile             `json:"cost_profiles"`
 	Pacing                        []runtimePacingStatus            `json:"pacing,omitempty"`
 	ADQ                           runtimeADQStatus                 `json:"adq"`
+	QuotaEpoch                    runtimeQuotaEpochStatus          `json:"quota_epoch"`
 	StickyBindings                int                              `json:"sticky_bindings"`
 	SessionSwitches               uint64                           `json:"session_switches"`
 	ShadowDisagreements           uint64                           `json:"shadow_disagreements"`
@@ -1723,6 +1758,7 @@ type runtimeWarmupStatus struct {
 	Status        int    `json:"status,omitempty"`
 	Error         string `json:"error,omitempty"`
 	Blocked       bool   `json:"blocked,omitempty"`
+	EpochID       string `json:"epoch_id,omitempty"`
 }
 
 type runtimeCostProfile struct {
@@ -1801,18 +1837,11 @@ func runtimeADQAccountFor(snapshot quotaSnapshot, cfg pluginConfig, policy adqPo
 	if !fiveKnown {
 		fiveCapacity, fiveKnown = adqCapacityFromSnapshot(snapshot, "5h")
 	}
-	plan, _, _ := resolvedQuotaPlan(cfg, id, snapshot, now)
-	status := &runtimeADQAccountStatus{AbsoluteCapacityKnown: weeklyKnown && fiveKnown}
-	if !status.AbsoluteCapacityKnown {
-		status.adqAccountMetrics = adqAccountMetrics{
-			AuthID: id, AuthIndex: strings.TrimSpace(snapshot.AuthIndex), Plan: plan,
-			State: "CAPACITY_UNKNOWN", Reason: "waiting_for_observed_capacity",
-			W: maxADQ(weeklyCapacity, 0), H: maxADQ(fiveCapacity, 0),
-			ProviderState: circuit.State, ProviderRetryAt: circuit.RetryAt,
-			Eligible: false,
-		}
-		return status
-	}
+	plan, planWeight, _ := resolvedQuotaPlan(cfg, id, snapshot, now)
+	weeklyCapacity, fiveCapacity, capacitySource, fullyObserved := adqResolveCapacities(
+		weeklyCapacity, weeklyKnown, fiveCapacity, fiveKnown, planWeight, policy.MaxQuotaRatio5h,
+	)
+	status := &runtimeADQAccountStatus{AbsoluteCapacityKnown: fullyObserved}
 	weeklyRemaining, fiveRemaining := 0.0, 0.0
 	weeklyReset, fiveReset := time.Time{}, time.Time{}
 	for _, window := range snapshot.Windows {
@@ -1826,8 +1855,10 @@ func runtimeADQAccountFor(snapshot quotaSnapshot, cfg pluginConfig, policy adqPo
 		}
 	}
 	reservationFive, reservationWeek := 0.0, 0.0
+	settlingFive, settlingWeek := 0.0, 0.0
 	if reservations != nil {
 		reservationFive, reservationWeek = reservations.Reserved(id, now)
+		settlingFive, settlingWeek = reservations.Settling(id, now)
 	}
 	cacheAge := now.Sub(snapshot.RefreshedAt)
 	if cacheAge < 0 {
@@ -1842,8 +1873,10 @@ func runtimeADQAccountFor(snapshot quotaSnapshot, cfg pluginConfig, policy adqPo
 		BurnP90:  adqRunwayBurnForClass(runway, "5h", fiveCapacity),
 		BurnP95:  adqRunwayBurnForClass(runway, "5h", fiveCapacity),
 		CacheAge: cacheAge, ReservationFiveHour: reservationFive, ReservationWeekly: reservationWeek,
+		SettlingFiveHour: settlingFive, SettlingWeekly: settlingWeek,
 		ProviderState: circuit.State, ProviderRetryAt: circuit.RetryAt,
-		Healthy: true, WeeklyDebt: state.DeficitCredits, AbsoluteCapacityKnown: true,
+		Healthy: true, WeeklyDebt: state.DeficitCredits, AbsoluteCapacityKnown: fullyObserved,
+		CapacitySource: capacitySource,
 	}
 	status.adqAccountMetrics = adqAssessAccount(input, policy, now)
 	return status
@@ -1918,6 +1951,7 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 	adqReservationCollisions := s.adqReservationCollisions
 	adqReservations := s.adqReservations
 	adqLastDecision := s.adqLastDecision
+	quotaEpoch := cloneQuotaEpochState(s.quotaEpoch)
 	adqCircuits := make(map[string]adqProviderCircuit, len(s.adqProviderCircuits))
 	for authID, circuit := range s.adqProviderCircuits {
 		adqCircuits[authID] = circuit
@@ -2028,7 +2062,8 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 	snapshots := make([]runtimeQuotaStatus, 0)
 	pacing := make([]runtimePacingStatus, 0)
 	adqMetrics := make([]adqAccountMetrics, 0)
-	adqUnknownAccounts := 0
+	adqCalibratedAccounts := 0
+	adqEstimatedAccounts := 0
 	for _, snapshot := range quotas {
 		canonical := strings.TrimSpace(snapshot.AuthID)
 		if canonical == "" {
@@ -2071,10 +2106,11 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 			if adq != nil {
 				item.ADQ = adq
 				if adq.AbsoluteCapacityKnown {
-					adqMetrics = append(adqMetrics, adq.adqAccountMetrics)
+					adqCalibratedAccounts++
 				} else {
-					adqUnknownAccounts++
+					adqEstimatedAccounts++
 				}
+				adqMetrics = append(adqMetrics, adq.adqAccountMetrics)
 			}
 		}
 		if health, ok := authExpiry[canonical]; ok {
@@ -2206,22 +2242,26 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 	sort.Slice(pacing, func(i, j int) bool { return pacing[i].AuthID < pacing[j].AuthID })
 
 	adqStatus := runtimeADQStatus{Enabled: adqEnabled, Decisions: adqDecisions, ReservationCollisions: adqReservationCollisions,
-		AccountsTotal: len(seen), CalibratedAccounts: len(adqMetrics), ProviderCircuits: make(map[string]runtimeADQProviderCircuitStatus)}
+		AccountsTotal: len(seen), CalibratedAccounts: adqCalibratedAccounts, EstimatedAccounts: adqEstimatedAccounts,
+		ProviderCircuits: make(map[string]runtimeADQProviderCircuitStatus)}
 	if adqEnabled {
 		adqStatus.Pool = adqComputePool(adqMetrics, 0, adqPolicy, now)
-		adqStatus.UsingFallback = adqUnknownAccounts > 0 || len(adqMetrics) == 0
-		if adqUnknownAccounts > 0 {
-			adqStatus.FallbackReason = "等待每个账号完成 5h 与周额度的真实容量校准"
-		} else if len(adqMetrics) == 0 && len(seen) > 0 {
-			adqStatus.FallbackReason = "尚未获得可用于原子预留的真实容量"
+		adqStatus.UsingFallback = len(adqMetrics) == 0
+		if len(adqMetrics) == 0 && len(seen) > 0 {
+			adqStatus.FallbackReason = "尚未获得可用于调度的额度窗口"
 		}
 	} else {
 		adqStatus.FallbackReason = "ADQ 仅在均衡并发模式启用"
 	}
 	if adqReservations != nil {
 		for _, reservation := range adqReservations.Snapshot(now) {
-			if reservation.Status == adqReservationActive {
+			switch reservation.Status {
+			case adqReservationActive:
 				adqStatus.ReservationsActive++
+			case adqReservationSettling:
+				adqStatus.ReservationsSettling++
+				adqStatus.SettlingFiveHour += reservation.ActualFiveHour
+				adqStatus.SettlingWeekly += reservation.ActualWeekly
 			}
 		}
 	}
@@ -2318,6 +2358,7 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 		CostProfiles:                  costProfiles,
 		Pacing:                        pacing,
 		ADQ:                           adqStatus,
+		QuotaEpoch:                    runtimeQuotaEpoch(quotaEpoch),
 		StickyBindings:                stickyBindings + balancedStickyCount,
 		BalancedStickyBindings:        balancedStickyCount,
 		BalancedSessionHits:           balancedHits,
@@ -2386,7 +2427,7 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 		} else if !entry.CompletedAt.IsZero() {
 			state = "pending_confirmation"
 		}
-		item := runtimeWarmupStatus{AuthID: entry.AuthID, Window: entry.Window, State: state, Status: entry.Status, Error: entry.Error, Blocked: entry.Blocked}
+		item := runtimeWarmupStatus{AuthID: entry.AuthID, Window: entry.Window, State: state, Status: entry.Status, Error: entry.Error, Blocked: entry.Blocked, EpochID: entry.EpochID}
 		item.DispatchState = entry.DispatchState
 		if entry.Error != "" && entry.Status == 0 && item.DispatchState == "" {
 			item.DispatchState = "uncertain"

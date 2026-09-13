@@ -127,6 +127,7 @@ func parseNativeQuota(raw []byte, authID, index string, observedAt time.Time) (q
 	if len(out.Windows) == 0 {
 		return quotaSnapshot{}, errors.New("missing_quota_windows")
 	}
+	out.Windows = normalizeQuotaWindowSet(out.Windows, observedAt, observedAt, 15*time.Minute)
 	return out, nil
 }
 
@@ -298,6 +299,15 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 		}
 		return
 	}
+	s.mu.Lock()
+	epochStateChanged := s.prepareQuotaEpochInventoryLocked(inventory, time.Now())
+	initialEpochTransition := s.finalizeQuotaEpochSweepLocked(time.Now())
+	s.mu.Unlock()
+	if initialEpochTransition.ID != "" {
+		s.applyQuotaEpochTransition(initialEpochTransition)
+	} else if epochStateChanged {
+		s.persistBanState()
+	}
 	ids := make([]string, 0, len(inventory))
 	for id := range inventory {
 		ids = append(ids, id)
@@ -336,15 +346,18 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 			continue
 		}
 		interval := s.quotaPollIntervalLocked(id, activeID, now)
-		if deferUntil := quotaHeaderCacheDeadline(s.quotas[id], poll, cfg, interval, now); deferUntil.After(now) {
-			poll.NextAt = deferUntil
-			s.quotaPolls[id] = poll
-			s.mu.Unlock()
-			continue
+		if !strings.HasPrefix(reason, "epoch_") {
+			if deferUntil := quotaHeaderCacheDeadline(s.quotas[id], poll, cfg, interval, now); deferUntil.After(now) {
+				poll.NextAt = deferUntil
+				s.quotaPolls[id] = poll
+				s.mu.Unlock()
+				continue
+			}
 		}
 		poll.Reason = reason
 		poll.AuthIndex = auth.AuthIndex
 		poll.AttemptedAt = now
+		s.recordQuotaEpochProbeAttemptLocked(id, reason, now)
 		poll.NextAt = now.Add(interval)
 		// A reset timestamp schedules an observation; it never proves renewed quota.
 		for _, window := range s.quotas[id].Windows {
@@ -382,6 +395,10 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 		}
 		s.mu.Lock()
 		poll = s.quotaPolls[id]
+		previousSnapshot := s.quotas[id]
+		var epochTransition quotaEpochTransition
+		var settlementSnapshot quotaSnapshot
+		var observeSettlement bool
 		if fetchErr != nil {
 			s.quotaRunway.ForgetAuth(id)
 			delete(s.quotaNative, id)
@@ -399,6 +416,7 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 			if retryAt := time.Now().Add(delay); retryAt.After(poll.NextAt) {
 				poll.NextAt = retryAt
 			}
+			epochTransition = s.observeQuotaEpochProbeErrorLocked(id, poll.Error, time.Now())
 		} else {
 			poll.Failures = 0
 			poll.Error = ""
@@ -417,15 +435,24 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 			s.quotas[id] = snapshot
 			s.quotas[auth.AuthIndex] = snapshot
 			s.updateCalibrationsLocked(map[string]quotaSnapshot{id: snapshot}, now)
+			epochTransition = s.observeQuotaEpochProbeLocked(id, previousSnapshot, snapshot, inventory, time.Now())
+			settlementSnapshot = snapshot
+			observeSettlement = true
 		}
 		s.quotaPolls[id] = poll
+		reservations := s.adqReservations
 		s.mu.Unlock()
+		if observeSettlement && reservations != nil {
+			reservations.ObserveQuota(id, settlementSnapshot, time.Now())
+		}
+		s.applyQuotaEpochTransition(epochTransition)
 		s.reconcileAuthExpiry(batchCtx, cfg, auth, document, documentErr, snapshot, fetchErr, now, callHost, saveNativeAuthExpiry)
 		if batchCtx.Err() != nil {
 			break
 		}
 	}
 	s.mu.Lock()
+	finalEpochTransition := s.finalizeQuotaEpochSweepLocked(time.Now())
 	// Retain an account failure while its retry is deferred; a successful
 	// inventory read is not evidence that its quota query recovered.
 	if lastErr == "" {
@@ -446,6 +473,7 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 	s.quotaRefreshTargetsLast = len(ids)
 	s.quotaRefreshLastError = lastErr
 	s.mu.Unlock()
+	s.applyQuotaEpochTransition(finalEpochTransition)
 	if s.confirmPendingWarmups(snapshotCopy, time.Now()) {
 		s.persistBanState()
 	}

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -46,6 +47,88 @@ func TestBalancedParallelRequestsReserveFairShareAtomically(t *testing.T) {
 	}
 	if s.serialActiveAuthID != "" {
 		t.Fatal("balanced routing committed a serial primary")
+	}
+}
+
+func TestADQSequentialCompletionsStayEvenWhileQuotaTelemetryLags(t *testing.T) {
+	resetBanStoreForTest()
+	defer resetBanStoreForTest()
+	now := time.Now().UTC()
+	cfg := defaultPluginConfig()
+	cfg.SchedulerMode = "balanced"
+	cfg.StatePath = ""
+	state := &schedulerRuntimeState{
+		cfg:                 cfg,
+		quotas:              make(map[string]quotaSnapshot),
+		identities:          make(map[string]string),
+		balancedAccounts:    make(map[string]*balancedAccount),
+		balancedSessions:    make(map[string]balancedSessionBinding),
+		adqPolicy:           defaultADQPolicy(),
+		adqReservations:     newADQReservationBook(),
+		adqProviderCircuits: make(map[string]adqProviderCircuit),
+		globalCostSamples:   []float64{.1, .1, .1, .1, .1, .1, .1, .1},
+	}
+	req := pluginapi.SchedulerPickRequest{Model: "gpt-5.6-luna", Provider: providerCodex}
+	for i := 0; i < 5; i++ {
+		id := fmt.Sprintf("team-%d", i)
+		snapshot := quotaSnapshot{
+			AuthID: id, AuthIndex: id, RefreshedAt: now,
+			Windows: []quotaWindow{
+				{Class: "5h", WindowSeconds: 18000, UsedPercent: 0, Allowed: true, ResetAt: now.Add(5 * time.Hour), ObservedAt: now},
+				{Class: "weekly", WindowSeconds: 604800, UsedPercent: 0, Allowed: true, ResetAt: now.Add(7 * 24 * time.Hour), ObservedAt: now},
+			},
+		}
+		state.quotas[id] = snapshot
+		state.identities[id] = id
+		req.Candidates = append(req.Candidates, pluginapi.SchedulerAuthCandidate{ID: id, Provider: providerCodex})
+	}
+
+	counts := make(map[string]int)
+	for i := 0; i < 50; i++ {
+		at := now.Add(time.Duration(i) * time.Millisecond)
+		pick := state.balancedPick(withBalancedSession(req, fmt.Sprintf("fresh-%d", i)), at)
+		if !pick.Handled || pick.AuthID == "" {
+			t.Fatalf("pick %d failed: %#v", i, pick)
+		}
+		counts[pick.AuthID]++
+		state.observeBalancedUsage(pluginapi.UsageRecord{
+			Provider: providerCodex, Generate: true, AuthID: pick.AuthID, AuthIndex: pick.AuthID,
+			Model: req.Model, RequestedAt: at,
+		}, at.Add(500*time.Microsecond))
+	}
+	minPicks, maxPicks := 50, 0
+	for i := 0; i < 5; i++ {
+		value := counts[fmt.Sprintf("team-%d", i)]
+		if value < minPicks {
+			minPicks = value
+		}
+		if value > maxPicks {
+			maxPicks = value
+		}
+	}
+	if maxPicks-minPicks > 1 {
+		t.Fatalf("stale telemetry produced uneven allocation: counts=%v", counts)
+	}
+	if state.adqReservations == nil {
+		t.Fatal("ADQ reservations were not active")
+	}
+	_, settling := state.adqReservations.Settling("", now.Add(time.Second))
+	if settling <= 0 {
+		t.Fatal("completed token-less requests did not retain settling debt")
+	}
+
+	stickyReq := withBalancedSession(req, "sticky-conversation")
+	first := state.balancedPick(stickyReq, now.Add(2*time.Second))
+	for i := 1; i < 6; i++ {
+		at := now.Add(2*time.Second + time.Duration(i)*time.Millisecond)
+		next := state.balancedPick(stickyReq, at)
+		if next.AuthID != first.AuthID {
+			t.Fatalf("settlement waterline moved sticky session from %q to %q", first.AuthID, next.AuthID)
+		}
+		state.observeBalancedUsage(pluginapi.UsageRecord{
+			Provider: providerCodex, Generate: true, AuthID: next.AuthID, AuthIndex: next.AuthID,
+			Model: req.Model, RequestedAt: at,
+		}, at.Add(500*time.Microsecond))
 	}
 }
 

@@ -139,6 +139,7 @@ func (s *schedulerRuntimeState) adqPolicyLocked() adqPolicy {
 	// The legacy panel reserve_5h_percent is a serial handoff setting. ADQ
 	// never silently converts it into a 5h quota reserve.
 	policy.FiveHourSafetyMargin = 0
+	policy.SettlementTimeout = adqSettlementTTL(s.cfg.QuotaRefreshCooldown)
 	return policy
 }
 
@@ -243,6 +244,26 @@ func adqCapacityFromSnapshot(snapshot quotaSnapshot, class string) (float64, boo
 	return 0, false
 }
 
+func adqResolveCapacities(weekly float64, weeklyKnown bool, fiveHour float64, fiveHourKnown bool, planWeight, ratio float64) (resolvedWeekly, resolvedFiveHour float64, source string, fullyObserved bool) {
+	if ratio <= 0 || !finiteADQ(ratio) {
+		ratio = defaultADQPolicy().MaxQuotaRatio5h
+	}
+	if planWeight <= 0 || !finiteADQ(planWeight) {
+		planWeight = 1
+	}
+	switch {
+	case weeklyKnown && fiveHourKnown:
+		return weekly, fiveHour, "observed", true
+	case weeklyKnown:
+		return weekly, weekly * ratio, "observed_weekly", false
+	case fiveHourKnown:
+		return fiveHour / ratio, fiveHour, "observed_5h", false
+	default:
+		resolvedWeekly = 100 * planWeight
+		return resolvedWeekly, resolvedWeekly * ratio, "plan_prior", false
+	}
+}
+
 func adqRunwayBurnForClass(assessments []quotaRunwayWindowAssessment, class string, capacity float64) float64 {
 	class = normalizeWindowClass(class)
 	for _, item := range assessments {
@@ -257,13 +278,15 @@ func adqRunwayBurnForClass(assessments []quotaRunwayWindowAssessment, class stri
 	return 0
 }
 
-func adqPendingWithoutReservation(account *balancedAccount) float64 {
+func adqPendingWithoutReservation(account *balancedAccount, reservations *adqReservationBook, now time.Time) float64 {
 	if account == nil {
 		return 0
 	}
 	total := 0.0
 	for _, pending := range account.Pending {
-		if strings.TrimSpace(pending.ReservationID) == "" && pending.Cost > 0 && finiteADQ(pending.Cost) {
+		reservationID := strings.TrimSpace(pending.ReservationID)
+		covered := reservationID != "" && reservations != nil && reservations.CoversPending(reservationID, now)
+		if !covered && pending.Cost > 0 && finiteADQ(pending.Cost) {
 			total += pending.Cost
 		}
 	}
@@ -295,27 +318,22 @@ func (s *schedulerRuntimeState) adqInputForChoiceLocked(choice serialCandidate, 
 	if !fiveKnown {
 		fiveCapacity, fiveKnown = adqCapacityFromSnapshot(snapshot, "5h")
 	}
-	if !weeklyKnown || !fiveKnown {
-		// A plan prior is useful for display, but it is not safe for an atomic
-		// reservation because it is not an observed provider capacity.
-		return adqAccountInput{}, false
-	}
 	plan, planWeight, _ := resolvedQuotaPlan(s.cfg, id, snapshot, now)
-	if planWeight <= 0 || !finiteADQ(planWeight) {
-		planWeight = 1
-	}
-	// Preserve the observed absolute capacities. Plan is metadata and only
-	// contributes a fallback weight when the provider has not calibrated yet.
-	_ = planWeight
+	policy := s.adqPolicyLocked()
+	weeklyCapacity, fiveCapacity, capacitySource, fullyObserved := adqResolveCapacities(
+		weeklyCapacity, weeklyKnown, fiveCapacity, fiveKnown, planWeight, policy.MaxQuotaRatio5h,
+	)
 	reservationsFive, reservationsWeek := 0.0, 0.0
+	settlingFive, settlingWeek := 0.0, 0.0
 	if s.adqReservations != nil {
 		reservationsFive, reservationsWeek = s.adqReservations.Reserved(id, now)
+		settlingFive, settlingWeek = s.adqReservations.Settling(id, now)
 	}
 	account := s.balancedAccounts[id]
 	if account == nil && rawID != id {
 		account = s.balancedAccounts[rawID]
 	}
-	pending := adqPendingWithoutReservation(account)
+	pending := adqPendingWithoutReservation(account, s.adqReservations, now)
 	assessments := s.quotaRunway.Assess(snapshot, s.cfg, now)
 	circuit := s.adqCircuitLocked(id, now)
 	if circuit.State == "" && rawID != id {
@@ -340,13 +358,16 @@ func (s *schedulerRuntimeState) adqInputForChoiceLocked(choice serialCandidate, 
 		BurnP95:               adqRunwayBurnForClass(assessments, "5h", fiveCapacity),
 		ReservationFiveHour:   reservationsFive,
 		ReservationWeekly:     reservationsWeek,
+		SettlingFiveHour:      settlingFive,
+		SettlingWeekly:        settlingWeek,
 		PendingFiveHour:       pending,
 		PendingWeekly:         pending,
 		ProviderState:         circuit.State,
 		ProviderRetryAt:       circuit.RetryAt,
 		Healthy:               healthy,
 		Sticky:                false,
-		AbsoluteCapacityKnown: true,
+		AbsoluteCapacityKnown: fullyObserved,
+		CapacitySource:        capacitySource,
 	}, true
 }
 
@@ -416,7 +437,9 @@ func (s *schedulerRuntimeState) adqRouteChoicesLocked(req pluginapi.SchedulerPic
 			}
 		}
 		for _, input := range inputs {
-			s.adqReservations.SetCapacity(input.ID, input.FiveHourCapacity, input.WeeklyCapacity)
+			fiveLimit := maxADQ(0, input.FiveHourRemaining-input.PendingFiveHour-input.FiveHourCapacity*adqFiveHourSafety(policy))
+			weekLimit := maxADQ(0, input.WeeklyRemaining-input.PendingWeekly-input.WeeklyCapacity*adqWeeklySafety(policy))
+			s.adqReservations.SetCapacity(input.ID, fiveLimit, weekLimit)
 		}
 		decision, ok := adqChooseWithDebit(inputs, 0, cost, policy, now)
 		if !ok {

@@ -162,7 +162,7 @@ func TestADQFiveHourHasNoImplicitSafetyReserve(t *testing.T) {
 	}
 }
 
-func TestADQNormalCDFTailsAndWidthUseBothWindows(t *testing.T) {
+func TestADQNormalCDFTailsAndFutureWidthUseWeeklyReservoir(t *testing.T) {
 	if got := adqNormalCDF(-9); got != 0 {
 		t.Fatalf("negative tail=%v want 0", got)
 	}
@@ -175,11 +175,14 @@ func TestADQNormalCDFTailsAndWidthUseBothWindows(t *testing.T) {
 		FiveHourCapacity: 16, FiveHourRemaining: 8,
 		Healthy: true, ProviderState: adqProviderHealthy,
 	}, p, time.Now())
-	if m.FullWidthContribution != 0 {
-		t.Fatalf("partial 5h window counted as FullWidth: %#v", m)
+	if m.FullWidthContribution != 1 {
+		t.Fatalf("weekly reservoir did not preserve one future full 5h cycle: %#v", m)
 	}
-	if m.EffectiveWidthContribution != .5 {
-		t.Fatalf("effective width=%v want .5", m.EffectiveWidthContribution)
+	if m.EffectiveWidthContribution != 1 {
+		t.Fatalf("effective future width=%v want 1", m.EffectiveWidthContribution)
+	}
+	if !m.Tail || m.HEffective >= m.H {
+		t.Fatalf("current partial 5h headroom was not retained as an independent gate: %#v", m)
 	}
 }
 
@@ -221,6 +224,118 @@ func TestADQReservationSnapshotExpiresEveryAccount(t *testing.T) {
 	}
 	if f, w := b.Reserved("a", now); f != 0 || w != 0 {
 		t.Fatalf("expired reservation a still counted f=%v w=%v", f, w)
+	}
+}
+
+func TestADQSettlingDebtPersistsUntilQuotaChangesOrTTL(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	baselineAt := now.Add(-time.Second)
+	baseline := quotaSnapshot{
+		AuthID: "a", RefreshedAt: baselineAt,
+		Windows: []quotaWindow{
+			{Class: "5h", UsedPercent: 10, ResetAt: now.Add(4 * time.Hour), ObservedAt: baselineAt},
+			{Class: "weekly", UsedPercent: 20, ResetAt: now.Add(6 * 24 * time.Hour), ObservedAt: baselineAt},
+		},
+	}
+	b := newADQReservationBook()
+	b.SetCapacity("a", 16, 100)
+	r, ok := b.TryReserve(adqReservationRequest{AuthID: "a", FiveHour: .2, Weekly: .3, TTL: time.Second}, baselineAt)
+	if !ok || !b.Settle(r.ID, .2, .3, baseline, now, 2*time.Minute) {
+		t.Fatalf("could not create settling debt: %#v ok=%v", r, ok)
+	}
+	if f, w := b.Reserved("a", now); f != 0 || w != 0 {
+		t.Fatalf("completed reservation remained active: f=%v w=%v", f, w)
+	}
+	if f, w := b.Settling("a", now); f != .2 || w != .3 {
+		t.Fatalf("settling debt missing: f=%v w=%v", f, w)
+	}
+
+	unchanged := baseline
+	unchanged.RefreshedAt = now.Add(time.Second)
+	for i := range unchanged.Windows {
+		unchanged.Windows[i].ObservedAt = unchanged.RefreshedAt
+	}
+	if changed := b.ObserveQuota("a", unchanged, unchanged.RefreshedAt); changed != 0 {
+		t.Fatalf("unchanged telemetry cleared %d settlement layers", changed)
+	}
+	if f, w := b.Settling("a", unchanged.RefreshedAt); f != .2 || w != .3 {
+		t.Fatalf("unchanged telemetry lost debt: f=%v w=%v", f, w)
+	}
+
+	fiveUpdated := unchanged
+	fiveUpdated.RefreshedAt = now.Add(2 * time.Second)
+	fiveUpdated.Windows = append([]quotaWindow(nil), unchanged.Windows...)
+	fiveUpdated.Windows[0].ObservedAt = fiveUpdated.RefreshedAt
+	fiveUpdated.Windows[0].UsedPercent = 11
+	if changed := b.ObserveQuota("a", fiveUpdated, fiveUpdated.RefreshedAt); changed != 1 {
+		t.Fatalf("5h update acknowledged %d layers; want 1", changed)
+	}
+	if f, w := b.Settling("a", fiveUpdated.RefreshedAt); f != 0 || w != .3 {
+		t.Fatalf("5h and weekly settlement were not independent: f=%v w=%v", f, w)
+	}
+
+	weeklyReset := fiveUpdated
+	weeklyReset.RefreshedAt = now.Add(3 * time.Second)
+	weeklyReset.Windows = append([]quotaWindow(nil), fiveUpdated.Windows...)
+	weeklyReset.Windows[1].ObservedAt = weeklyReset.RefreshedAt
+	weeklyReset.Windows[1].UsedPercent = 0
+	weeklyReset.Windows[1].ResetAt = now.Add(7 * 24 * time.Hour)
+	if changed := b.ObserveQuota("a", weeklyReset, weeklyReset.RefreshedAt); changed != 1 {
+		t.Fatalf("weekly reset acknowledged %d layers; want 1", changed)
+	}
+	if f, w := b.Settling("a", weeklyReset.RefreshedAt); f != 0 || w != 0 {
+		t.Fatalf("acknowledged settlement remained: f=%v w=%v", f, w)
+	}
+	if got, _ := b.Get(r.ID); got.Status != adqReservationReconciled || got.SettlementReason != "telemetry" {
+		t.Fatalf("settlement terminal state=%#v", got)
+	}
+
+	r2, ok := b.TryReserve(adqReservationRequest{AuthID: "a", FiveHour: .2, Weekly: .2, TTL: time.Second}, now.Add(4*time.Second))
+	if !ok || !b.Settle(r2.ID, .2, .2, weeklyReset, now.Add(4*time.Second), 30*time.Second) {
+		t.Fatal("could not seed TTL settlement")
+	}
+	if f, w := b.Settling("a", now.Add(35*time.Second)); f != 0 || w != 0 {
+		t.Fatalf("TTL did not release settlement: f=%v w=%v", f, w)
+	}
+	if got, _ := b.Get(r2.ID); got.Status != adqReservationReconciled || got.SettlementReason != "ttl" {
+		t.Fatalf("TTL terminal state=%#v", got)
+	}
+}
+
+func TestADQExpiredReservationFallsBackToPendingDebit(t *testing.T) {
+	now := time.Now()
+	b := newADQReservationBook()
+	b.SetCapacity("a", 1, 1)
+	r, ok := b.TryReserve(adqReservationRequest{AuthID: "a", FiveHour: .4, Weekly: .4, TTL: time.Second}, now)
+	if !ok {
+		t.Fatal("reservation failed")
+	}
+	account := &balancedAccount{Pending: []balancedPending{{At: now, Cost: .4, ReservationID: r.ID}}}
+	if got := adqPendingWithoutReservation(account, b, now.Add(500*time.Millisecond)); got != 0 {
+		t.Fatalf("active reservation was double-counted as pending: %v", got)
+	}
+	if got := adqPendingWithoutReservation(account, b, now.Add(2*time.Second)); got != .4 {
+		t.Fatalf("expired long request disappeared from effective quota: %v", got)
+	}
+}
+
+func TestADQSettlingDebtBalancesFreshSessionsButDoesNotBreakSticky(t *testing.T) {
+	p := defaultADQPolicy()
+	now := time.Now()
+	in := adqAccountInput{
+		ID: "a", WeeklyCapacity: 100, WeeklyRemaining: 10,
+		FiveHourCapacity: 16, FiveHourRemaining: 2,
+		SettlingFiveHour: 2, SettlingWeekly: 10,
+		Healthy: true, ProviderState: adqProviderHealthy,
+	}
+	fresh := adqAssessAccount(in, p, now)
+	if fresh.Eligible {
+		t.Fatalf("fresh work ignored unconfirmed completed usage: %#v", fresh)
+	}
+	in.Sticky = true
+	sticky := adqAssessAccount(in, p, now)
+	if !sticky.Eligible || sticky.Reason != "sticky_settlement_pending" {
+		t.Fatalf("telemetry lag forced a sticky migration: %#v", sticky)
 	}
 }
 

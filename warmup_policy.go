@@ -171,9 +171,18 @@ func (s *schedulerRuntimeState) warmupCandidateStillEligible(candidate warmupCan
 	s.mu.RLock()
 	snapshot, ok := s.quotas[candidate.Snapshot.AuthID]
 	cfg, activeID, poll := s.cfg, s.serialActiveAuthID, s.quotaPolls[candidate.Snapshot.AuthID]
+	epoch := cloneQuotaEpochState(s.quotaEpoch)
 	s.mu.RUnlock()
-	if !ok || activeID == candidate.Snapshot.AuthID || snapshot.AuthIndex != candidate.Snapshot.AuthIndex || poll.Error != "" ||
-		!warmupSnapshotFresh(snapshot, now, cfg.StaleAfter) || !warmupQuotaHasHeadroom(snapshot, cfg) {
+	epochID, epochAllowed := quotaEpochWarmupAllowance(epoch, snapshot, poll, now)
+	if candidate.EpochID != "" {
+		if !epochAllowed || epochID != candidate.EpochID {
+			return false
+		}
+	} else {
+		epochAllowed = false
+	}
+	if !ok || (activeID == candidate.Snapshot.AuthID && !epochAllowed) || snapshot.AuthIndex != candidate.Snapshot.AuthIndex || poll.Error != "" ||
+		!warmupSnapshotFreshForEpoch(snapshot, now, cfg.StaleAfter, epochAllowed) || !warmupQuotaHasHeadroom(snapshot, cfg) {
 		return false
 	}
 	window, ok := unstartedWarmupWindow(snapshot, now)

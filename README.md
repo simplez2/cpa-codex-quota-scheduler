@@ -2,7 +2,7 @@
 
 Standalone CPA plugin for balanced concurrent or serial Codex account selection, native quota polling,
 5h/weekly/monthly windows, persistent 429 quarantine and optional warmup.
-Source version: **0.3.8**. Local builds are not a published release.
+Source version: **0.3.9**. Local builds are not a published release.
 
 ## CPA dashboard
 
@@ -334,3 +334,5 @@ CPA 会在调度插件收到候选账号之前排除过期认证。某些明确�
 v0.3.7 修正状态列表的账号索引别名重复，预算列表与账号列表一一对应。
 
 v0.3.8 完成 ADQ-PBS 状态可观测性、Provider 临时故障本地切换与面板倒计时同一轮采集时间修正。
+
+v0.3.9 在请求完成后保留有界的待确认扣减，避免 Provider 额度遥测延迟时把新会话连续分配给同一账号；运行超过短 reservation 租期的请求仍计入在途消耗，已有会话继续保持粘性。最大周期 reset 现在通过账号池多数复核形成 epoch，为每个账号分别记录自然激活、自动预热、等待或阻止状态；同一 epoch 成功账号不会重复预热，漏查账号会做有限补查。面板同步显示 epoch 覆盖和 5h/周待确认扣减。
