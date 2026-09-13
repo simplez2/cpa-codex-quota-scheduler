@@ -105,7 +105,7 @@ import (
 
 const (
 	pluginName    = "codex-quota-scheduler"
-	pluginVersion = "0.3.9"
+	pluginVersion = "0.3.10"
 
 	// providerCodex is the CPA provider key for OpenAI Codex (ChatGPT backend).
 	providerCodex = "codex"
@@ -885,7 +885,7 @@ func managementRegistration() pluginapi.ManagementRegistrationResponse {
 			},
 			{
 				Method:      http.MethodGet,
-				Path:        managementRoutePrefix + "/quota",
+				Path:        managementRoutePrefix + "/scheduler-status",
 				Description: "Show the active serial auth, quota probe freshness, pacing diagnostics, and redacted decisions.",
 			},
 			{
@@ -935,7 +935,7 @@ func dispatchManagement(req pluginapi.ManagementRequest) pluginapi.ManagementRes
 		return handleManagementUnban(req)
 	case method == http.MethodPost && matchesManagementPath(req.Path, "/unban-all"):
 		return handleManagementUnbanAll()
-	case method == http.MethodGet && matchesManagementPath(req.Path, "/quota"):
+	case method == http.MethodGet && (matchesManagementPath(req.Path, "/scheduler-status") || matchesManagementPath(req.Path, "/quota")):
 		return jsonManagementResponse(http.StatusOK, schedulerRuntime.status())
 	case method == http.MethodPut && matchesManagementPath(req.Path, "/serial-active"):
 		return handleManagementSerialActivePut(req)

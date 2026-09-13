@@ -9,8 +9,12 @@ import (
 )
 
 const (
-	quotaEpochSweepWindow       = 2 * time.Minute
+	quotaEpochSweepWindow       = 10 * time.Minute
+	quotaEpochSweepRoundDelay   = 45 * time.Second
+	quotaEpochSweepMaxRounds    = 4
 	quotaEpochWarmupSnapshotAge = 10 * time.Minute
+	quotaEpochResetCatchupAge   = 15 * time.Minute
+	quotaEpochResetAnchorSkew   = 15 * time.Minute
 	quotaEpochResetRisePercent  = 10.0
 	quotaEpochPendingProbeLimit = 3
 	quotaEpochPendingProbeDelay = 30 * time.Second
@@ -37,6 +41,7 @@ type quotaEpochAccountState struct {
 type quotaEpochSweepTarget struct {
 	AuthID         string    `json:"auth_id"`
 	AuthIndex      string    `json:"auth_index,omitempty"`
+	AttemptedAt    time.Time `json:"attempted_at,omitempty"`
 	ObservedAt     time.Time `json:"observed_at,omitempty"`
 	Evidence       bool      `json:"evidence,omitempty"`
 	EvidenceReason string    `json:"evidence_reason,omitempty"`
@@ -44,16 +49,19 @@ type quotaEpochSweepTarget struct {
 }
 
 type quotaEpochSweepState struct {
-	Active        bool                             `json:"active"`
-	Reason        string                           `json:"reason,omitempty"`
-	TriggerAuthID string                           `json:"trigger_auth_id,omitempty"`
-	TriggerReason string                           `json:"trigger_reason,omitempty"`
-	StartedAt     time.Time                        `json:"started_at,omitempty"`
-	Deadline      time.Time                        `json:"deadline,omitempty"`
-	CompletedAt   time.Time                        `json:"completed_at,omitempty"`
-	Required      int                              `json:"required"`
-	EpochID       string                           `json:"epoch_id,omitempty"`
-	Targets       map[string]quotaEpochSweepTarget `json:"targets,omitempty"`
+	Active         bool                             `json:"active"`
+	Reason         string                           `json:"reason,omitempty"`
+	TriggerAuthID  string                           `json:"trigger_auth_id,omitempty"`
+	TriggerReason  string                           `json:"trigger_reason,omitempty"`
+	StartedAt      time.Time                        `json:"started_at,omitempty"`
+	Deadline       time.Time                        `json:"deadline,omitempty"`
+	Round          int                              `json:"round,omitempty"`
+	RoundStartedAt time.Time                        `json:"round_started_at,omitempty"`
+	NextRoundAt    time.Time                        `json:"next_round_at,omitempty"`
+	CompletedAt    time.Time                        `json:"completed_at,omitempty"`
+	Required       int                              `json:"required"`
+	EpochID        string                           `json:"epoch_id,omitempty"`
+	Targets        map[string]quotaEpochSweepTarget `json:"targets,omitempty"`
 }
 
 type quotaEpochState struct {
@@ -94,6 +102,9 @@ type runtimeQuotaEpochStatus struct {
 	SweepReason    string                           `json:"sweep_reason,omitempty"`
 	SweepStartedAt string                           `json:"sweep_started_at,omitempty"`
 	SweepDeadline  string                           `json:"sweep_deadline,omitempty"`
+	SweepRound     int                              `json:"sweep_round"`
+	SweepMaxRounds int                              `json:"sweep_max_rounds"`
+	SweepNextRound string                           `json:"sweep_next_round_at,omitempty"`
 	SweepObserved  int                              `json:"sweep_observed"`
 	SweepTargets   int                              `json:"sweep_targets"`
 	SweepEvidence  int                              `json:"sweep_evidence"`
@@ -121,6 +132,14 @@ func normalizeQuotaEpochState(state quotaEpochState) quotaEpochState {
 	}
 	if out.Sweep.Targets == nil {
 		out.Sweep.Targets = make(map[string]quotaEpochSweepTarget)
+	}
+	if out.Sweep.Active {
+		if out.Sweep.Round < 1 {
+			out.Sweep.Round = 1
+		}
+		if out.Sweep.RoundStartedAt.IsZero() {
+			out.Sweep.RoundStartedAt = out.Sweep.StartedAt
+		}
 	}
 	for key, account := range out.Accounts {
 		id := strings.TrimSpace(account.AuthID)
@@ -241,11 +260,28 @@ func quotaEpochResetEvidence(previous, current quotaSnapshot, now time.Time) (st
 	return "", false
 }
 
+func quotaEpochResetMatchesCurrent(state quotaEpochState, current quotaSnapshot, now time.Time) bool {
+	if state.ID == "" || state.ConfirmedAt.IsZero() || state.ResetAt.IsZero() ||
+		now.Before(state.ConfirmedAt) || now.Sub(state.ConfirmedAt) > quotaEpochResetCatchupAge {
+		return false
+	}
+	window, ok := quotaEpochWeeklyWindow(current)
+	if !ok || window.ResetAt.IsZero() {
+		return false
+	}
+	delta := window.ResetAt.Sub(state.ResetAt)
+	if delta < 0 {
+		delta = -delta
+	}
+	return delta <= quotaEpochResetAnchorSkew
+}
+
 func (s *schedulerRuntimeState) beginQuotaEpochSweepLocked(inventory map[string]cpaAuthFileEntry, reason, triggerAuthID, triggerReason string, now time.Time) bool {
 	if len(inventory) == 0 {
 		return false
 	}
 	resetSweep := reason == "provider_reset"
+	forceProbe := false
 	if s.quotaEpoch.Sweep.Active {
 		if resetSweep && s.quotaEpoch.Sweep.Reason != "provider_reset" {
 			s.quotaEpoch.Sweep.Reason = "provider_reset"
@@ -253,25 +289,33 @@ func (s *schedulerRuntimeState) beginQuotaEpochSweepLocked(inventory map[string]
 			s.quotaEpoch.Sweep.TriggerReason = strings.TrimSpace(triggerReason)
 			s.quotaEpoch.Sweep.StartedAt = now
 			s.quotaEpoch.Sweep.Deadline = now.Add(quotaEpochSweepWindow)
+			s.quotaEpoch.Sweep.Round = 1
+			s.quotaEpoch.Sweep.RoundStartedAt = now
+			s.quotaEpoch.Sweep.NextRoundAt = time.Time{}
 			s.quotaEpoch.Sweep.EpochID = ""
 			for id, target := range s.quotaEpoch.Sweep.Targets {
+				target.AttemptedAt = time.Time{}
 				target.ObservedAt = time.Time{}
 				target.Evidence = false
 				target.EvidenceReason = ""
 				target.Error = ""
 				s.quotaEpoch.Sweep.Targets[id] = target
 			}
+			forceProbe = true
 		}
 	} else {
 		s.quotaEpoch.Sweep = quotaEpochSweepState{
-			Active:        true,
-			Reason:        reason,
-			TriggerAuthID: strings.TrimSpace(triggerAuthID),
-			TriggerReason: strings.TrimSpace(triggerReason),
-			StartedAt:     now,
-			Deadline:      now.Add(quotaEpochSweepWindow),
-			Targets:       make(map[string]quotaEpochSweepTarget, len(inventory)),
+			Active:         true,
+			Reason:         reason,
+			TriggerAuthID:  strings.TrimSpace(triggerAuthID),
+			TriggerReason:  strings.TrimSpace(triggerReason),
+			StartedAt:      now,
+			Deadline:       now.Add(quotaEpochSweepWindow),
+			Round:          1,
+			RoundStartedAt: now,
+			Targets:        make(map[string]quotaEpochSweepTarget, len(inventory)),
 		}
+		forceProbe = true
 	}
 	if s.quotaEpoch.Sweep.Targets == nil {
 		s.quotaEpoch.Sweep.Targets = make(map[string]quotaEpochSweepTarget, len(inventory))
@@ -283,13 +327,16 @@ func (s *schedulerRuntimeState) beginQuotaEpochSweepLocked(inventory map[string]
 	}
 	for id, auth := range inventory {
 		target := s.quotaEpoch.Sweep.Targets[id]
+		newTarget := strings.TrimSpace(target.AuthID) == ""
 		target.AuthID = id
 		target.AuthIndex = strings.TrimSpace(auth.AuthIndex)
 		s.quotaEpoch.Sweep.Targets[id] = target
-		poll := s.quotaPolls[id]
-		if !strings.Contains(poll.Error, "401") && !strings.Contains(poll.Error, "403") {
-			poll.NextAt = time.Time{}
-			s.quotaPolls[id] = poll
+		if forceProbe || newTarget {
+			poll := s.quotaPolls[id]
+			if !strings.Contains(poll.Error, "401") && !strings.Contains(poll.Error, "403") {
+				poll.NextAt = time.Time{}
+				s.quotaPolls[id] = poll
+			}
 		}
 	}
 	s.quotaEpoch.Sweep.Required = quotaEpochQuorum(len(s.quotaEpoch.Sweep.Targets))
@@ -326,9 +373,14 @@ func (s *schedulerRuntimeState) prepareQuotaEpochInventoryLocked(inventory map[s
 
 func (s *schedulerRuntimeState) quotaEpochProbeReasonLocked(authID string, now time.Time) string {
 	authID = strings.TrimSpace(authID)
-	if s.quotaEpoch.Sweep.Active && now.Before(s.quotaEpoch.Sweep.Deadline) {
+	if s.quotaEpoch.Sweep.Active && now.Before(s.quotaEpoch.Sweep.Deadline) &&
+		(s.quotaEpoch.Sweep.NextRoundAt.IsZero() || !now.Before(s.quotaEpoch.Sweep.NextRoundAt)) {
 		target, exists := s.quotaEpoch.Sweep.Targets[authID]
-		if exists && (target.ObservedAt.IsZero() || target.ObservedAt.Before(s.quotaEpoch.Sweep.StartedAt)) {
+		roundStartedAt := s.quotaEpoch.Sweep.RoundStartedAt
+		if roundStartedAt.IsZero() {
+			roundStartedAt = s.quotaEpoch.Sweep.StartedAt
+		}
+		if exists && !target.Evidence && (target.AttemptedAt.IsZero() || target.AttemptedAt.Before(roundStartedAt)) {
 			if s.quotaEpoch.Sweep.Reason == "provider_reset" {
 				return "epoch_reset_sweep"
 			}
@@ -336,9 +388,21 @@ func (s *schedulerRuntimeState) quotaEpochProbeReasonLocked(authID string, now t
 		}
 	}
 	account, exists := s.quotaEpoch.Accounts[authID]
-	if !exists || s.quotaEpoch.ID == "" || account.State != quotaEpochAccountPending || !account.ObservedAt.IsZero() ||
-		account.ProbeAttempts >= quotaEpochPendingProbeLimit {
+	needsObservation := account.ObservedAt.IsZero() || now.Before(account.ObservedAt) ||
+		now.Sub(account.ObservedAt) > quotaEpochWarmupSnapshotAge
+	if !exists || s.quotaEpoch.ID == "" || account.State != quotaEpochAccountPending || !needsObservation {
 		return ""
+	}
+	if account.ProbeAttempts >= quotaEpochPendingProbeLimit {
+		// A provider reset can leave one account on an old telemetry snapshot
+		// through the fast follow-up probes. Admit one delayed catch-up probe
+		// after the warmup snapshot horizon, but keep it inside the bounded
+		// reset catch-up window so idle accounts do not resume periodic polling.
+		if s.quotaEpoch.Reason != "provider_reset" || s.quotaEpoch.ConfirmedAt.IsZero() ||
+			now.Before(s.quotaEpoch.ConfirmedAt) || now.Sub(s.quotaEpoch.ConfirmedAt) > quotaEpochResetCatchupAge ||
+			account.LastProbeAt.IsZero() || now.Before(account.LastProbeAt.Add(quotaEpochWarmupSnapshotAge)) {
+			return ""
+		}
 	}
 	if !account.LastProbeAt.IsZero() && now.Before(account.LastProbeAt.Add(quotaEpochPendingProbeDelay)) {
 		return ""
@@ -347,12 +411,23 @@ func (s *schedulerRuntimeState) quotaEpochProbeReasonLocked(authID string, now t
 }
 
 func (s *schedulerRuntimeState) recordQuotaEpochProbeAttemptLocked(authID, reason string, now time.Time) {
+	authID = strings.TrimSpace(authID)
+	if reason == "epoch_reset_sweep" || reason == "epoch_bootstrap" {
+		target, exists := s.quotaEpoch.Sweep.Targets[authID]
+		if exists {
+			target.AttemptedAt = now
+			target.Error = ""
+			s.quotaEpoch.Sweep.Targets[authID] = target
+		}
+		return
+	}
 	if reason != "epoch_pending" {
 		return
 	}
-	authID = strings.TrimSpace(authID)
 	account, exists := s.quotaEpoch.Accounts[authID]
-	if !exists || account.State != quotaEpochAccountPending || !account.ObservedAt.IsZero() {
+	needsObservation := account.ObservedAt.IsZero() || now.Before(account.ObservedAt) ||
+		now.Sub(account.ObservedAt) > quotaEpochWarmupSnapshotAge
+	if !exists || account.State != quotaEpochAccountPending || !needsObservation {
 		return
 	}
 	account.ProbeAttempts++
@@ -374,7 +449,7 @@ func quotaEpochAccountFromSnapshot(snapshot quotaSnapshot, now time.Time) quotaE
 
 func (s *schedulerRuntimeState) confirmQuotaEpochLocked(reason string, now time.Time) quotaEpochTransition {
 	s.quotaEpoch.Sequence++
-	resetAt := quotaEpochMedianResetLocked(s.quotas, s.quotaEpoch.Sweep.Targets)
+	resetAt := quotaEpochMedianResetLocked(s.quotas, s.quotaEpoch.Sweep.Targets, reason == "provider_reset")
 	id := adqEpochID(resetAt, now)
 	if id == s.quotaEpoch.ID {
 		id = fmt.Sprintf("%s-%d", id, s.quotaEpoch.Sequence)
@@ -387,7 +462,11 @@ func (s *schedulerRuntimeState) confirmQuotaEpochLocked(reason string, now time.
 	for authID, target := range s.quotaEpoch.Sweep.Targets {
 		account := quotaEpochAccountState{AuthID: authID, AuthIndex: target.AuthIndex, State: quotaEpochAccountPending}
 		if snapshot, ok := s.quotas[authID]; ok && !target.ObservedAt.IsZero() && !target.ObservedAt.Before(s.quotaEpoch.Sweep.StartedAt) {
-			account = quotaEpochAccountFromSnapshot(snapshot, now)
+			if reason != "provider_reset" || target.Evidence {
+				account = quotaEpochAccountFromSnapshot(snapshot, now)
+			} else if _, needsWarmup := unstartedWarmupWindow(snapshot, now); needsWarmup {
+				account.ObservedAt = snapshot.RefreshedAt
+			}
 		}
 		if poll := s.quotaPolls[authID]; !poll.LastUsageAt.IsZero() && !poll.LastUsageAt.Before(s.quotaEpoch.Sweep.StartedAt) {
 			account.State = quotaEpochAccountNatural
@@ -400,10 +479,10 @@ func (s *schedulerRuntimeState) confirmQuotaEpochLocked(reason string, now time.
 	return quotaEpochTransition{ID: id, Reason: reason}
 }
 
-func quotaEpochMedianResetLocked(quotas map[string]quotaSnapshot, targets map[string]quotaEpochSweepTarget) time.Time {
+func quotaEpochMedianResetLocked(quotas map[string]quotaSnapshot, targets map[string]quotaEpochSweepTarget, evidenceOnly bool) time.Time {
 	values := make([]time.Time, 0, len(targets))
 	for id, target := range targets {
-		if target.ObservedAt.IsZero() {
+		if target.ObservedAt.IsZero() || (evidenceOnly && !target.Evidence) {
 			continue
 		}
 		if window, ok := quotaEpochWeeklyWindow(quotas[id]); ok && !window.ResetAt.IsZero() {
@@ -415,6 +494,48 @@ func quotaEpochMedianResetLocked(quotas map[string]quotaSnapshot, targets map[st
 	}
 	sort.Slice(values, func(i, j int) bool { return values[i].Before(values[j]) })
 	return values[len(values)/2]
+}
+
+func quotaEpochSweepRoundProgress(sweep quotaEpochSweepState) (attempted, remaining int) {
+	roundStartedAt := sweep.RoundStartedAt
+	if roundStartedAt.IsZero() {
+		roundStartedAt = sweep.StartedAt
+	}
+	for _, target := range sweep.Targets {
+		if target.Evidence {
+			continue
+		}
+		remaining++
+		if !target.AttemptedAt.IsZero() && !target.AttemptedAt.Before(roundStartedAt) {
+			attempted++
+		}
+	}
+	return attempted, remaining
+}
+
+func (s *schedulerRuntimeState) scheduleNextQuotaEpochSweepRoundLocked(now time.Time) bool {
+	sweep := &s.quotaEpoch.Sweep
+	if !sweep.Active || sweep.Reason != "provider_reset" || sweep.Round >= quotaEpochSweepMaxRounds {
+		return false
+	}
+	next := now.Add(quotaEpochSweepRoundDelay)
+	if !sweep.Deadline.IsZero() && !next.Before(sweep.Deadline) {
+		return false
+	}
+	sweep.Round++
+	sweep.RoundStartedAt = next
+	sweep.NextRoundAt = next
+	for authID, target := range sweep.Targets {
+		if target.Evidence {
+			continue
+		}
+		poll := s.quotaPolls[authID]
+		if poll.Error == "" || poll.NextAt.Before(next) {
+			poll.NextAt = next
+			s.quotaPolls[authID] = poll
+		}
+	}
+	return true
 }
 
 func quotaEpochSweepCounts(sweep quotaEpochSweepState) (observed, evidence int) {
@@ -451,9 +572,17 @@ func (s *schedulerRuntimeState) finalizeQuotaEpochSweepLocked(now time.Time) quo
 			}
 		}
 	}
-	if observed == len(sweep.Targets) || !now.Before(sweep.Deadline) {
+	roundAttempted, roundRemaining := quotaEpochSweepRoundProgress(*sweep)
+	roundComplete := roundRemaining == 0 || roundAttempted == roundRemaining
+	if transition.ID == "" && sweep.Reason == "provider_reset" && now.Before(sweep.Deadline) && roundComplete &&
+		s.scheduleNextQuotaEpochSweepRoundLocked(now) {
+		return transition
+	}
+	if transition.ID != "" || !now.Before(sweep.Deadline) ||
+		(sweep.Reason != "provider_reset" && observed == len(sweep.Targets)) {
 		sweep.Active = false
 		sweep.CompletedAt = now
+		sweep.NextRoundAt = time.Time{}
 	}
 	return transition
 }
@@ -461,7 +590,8 @@ func (s *schedulerRuntimeState) finalizeQuotaEpochSweepLocked(now time.Time) quo
 func (s *schedulerRuntimeState) observeQuotaEpochProbeLocked(authID string, previous, current quotaSnapshot, inventory map[string]cpaAuthFileEntry, now time.Time) quotaEpochTransition {
 	authID = strings.TrimSpace(authID)
 	reason, resetEvidence := quotaEpochResetEvidence(previous, current, now)
-	if resetEvidence && (!s.quotaEpoch.Sweep.Active || s.quotaEpoch.Sweep.Reason != "provider_reset") {
+	newEpochEvidence := resetEvidence && !quotaEpochResetMatchesCurrent(s.quotaEpoch, current, now)
+	if newEpochEvidence && (!s.quotaEpoch.Sweep.Active || s.quotaEpoch.Sweep.Reason != "provider_reset") {
 		s.beginQuotaEpochSweepLocked(inventory, "provider_reset", authID, reason, now)
 	}
 	if target, exists := s.quotaEpoch.Sweep.Targets[authID]; exists {
@@ -469,22 +599,32 @@ func (s *schedulerRuntimeState) observeQuotaEpochProbeLocked(authID string, prev
 		target.AuthIndex = strings.TrimSpace(current.AuthIndex)
 		target.ObservedAt = current.RefreshedAt
 		target.Error = ""
-		if resetEvidence {
+		if newEpochEvidence {
 			target.Evidence = true
 			target.EvidenceReason = reason
 		}
 		s.quotaEpoch.Sweep.Targets[authID] = target
 	}
 	if account, exists := s.quotaEpoch.Accounts[authID]; exists && !current.RefreshedAt.Before(s.quotaEpoch.ConfirmedAt) {
-		updated := quotaEpochAccountFromSnapshot(current, now)
-		updated.LastUsageAt = account.LastUsageAt
-		updated.LastWarmEpoch = account.LastWarmEpoch
-		updated.LastWarmAt = account.LastWarmAt
-		updated.ProbeAttempts = account.ProbeAttempts
-		updated.LastProbeAt = account.LastProbeAt
-		if account.State == quotaEpochAccountWarmed || account.State == quotaEpochAccountBlocked {
-			updated.State = account.State
-			updated.Error = account.Error
+		updated := account
+		canAdoptSnapshot := s.quotaEpoch.Reason != "provider_reset" || account.State != quotaEpochAccountPending || resetEvidence
+		if !canAdoptSnapshot {
+			_, canAdoptSnapshot = unstartedWarmupWindow(current, now)
+		}
+		if canAdoptSnapshot {
+			updated = quotaEpochAccountFromSnapshot(current, now)
+			updated.LastUsageAt = account.LastUsageAt
+			updated.LastWarmEpoch = account.LastWarmEpoch
+			updated.LastWarmAt = account.LastWarmAt
+			updated.ProbeAttempts = account.ProbeAttempts
+			updated.LastProbeAt = account.LastProbeAt
+			if account.State == quotaEpochAccountWarmed || account.State == quotaEpochAccountBlocked {
+				updated.State = account.State
+				updated.Error = account.Error
+			}
+		} else {
+			updated.ObservedAt = time.Time{}
+			updated.Error = ""
 		}
 		s.quotaEpoch.Accounts[authID] = updated
 	}
@@ -506,7 +646,7 @@ func (s *schedulerRuntimeState) observeQuotaEpochProbeErrorLocked(authID, code s
 
 func (s *schedulerRuntimeState) beginQuotaEpochResetFromHeadersLocked(authID string, previous, current quotaSnapshot, now time.Time) bool {
 	reason, evidence := quotaEpochResetEvidence(previous, current, now)
-	if !evidence {
+	if !evidence || quotaEpochResetMatchesCurrent(s.quotaEpoch, current, now) {
 		return false
 	}
 	inventory := make(map[string]cpaAuthFileEntry)
@@ -692,7 +832,7 @@ func runtimeQuotaEpoch(state quotaEpochState) runtimeQuotaEpochStatus {
 	out := runtimeQuotaEpochStatus{
 		ID: state.ID, Sequence: state.Sequence, Reason: state.Reason, SweepActive: state.Sweep.Active,
 		SweepReason: state.Sweep.Reason, SweepTargets: len(state.Sweep.Targets),
-		SweepRequired: state.Sweep.Required,
+		SweepRequired: state.Sweep.Required, SweepRound: state.Sweep.Round, SweepMaxRounds: quotaEpochSweepMaxRounds,
 	}
 	if !state.ConfirmedAt.IsZero() {
 		out.ConfirmedAt = state.ConfirmedAt.Format(time.RFC3339)
@@ -705,6 +845,9 @@ func runtimeQuotaEpoch(state quotaEpochState) runtimeQuotaEpochStatus {
 	}
 	if !state.Sweep.Deadline.IsZero() {
 		out.SweepDeadline = state.Sweep.Deadline.Format(time.RFC3339)
+	}
+	if !state.Sweep.NextRoundAt.IsZero() {
+		out.SweepNextRound = state.Sweep.NextRoundAt.Format(time.RFC3339)
 	}
 	out.SweepObserved, out.SweepEvidence = quotaEpochSweepCounts(state.Sweep)
 	for _, account := range state.Accounts {

@@ -3,7 +3,7 @@ import { createSettingsEditor } from './settings.mjs';
 
 const $ = id => document.getElementById(id);
 const base = resourceBase(location.href);
-const endpoint = base + '/v0/management/plugins/codex-quota-scheduler/quota';
+const endpoint = base + '/v0/management/plugins/codex-quota-scheduler/scheduler-status';
 const bansEndpoint = base + '/v0/management/plugins/codex-quota-scheduler/bans';
 const plans = {team_standard:'Team Standard',team_premium:'Team Premium',plus:'Plus',pro_5x:'Pro 5x',pro_20x:'Pro 20x'};
 const upstreamPlans = {team:'Team Standard',self_serve_business_prolite:'Team Premium',plus:'Plus'};
@@ -351,11 +351,13 @@ function renderQuotaEpoch() {
     ['Epoch',epoch.id||'尚未确认'],
     ['确认时间',dateText(epoch.confirmed_at)],
     ['重置锚点',dateText(epoch.reset_at)],
+    ['复核轮次',String(epoch.sweep_round||0)+' / '+String(epoch.sweep_max_rounds||0)],
     ['Sweep quorum',String(epoch.sweep_evidence||0)+' / '+String(epoch.sweep_required||0)+' · 已观测 '+String(epoch.sweep_observed||0)+' / '+String(epoch.sweep_targets||0)],
     ['账号覆盖','等待 '+String(epoch.pending||0)+' · 自然 '+String(epoch.natural||0)+' · 自动 '+String(epoch.warmed||0)+' · 阻止 '+String(epoch.blocked||0)+' / '+String(total)]
   ];
   for(const [label,value] of pairs){const row=element('div');row.append(element('dt','',label),element('dd','',value));metrics.append(row);}
   if(epoch.sweep_active&&timestamp(epoch.sweep_deadline))accounts.append(countdown(epoch.sweep_deadline,'本轮复核窗口 '));
+  if(epoch.sweep_active&&timestamp(epoch.sweep_next_round_at))accounts.append(countdown(epoch.sweep_next_round_at,'下一轮复核 '));
   for(const account of epoch.accounts||[]){
     const item=element('li'),line=element('div','warmup-line'),label=epochAccountStates[account.state]||account.state||'未知';
     line.append(element('span','warmup-id',account.auth_id),element('span','badge'+(account.state==='blocked'?' warning':account.state==='pending'?'':' good'),label));
@@ -441,6 +443,7 @@ async function refresh(force=false) {
     const warnings = [];
     if (!state.enabled) warnings.push('调度器已关闭。');
     if (state.generation_managed && !state.generation_active) warnings.push('当前插件实例未取得运行权，请检查 CPA 插件加载状态。');
+    if ((state.quota_refresh_targets ?? 0) === 0 && (state.snapshots?.length ?? 0) === 0) warnings.push('CPA 当前返回 0 个 Codex 认证账号；没有账号可分配或预热。');
     if (state.last_error || state.quota_refresh_error) warnings.push('额度查询异常：' + (state.quota_refresh_error || state.last_error));
     notice(warnings.join(' '));
   } catch (error) {

@@ -41,9 +41,32 @@ func TestDashboardMenuAndAssets(t *testing.T) {
 		t.Fatalf("resources=%d menus=%d", len(resources), menus)
 	}
 	// JSON endpoints must remain behind management authentication, never menus.
+	foundStatus := false
 	for _, route := range managementRegistration().Routes {
 		if route.Menu != "" {
 			t.Fatalf("management data route %s exposed as public menu", route.Path)
+		}
+		if route.Path == managementRoutePrefix+"/quota" {
+			t.Fatal("CPA v7.3.0 native quota route must not be registered by the plugin")
+		}
+		if route.Path == managementRoutePrefix+"/scheduler-status" {
+			foundStatus = true
+		}
+	}
+	if !foundStatus {
+		t.Fatal("scheduler status route is not registered")
+	}
+}
+
+func TestDashboardStatusRouteAndLegacyDispatchAlias(t *testing.T) {
+	for _, path := range []string{
+		managementRoutePrefix + "/scheduler-status",
+		"/v0/management" + managementRoutePrefix + "/scheduler-status",
+		managementRoutePrefix + "/quota",
+	} {
+		response := dispatchManagement(pluginapi.ManagementRequest{Method: http.MethodGet, Path: path})
+		if response.StatusCode != http.StatusOK || !strings.Contains(string(response.Body), `"scheduler_mode"`) {
+			t.Fatalf("status route %s unavailable: %d body=%s", path, response.StatusCode, response.Body)
 		}
 	}
 }
