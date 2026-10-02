@@ -540,9 +540,9 @@ func pluginRegistration() registration {
 			Author:           "simplez2",
 			GitHubRepository: "https://github.com/simplez2/cpa-codex-quota-scheduler",
 			ConfigFields: []pluginapi.ConfigField{
-				{Name: "account_concurrency_enabled", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Enforce per-account execution slots using CPA request IDs and terminal lifecycle events (default true)."},
-				{Name: "account_max_concurrency", Type: pluginapi.ConfigFieldTypeInteger, Description: "Maximum simultaneous executions per Codex account, including warmup (1-64, default 2)."},
-				{Name: "account_concurrency_wait", Type: pluginapi.ConfigFieldTypeString, Description: "Bounded wait for a busy sticky account or a full pool (0s-30s, default 10s)."},
+				{Name: "account_concurrency_enabled", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Enforce per-credential execution slots using CPA request IDs and terminal lifecycle events (default true)."},
+				{Name: "account_max_concurrency", Type: pluginapi.ConfigFieldTypeInteger, Description: "Maximum simultaneous executions per CPA Codex credential, including warmup (1-64, default 2)."},
+				{Name: "account_concurrency_wait", Type: pluginapi.ConfigFieldTypeString, Description: "Bounded wait for a busy sticky credential or a full pool (0s-30s, default 10s)."},
 				{Name: "scheduler_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"balanced", "serial", "legacy", "shadow", "enforce"}, Description: "Balanced spreads concurrent work by 5h headroom, weekly daily budget and plan capacity. Serial retains one committed primary. Configure either directly in the quota panel."},
 				{Name: "serial_switch_percent", Type: pluginapi.ConfigFieldTypeNumber, Description: "Soft used-percent switch threshold. Drain mode may cross it; hard limits, disallowed windows, and 429 still force failover."},
 				{Name: "serial_handoff_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"threshold_only", "reserve_aware"}, Description: "Account handoff policy. threshold_only follows serial_switch_percent; reserve_aware also hands off before the configured reserve for the active 5h, weekly, or monthly window is consumed."},

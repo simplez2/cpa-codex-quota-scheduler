@@ -6,7 +6,8 @@ plugins:
       enabled: true
       priority: 2000
       scheduler_mode: serial
-      # Native CPA request lifecycle gate, shared by foreground and warmup.
+      # Native CPA request lifecycle gate: independent per credential.
+      # Foreground and warmup share its slots; legacy account_* keys stay compatible.
       account_concurrency_enabled: true
       account_max_concurrency: 2
       account_concurrency_wait: 10s

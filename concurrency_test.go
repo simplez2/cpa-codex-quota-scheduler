@@ -173,7 +173,7 @@ func TestAccountConcurrencyAliasesShareCapAndNewIdentityDoesNotResetIt(t *testin
 	alias.Candidates = []pluginapi.SchedulerAuthCandidate{{ID: "alias", Provider: providerCodex, Attributes: map[string]string{"auth_index": "a"}}}
 	second := correlatedConcurrencyRequest(s, alias, "second", "")
 	if _, err := s.schedulerPick(second); err == nil {
-		t.Fatal("auth_index alias bypassed account cap")
+		t.Fatal("auth_index alias bypassed credential cap")
 	}
 	s.concurrency.release("first")
 	second = correlatedConcurrencyRequest(s, alias, "fresh-alias", "")
@@ -181,27 +181,46 @@ func TestAccountConcurrencyAliasesShareCapAndNewIdentityDoesNotResetIt(t *testin
 		t.Fatal(err)
 	}
 }
-func TestAccountConcurrencyTeamWorkspaceDoesNotMergeDifferentUsers(t *testing.T) {
-	resetBanStoreForTest()
-	defer resetBanStoreForTest()
-	s, base := balancedFixture(time.Now())
-	s.cfg.AccountMaxConcurrency = 1
-	s.cfg.AccountConcurrencyWait = 0
-	for _, id := range []string{"a", "b"} {
-		q := s.quotas[id]
-		q.AccountID = "team-workspace"
-		s.quotas[id] = q
-	}
-	base.Candidates[0].Metadata = map[string]any{"email": "user-a@example.test"}
-	base.Candidates[1].Metadata = map[string]any{"email": "user-b@example.test"}
-	for _, id := range []string{"first", "second"} {
-		req := correlatedConcurrencyRequest(s, base, id, "")
-		if _, err := s.schedulerPick(req); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if got := concurrencyCount(s); got.Accounts["a"].Active != 1 || got.Accounts["b"].Active != 1 {
-		t.Fatalf("different Team seats were merged: %+v", got)
+func TestAccountConcurrencyCredentialsStayIndependentForSameWorkspaceAndUser(t *testing.T) {
+	for _, sameUser := range []bool{false, true} {
+		t.Run(fmt.Sprintf("same_user_%t", sameUser), func(t *testing.T) {
+			resetBanStoreForTest()
+			defer resetBanStoreForTest()
+			s, base := balancedFixture(time.Now())
+			s.cfg.AccountMaxConcurrency = 1
+			s.cfg.AccountConcurrencyWait = 0
+			for _, id := range []string{"a", "b"} {
+				q := s.quotas[id]
+				q.AccountID = "team-workspace"
+				s.quotas[id] = q
+			}
+			userB := "user-b@example.test"
+			if sameUser {
+				userB = "user-a@example.test"
+			}
+			base.Candidates[0].Metadata = map[string]any{"email": "user-a@example.test", "chatgpt_user_id": "user-a"}
+			base.Candidates[1].Metadata = map[string]any{"email": userB}
+			if sameUser {
+				base.Candidates[1].Metadata["chatgpt_user_id"] = "user-a"
+			}
+			for _, id := range []string{"first", "second"} {
+				req := correlatedConcurrencyRequest(s, base, id, "")
+				if _, err := s.schedulerPick(req); err != nil {
+					t.Fatal(err)
+				}
+			}
+			got := concurrencyCount(s)
+			if got.Scope != "credential" || got.MaxPerCredential != 1 || got.Credentials["a"].Active != 1 || got.Credentials["b"].Active != 1 {
+				t.Fatalf("independent CPA credentials were merged: %+v", got)
+			}
+			if got.Accounts["a"] != got.Credentials["a"] || got.MaxPerAccount != got.MaxPerCredential {
+				t.Fatal("legacy status aliases diverged")
+			}
+			third := correlatedConcurrencyRequest(s, base, "third", "")
+			if _, err := s.schedulerPick(third); err == nil {
+				t.Fatal("credential cap allowed a third execution")
+			}
+		})
 	}
 }
 func TestAccountConcurrencyRetryMovesOneSlotAndOldUsageCannotReleaseIt(t *testing.T) {
@@ -278,7 +297,7 @@ func TestAccountConcurrencyWarmupSharesForegroundSlot(t *testing.T) {
 	}
 	request := correlatedConcurrencyRequest(s, base, "real-request", "")
 	if _, err := s.schedulerPick(request); err == nil {
-		t.Fatal("foreground exceeded account cap while warmup running")
+		t.Fatal("foreground exceeded credential cap while warmup running")
 	}
 	s.concurrency.release(warmupID)
 	// A client retry starts a new CPA request lifecycle after admission timed out.

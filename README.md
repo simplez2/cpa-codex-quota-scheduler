@@ -20,7 +20,7 @@ needed after installation:
   clear one or all local cooldowns with confirmation.
 - **调配设置**: edit switching policy, weekly budgeting and default/per-account
   plans, including **均衡并发** (`balanced`) for simultaneous account use. Set
-  **限制每账号并发**, **每账号最大并发**, and **并发满时最长等待** here. The
+  **限制每凭据并发**, **每凭据最大并发**, and **并发满时最长等待** here. The
   default 5h policy remains zero reserve and hard-limit/429 handoff.
 - **预热管理**: enable/disable warmup, select its model, set spacing and daily
   limits, view cycle confirmation, and unblock failed retries. Unblocking does
@@ -46,14 +46,21 @@ encrypted and scoped CPA storage formats are supported. No sidecar is needed.
 UI authentication and settings regressions: `node --test web/*.test.mjs`.
 Linux release assets use the Debian 12 glibc baseline for CPA compatibility.
 
-## Per-account concurrency (CPA v8.0.4+)
+## Per-credential concurrency (CPA v8.0.4+)
 
-Concurrency protection is enabled by default: 2 executions per Codex account,
+Concurrency protection is enabled by default: 2 executions per CPA Codex credential,
 with a maximum queue wait of 10 seconds. Requests and synthetic warmup share
-slots. Distinct conversations may use different available accounts; a busy
-sticky conversation waits for its bound account. The panel shows actual active
+slots. Distinct conversations may use different available credentials; a busy
+sticky conversation waits for its bound credential. The panel shows actual active
 executions separately from predicted quota debt. When the bounded wait expires,
-CPA returns an explicit busy response rather than exceeding the account cap.
+CPA returns an explicit busy response rather than exceeding the credential cap.
+
+Distinct credentials have independent caps even when they belong to the same
+account, workspace or user. AuthID and auth_index representations of the same
+credential share a cap. Existing `account_concurrency_*` / `account_max_concurrency`
+configuration keys remain compatible and now explicitly apply per credential.
+Status reports `scope: "credential"`, `max_per_credential` and `credentials`;
+`max_per_account` and `accounts` remain identical wire aliases for older clients.
 
 Slots use CPA's native request lifecycle ID and terminal callback. Streaming,
 success, rejection, failure, cancellation and sequential retries retain/release

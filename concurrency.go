@@ -52,15 +52,18 @@ type accountConcurrencyAccountStatus struct {
 	AtLimit bool `json:"at_limit"`
 }
 type accountConcurrencyStatus struct {
-	Enabled       bool                                       `json:"enabled"`
-	Supported     bool                                       `json:"lifecycle_observed"`
-	MaxPerAccount int                                        `json:"max_per_account"`
-	WaitSeconds   float64                                    `json:"wait_seconds"`
-	Active        int                                        `json:"active"`
-	Waiting       int                                        `json:"waiting"`
-	Waits         uint64                                     `json:"waits"`
-	Rejected      uint64                                     `json:"rejected"`
-	Accounts      map[string]accountConcurrencyAccountStatus `json:"accounts"`
+	Enabled          bool                                       `json:"enabled"`
+	Supported        bool                                       `json:"lifecycle_observed"`
+	Scope            string                                     `json:"scope"`
+	MaxPerCredential int                                        `json:"max_per_credential"`
+	MaxPerAccount    int                                        `json:"max_per_account"`
+	WaitSeconds      float64                                    `json:"wait_seconds"`
+	Active           int                                        `json:"active"`
+	Waiting          int                                        `json:"waiting"`
+	Waits            uint64                                     `json:"waits"`
+	Rejected         uint64                                     `json:"rejected"`
+	Credentials      map[string]accountConcurrencyAccountStatus `json:"credentials"`
+	Accounts         map[string]accountConcurrencyAccountStatus `json:"accounts"`
 }
 
 func (g *accountConcurrencyGate) initLocked() {
@@ -124,7 +127,8 @@ func (g *accountConcurrencyGate) release(id string) *concurrencyRequest {
 }
 
 // Aliases are namespaced and merged when CPA supplies additional identity
-// evidence. Learning account_id/index after admission must not reset a count.
+// evidence for the same credential. Learning its auth_index after admission
+// must not reset a count. Account/workspace/user identity is never an alias.
 func (g *accountConcurrencyGate) keyLocked(aliases []string) string {
 	g.initLocked()
 	key := ""
@@ -192,12 +196,7 @@ func (s *schedulerRuntimeState) concurrencyAliases(candidate pluginapi.Scheduler
 	if index != "" {
 		out = append(out, "index:"+index)
 	}
-	// A Team account_id can identify a shared workspace. Scope it by CPA's
-	// explicit user identity; never merge unrelated seats by workspace alone.
-	user := extractMetadataString(candidate.Metadata, "chatgpt_user_id", "user_id", "email")
-	if ok && snapshot.AccountID != "" && user != "" {
-		out = append(out, "member:"+snapshot.AccountID+":"+strings.ToLower(user))
-	}
+	// Separate CPA credentials stay independent even for the same workspace/user.
 	return out
 }
 func (s *schedulerRuntimeState) concurrencyPreferred(req pluginapi.SchedulerPickRequest, cfg pluginConfig, now time.Time) string {
@@ -501,7 +500,7 @@ func (s *schedulerRuntimeState) concurrencyAfter(req pluginapi.RequestInterceptR
 			g.rejected++
 			g.mu.Unlock()
 			s.selectionMu.Unlock()
-			return concurrencyTermination("account_concurrency_unavailable", "CPA did not admit this Codex execution through the account concurrency scheduler")
+			return concurrencyTermination("account_concurrency_unavailable", "CPA did not admit this Codex execution through the credential concurrency scheduler")
 		}
 		if r != nil {
 			r.Dispatched = true
@@ -568,7 +567,9 @@ func (s *schedulerRuntimeState) concurrencyStatus(cfg pluginConfig, quotas map[s
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.initLocked()
-	out := accountConcurrencyStatus{Enabled: cfg.Enabled && cfg.AccountConcurrencyEnabled, Supported: g.supported, MaxPerAccount: cfg.AccountMaxConcurrency, WaitSeconds: cfg.AccountConcurrencyWait.Seconds(), Waiting: g.waiting, Waits: g.waits, Rejected: g.rejected, Accounts: map[string]accountConcurrencyAccountStatus{}}
+	out := accountConcurrencyStatus{Enabled: cfg.Enabled && cfg.AccountConcurrencyEnabled, Supported: g.supported, Scope: "credential", MaxPerCredential: cfg.AccountMaxConcurrency, MaxPerAccount: cfg.AccountMaxConcurrency, WaitSeconds: cfg.AccountConcurrencyWait.Seconds(), Waiting: g.waiting, Waits: g.waits, Rejected: g.rejected, Accounts: map[string]accountConcurrencyAccountStatus{}}
+	// Keep the original fields as wire aliases for existing panel/API clients.
+	out.Credentials = out.Accounts
 	for _, q := range quotas {
 		if q.AuthID == "" {
 			continue
