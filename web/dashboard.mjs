@@ -269,6 +269,8 @@ function renderAccounts() {
     row.append(budget);
     const balanced=state.balanced_accounts?.[account.auth_id];
     if(state.scheduler_mode==='balanced')budget.append(element('span','subtext','已分配 '+(balanced?.picks||0)+' 次 · 在途估计 '+(balanced?.pending_estimate||0)));
+    const concurrency=state.concurrency?.accounts?.[account.auth_id];
+    if(concurrency)budget.append(element('span','subtext','实时并发 '+concurrency.active+' / '+(state.concurrency.enabled ? concurrency.limit : '不限')+(concurrency.warmup ? ' · 含预热 '+concurrency.warmup : '')+(concurrency.at_limit ? ' · 已达上限' : '')));
     const poll = state.quota_polls?.[account.auth_id] || state.quota_polls?.[account.auth_index];
     const observed = (account.windows || []).map(w=>w.observed_at).filter(v=>timestamp(v)).sort().at(-1);
     const freshness = element('td');
@@ -292,6 +294,7 @@ function renderPolicy() {
   const hold = String(state.serial_weekly_rebalance_min_hold || '').replace(/([hm])0s$/,'$1').replace(/(\d+)h/g,'$1 小时 ').replace(/(\d+)m/g,'$1 分钟 ').replace(/(\d+)s/g,'$1 秒').trim();
   const pairs = [
     ['调度模式',modes[state.scheduler_mode] || state.scheduler_mode],
+    ['每账号并发',state.concurrency?.enabled ? '上限 '+state.concurrency.max_per_account+' · 当前在途 '+state.concurrency.active+' · 等待 '+state.concurrency.waiting+(state.concurrency.lifecycle_observed ? '' : ' · 等待 CPA 生命周期信号') : '已关闭'],
     ['分配策略',state.scheduler_mode==='balanced'?'新会话按 5h 余量、套餐容量和周日均预算分配':state.serial_allocation_policy === 'sustainable' ? '按周日均预算平衡' : '按周剩余比例平衡'],
     ['5h 切换',noReserve ? '额度用尽 / 上游限额时切换' : state.serial_5h_handoff_mode],
     ['5h 预留',noReserve ? '0%（不提前预留）' : pct(state.reserve_5h_percent)],

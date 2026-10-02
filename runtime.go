@@ -72,6 +72,8 @@ type schedulerRuntimeState struct {
 	quotaNative    map[string]quotaSnapshot
 	lifecycleMu    sync.Mutex
 	mu             sync.RWMutex
+	selectionMu    sync.Mutex
+	concurrency    accountConcurrencyGate
 	persistMu      sync.Mutex
 	generationMu   sync.Mutex
 	generation     schedulerGenerationOwnership
@@ -188,6 +190,9 @@ func configureSchedulerRuntime(raw []byte) {
 	}
 
 	schedulerRuntime.stopLocked()
+	// Keep restored sticky bindings and admission changes atomic with picks.
+	schedulerRuntime.selectionMu.Lock()
+	defer schedulerRuntime.selectionMu.Unlock()
 	schedulerRuntime.initializeGenerationOwnership(cfg.StatePath)
 	schedulerRuntime.mu.Lock()
 	schedulerRuntime.cfg = cfg
@@ -261,6 +266,8 @@ func configureSchedulerRuntime(raw []byte) {
 	}
 	schedulerRuntime.configGeneration++
 	schedulerRuntime.mu.Unlock()
+	// Preserve active execution slots across hot reload and wake bounded queues.
+	schedulerRuntime.concurrency.notify()
 
 	loadBanState(cfg.StatePath)
 	if !cfg.Enabled {
@@ -735,7 +742,7 @@ func codexOnlySchedulerRequest(req pluginapi.SchedulerPickRequest) bool {
 	return true
 }
 
-func (s *schedulerRuntimeState) schedulerPick(req pluginapi.SchedulerPickRequest) (pluginapi.SchedulerPickResponse, error) {
+func (s *schedulerRuntimeState) schedulerPickUncapped(req pluginapi.SchedulerPickRequest) (pluginapi.SchedulerPickResponse, error) {
 	if schedulerRequestGenerationDisabled(req) {
 		return pluginapi.SchedulerPickResponse{Handled: false}, nil
 	}
@@ -1473,6 +1480,7 @@ type runtimeADQStatus struct {
 }
 
 type runtimeStatus struct {
+	Concurrency                   accountConcurrencyStatus         `json:"concurrency"`
 	QuotaProbeOnDemand            bool                             `json:"quota_probe_on_demand"`
 	AuthExpiryAutoRepair          bool                             `json:"auth_expiry_auto_repair"`
 	BalancedStickyBindings        int                              `json:"balanced_sticky_bindings"`
@@ -2306,6 +2314,7 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 	}
 
 	out := runtimeStatus{
+		Concurrency:                   s.concurrencyStatus(cfg, quotas),
 		QuotaProbeOnDemand:            cfg.QuotaProbeOnDemand,
 		AuthExpiryAutoRepair:          cfg.AuthExpiryAutoRepair,
 		BalancedAccounts:              balancedAccounts,

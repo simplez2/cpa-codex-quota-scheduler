@@ -94,3 +94,22 @@ func TestPanelControlsCoverEveryRuntimeSetting(t *testing.T) {
 		}
 	}
 }
+
+func TestPanelConcurrencySettingsValidateAndPreserveOtherFields(t *testing.T) {
+	for _, changes := range []map[string]any{
+		{"account_max_concurrency": 0}, {"account_max_concurrency": 65}, {"account_max_concurrency": 1.5},
+		{"account_concurrency_wait": "-1s"}, {"account_concurrency_wait": "31s"}, {"account_concurrency_enabled": "yes"},
+	} {
+		if _, errors := validatePanelSettings(nil, changes); len(errors) == 0 {
+			t.Fatalf("accepted invalid concurrency settings: %v", changes)
+		}
+	}
+	changes, errors := validatePanelSettings(map[string]any{"reserve_5h_percent": 0., "warmup_enabled": true}, map[string]any{"account_concurrency_enabled": false, "account_max_concurrency": 1, "account_concurrency_wait": "0s"})
+	if len(errors) != 0 || len(changes) != 3 || changes["account_concurrency_enabled"] != false {
+		t.Fatalf("changes=%v errors=%v", changes, errors)
+	}
+	defaults := panelSettingsValues(defaultPluginConfig())
+	if defaults["account_concurrency_enabled"] != true || defaults["account_max_concurrency"] != 2 {
+		t.Fatalf("missing safe concurrency defaults: %v", defaults)
+	}
+}

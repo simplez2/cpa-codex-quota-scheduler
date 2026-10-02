@@ -23,3 +23,10 @@ test('every control has a distinct key and a Chinese label',()=>{
   assert.equal(new Set(fields.map(f=>f[0])).size,fields.length);
   for(const spec of fields)assert.match(spec[1],/[\u4e00-\u9fff]/);
 });
+
+test('per-account concurrency controls are editable in allocation and save independently',()=>{
+  const settings=fields.filter(f=>f[0].startsWith('account_'));
+  assert.deepEqual(settings.map(f=>f[0]),['account_concurrency_enabled','account_max_concurrency','account_concurrency_wait']);
+  for(const spec of settings)assert.equal(spec[2],'allocation');
+  assert.deepEqual(changesBetween({account_concurrency_enabled:true,account_max_concurrency:2,reserve_5h_percent:0},{account_concurrency_enabled:false,account_max_concurrency:2,reserve_5h_percent:0}),{account_concurrency_enabled:false});
+});

@@ -3,6 +3,9 @@ const handoff = [['threshold_only','达到使用阈值'],['reserve_aware','保�
 // Metadata is presentation only. Defaults and validation come from the running
 // plugin so an omitted YAML field is never silently saved as zero or empty.
 export const fields = [
+  ['account_concurrency_enabled','限制每账号并发','allocation','boolean','默认开启。真实请求、重试和预热共用每账号槽位；长请求保留槽位直到 CPA 确认结束。保存后立即生效。'],
+  ['account_max_concurrency','每账号最大并发','allocation','number','1 至 64，默认 2。同一底层账号的多个凭据共享上限；调低上限不会中断已开始的请求。',1,64,1],
+  ['account_concurrency_wait','并发满时最长等待','allocation','duration','0 至 30 秒，默认 10 秒。同一会话等待原账号空位；新会话可分配给空闲账号。全池满载时排队，超时返回明确的忙碌状态。'],
   ['scheduler_mode','调度模式','allocation','select','均衡并发按会话分配：新会话按余量、周预算及套餐容量选择账号；同一会话的续聊、工具调用和并发请求保持绑定。账号不可用时才切换。', [['balanced','均衡并发（会话粘性）'],['serial','串行调配'],['legacy','传统调度'],['shadow','观察对比'],['enforce','动态节奏控制']]],
   ['serial_allocation_policy','串行模式的周额度分配方式','allocation','select','均衡并发始终按周日均预算分配。', [['sustainable','按距重置时间的日均预算'],['weekly_remaining','按周剩余比例']]],
   ['quota_default_plan','无法识别时的默认套餐','allocation','select','优先自动识别 CPA 返回的套餐；只有标签缺失、未知或缓存过期时使用此默认值。倍率是容量参考。',plans],
@@ -77,6 +80,10 @@ export function createSettingsEditor({api,notify,onSaved,onView}) {
     byId('save-summary').textContent=saving?'正在写入 CPA 并核对生效状态…':count+' 项未保存';
     byId('save-settings').disabled=saving;
     byId('discard-settings').disabled=saving;
+    for (const name of ['account_max_concurrency','account_concurrency_wait']) {
+      const control=controls.get(name);
+      if(control)for(const input of control.closest('.setting-field').querySelectorAll('input,select'))input.disabled=!draft.account_concurrency_enabled;
+    }
     const mode=draft.serial_5h_handoff_mode;
     for(const name of ['serial_allocation_policy','serial_budget_rebalance_percent','serial_weekly_rebalance_min_hold','serial_prefer_active_cycle','serial_soft_continuation']) {
       const row=controls.get(name)?.closest('.setting-field');if(row)row.hidden=draft.scheduler_mode==='balanced';

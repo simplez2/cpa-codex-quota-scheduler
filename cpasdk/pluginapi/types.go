@@ -976,6 +976,9 @@ type ResponseTransformRequest struct {
 
 // RequestInterceptRequest describes a request about to be executed upstream.
 type RequestInterceptRequest struct {
+	// RequestID is the CPA execution identifier shared with RequestCompletion.
+	RequestID string
+	TraceID   string
 	// SourceFormat is the original client protocol format.
 	SourceFormat string
 	// ToFormat is the selected upstream protocol format. It is empty before credential selection.
@@ -1002,6 +1005,27 @@ type RequestInterceptResponse struct {
 	Body []byte
 	// ClearHeaders explicitly removes current request headers before Headers is applied.
 	ClearHeaders []string
+	// CPA stops upstream execution when Terminate is true.
+	Terminate       bool
+	StatusCode      int
+	ResponseHeaders http.Header
+	ResponseBody    []byte
+}
+
+// RequestCompletion is the native CPA terminal event, including cancellation.
+type RequestCompletion struct {
+	RequestID      string
+	TraceID        string
+	SourceFormat   string
+	Model          string
+	RequestedModel string
+	Stream         bool
+	Outcome        string
+	StatusCode     int
+	Error          string
+	StartedAt      time.Time
+	CompletedAt    time.Time
+	Metadata       map[string]any
 }
 
 // ResponseInterceptRequest describes a successful non-streaming response.

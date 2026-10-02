@@ -2,7 +2,7 @@
 
 Standalone CPA plugin for balanced concurrent or serial Codex account selection, native quota polling,
 5h/weekly/monthly windows, persistent 429 quarantine and optional warmup.
-Source version: **0.3.10**. Local builds are not a published release.
+Source version: **0.3.11**. Local builds are not a published release.
 
 ## CPA dashboard
 
@@ -19,7 +19,8 @@ needed after installation:
 - **账号与额度**: choose a current account, restore automatic selection, and
   clear one or all local cooldowns with confirmation.
 - **调配设置**: edit switching policy, weekly budgeting and default/per-account
-  plans, including **均衡并发** (`balanced`) for simultaneous account use. The
+  plans, including **均衡并发** (`balanced`) for simultaneous account use. Set
+  **限制每账号并发**, **每账号最大并发**, and **并发满时最长等待** here. The
   default 5h policy remains zero reserve and hard-limit/429 handoff.
 - **预热管理**: enable/disable warmup, select its model, set spacing and daily
   limits, view cycle confirmation, and unblock failed retries. Unblocking does
@@ -44,6 +45,30 @@ encrypted and scoped CPA storage formats are supported. No sidecar is needed.
 
 UI authentication and settings regressions: `node --test web/*.test.mjs`.
 Linux release assets use the Debian 12 glibc baseline for CPA compatibility.
+
+## Per-account concurrency (CPA v8.0.4+)
+
+Concurrency protection is enabled by default: 2 executions per Codex account,
+with a maximum queue wait of 10 seconds. Requests and synthetic warmup share
+slots. Distinct conversations may use different available accounts; a busy
+sticky conversation waits for its bound account. The panel shows actual active
+executions separately from predicted quota debt. When the bounded wait expires,
+CPA returns an explicit busy response rather than exceeding the account cap.
+
+Slots use CPA's native request lifecycle ID and terminal callback. Streaming,
+success, rejection, failure, cancellation and sequential retries retain/release
+only their own slots; elapsed time alone never releases an active stream.
+Changing the limit or toggling it preserves existing in-flight counts; lowering
+the limit drains existing requests before new admission. Native mixed-provider
+routing stays with CPA, and Codex selection is admitted after credential selection.
+Other providers are unaffected. Missing native lifecycle correlation fails closed
+for Codex when protection is enabled. This release requires CPA v8.0.4 or later
+for concurrency protection; older hosts must disable the concurrency setting.
+
+Weekly daily budget uses a confirmed reset even when the remaining quota is
+100%. Full-cycle provider placeholders retain the 7-day fallback. The rate can
+exceed 100%/day when a reset is near: it describes a spending pace before the
+reset, not a new daily quota. A 6-hour minimum horizon bounds this pace.
 
 ## Dependencies
 

@@ -18,3 +18,7 @@ research/inspect_cpa_deploy.py
 # OS clutter
 .DS_Store
 Thumbs.db
+
+research/concurrency-v0311/
+
+.playwright-cli/

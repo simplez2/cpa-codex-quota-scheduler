@@ -92,7 +92,7 @@ func TestSerialBudgetPlaceholderAndMissingResetAreConservative(t *testing.T) {
 	now := time.Now()
 	s := newBudgetTestState(now)
 	q := s.quotas["primary"]
-	for _, reset := range []time.Time{now.Add(time.Minute), time.Time{}, now.Add(7 * 24 * time.Hour)} {
+	for _, reset := range []time.Time{time.Time{}, now.Add(7 * 24 * time.Hour)} {
 		q.Windows[1].UsedPercent = 0
 		q.Windows[1].ResetAt = reset
 		choice := inspectSerialCandidate(pluginapi.SchedulerAuthCandidate{ID: "primary"}, q, true, s.cfg, now)
@@ -240,5 +240,44 @@ func TestSerialBudgetDuplicateFiveHourWindowsKeepTightestHeadroom(t *testing.T) 
 			t.Fatalf("overwritten headroom=%v", choice.CapacityHeadroom)
 		}
 		q.Windows[0], q.Windows[2] = q.Windows[2], q.Windows[0]
+	}
+}
+
+func TestWeeklyBudgetFullWindowUsesConfirmedReset(t *testing.T) {
+	now := time.Date(2026, 10, 3, 1, 44, 0, 0, time.FixedZone("SGT", 8*3600))
+	for _, cached := range []bool{false, true} {
+		s := newBudgetTestState(now)
+		q := s.quotas["primary"]
+		observed := now
+		if cached {
+			observed = now.Add(-time.Hour)
+		}
+		q.RefreshedAt = observed
+		q.Windows[1] = quotaWindow{Class: "weekly", WindowSeconds: 604800, UsedPercent: 0, Allowed: true, ResetAt: now.Add(13*time.Hour + 17*time.Minute + 7*time.Second), ObservedAt: observed, Source: quotaSourceProbe}
+		choice := inspectSerialCandidate(pluginapi.SchedulerAuthCandidate{ID: "primary"}, q, true, s.cfg, now)
+		rate, known := serialWeeklyBudget(choice, s.cfg, now)
+		want := 92.0 * 24 / (13 + 17.0/60 + 7.0/3600)
+		if !known || math.Abs(rate-want) > 1e-6 {
+			t.Fatalf("cached=%v: rate=%v known=%v want=%v", cached, rate, known, want)
+		}
+	}
+}
+func TestWeeklyBudgetFullProviderPlaceholderStillUsesWeek(t *testing.T) {
+	now := time.Now()
+	s := newBudgetTestState(now)
+	q := s.quotas["primary"]
+	q.Windows[1] = quotaWindow{Class: "weekly", WindowSeconds: 604800, ResetAt: now.Add(7 * 24 * time.Hour), ObservedAt: now, Allowed: true, ResetAfterSeconds: 604800, ResetAfterSecondsKnown: true}
+	choice := inspectSerialCandidate(pluginapi.SchedulerAuthCandidate{ID: "primary"}, q, true, s.cfg, now)
+	if rate, known := serialWeeklyBudget(choice, s.cfg, now); !known || math.Abs(rate-92.0/7) > 1e-6 {
+		t.Fatalf("placeholder: %v %v", rate, known)
+	}
+	// The placeholder remains an unstarted window as its cached countdown runs.
+	if rate, _ := serialWeeklyBudget(choice, s.cfg, now.Add(6*24*time.Hour)); math.Abs(rate-92.0/7) > 1e-6 {
+		t.Fatalf("aged placeholder got imminent-reset priority: %v", rate)
+	}
+	q.Windows[1].ResetAt = now.Add(-time.Second)
+	choice = inspectSerialCandidate(pluginapi.SchedulerAuthCandidate{ID: "primary"}, q, true, s.cfg, now)
+	if _, known := serialWeeklyBudget(choice, s.cfg, now); known {
+		t.Fatal("expired reset used as budget horizon")
 	}
 }

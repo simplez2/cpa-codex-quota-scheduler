@@ -105,7 +105,7 @@ import (
 
 const (
 	pluginName    = "codex-quota-scheduler"
-	pluginVersion = "0.3.10"
+	pluginVersion = "0.3.11"
 
 	// providerCodex is the CPA provider key for OpenAI Codex (ChatGPT backend).
 	providerCodex = "codex"
@@ -514,6 +514,12 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return handleUsage(request)
 	case pluginabi.MethodSchedulerPick:
 		return handleSchedulerPick(request)
+	case pluginabi.MethodRequestInterceptBefore:
+		return handleConcurrencyBefore(request)
+	case pluginabi.MethodRequestInterceptAfter:
+		return handleConcurrencyAfter(request)
+	case pluginabi.MethodRequestComplete:
+		return handleConcurrencyComplete(request)
 	case pluginabi.MethodManagementRegister:
 		return okEnvelope(managementRegistration())
 	case pluginabi.MethodManagementHandle:
@@ -534,6 +540,9 @@ func pluginRegistration() registration {
 			Author:           "simplez2",
 			GitHubRepository: "https://github.com/simplez2/cpa-codex-quota-scheduler",
 			ConfigFields: []pluginapi.ConfigField{
+				{Name: "account_concurrency_enabled", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Enforce per-account execution slots using CPA request IDs and terminal lifecycle events (default true)."},
+				{Name: "account_max_concurrency", Type: pluginapi.ConfigFieldTypeInteger, Description: "Maximum simultaneous executions per Codex account, including warmup (1-64, default 2)."},
+				{Name: "account_concurrency_wait", Type: pluginapi.ConfigFieldTypeString, Description: "Bounded wait for a busy sticky account or a full pool (0s-30s, default 10s)."},
 				{Name: "scheduler_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"balanced", "serial", "legacy", "shadow", "enforce"}, Description: "Balanced spreads concurrent work by 5h headroom, weekly daily budget and plan capacity. Serial retains one committed primary. Configure either directly in the quota panel."},
 				{Name: "serial_switch_percent", Type: pluginapi.ConfigFieldTypeNumber, Description: "Soft used-percent switch threshold. Drain mode may cross it; hard limits, disallowed windows, and 429 still force failover."},
 				{Name: "serial_handoff_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"threshold_only", "reserve_aware"}, Description: "Account handoff policy. threshold_only follows serial_switch_percent; reserve_aware also hands off before the configured reserve for the active 5h, weekly, or monthly window is consumed."},
@@ -584,9 +593,11 @@ func pluginRegistration() registration {
 			},
 		},
 		Capabilities: registrationCapability{
-			UsagePlugin:   true,
-			Scheduler:     true,
-			ManagementAPI: true,
+			RequestInterceptor:     true,
+			RequestLifecyclePlugin: true,
+			UsagePlugin:            true,
+			Scheduler:              true,
+			ManagementAPI:          true,
 		},
 	}
 }
@@ -854,6 +865,12 @@ func handleSchedulerPick(raw []byte) ([]byte, error) {
 	}
 	response, err := schedulerRuntime.schedulerPick(req)
 	if err != nil {
+		if _, admission := err.(*accountConcurrencyError); admission {
+			// Scheduler ABI errors become generic HTTP 500 in CPA. Keep the
+			// request marked rejected and let native after-auth termination
+			// produce the explicit retryable HTTP 503 without any upstream call.
+			return okEnvelope(pluginapi.SchedulerPickResponse{Handled: false})
+		}
 		return nil, err
 	}
 	return okEnvelope(response)
@@ -1250,9 +1267,11 @@ type registration struct {
 }
 
 type registrationCapability struct {
-	UsagePlugin   bool `json:"usage_plugin"`
-	Scheduler     bool `json:"scheduler"`
-	ManagementAPI bool `json:"management_api"`
+	RequestInterceptor     bool `json:"request_interceptor"`
+	RequestLifecyclePlugin bool `json:"request_lifecycle_plugin"`
+	UsagePlugin            bool `json:"usage_plugin"`
+	Scheduler              bool `json:"scheduler"`
+	ManagementAPI          bool `json:"management_api"`
 }
 
 func okEnvelope(v any) ([]byte, error) {

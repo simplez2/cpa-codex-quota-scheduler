@@ -73,10 +73,10 @@ func serialWeeklyBudget(choice serialCandidate, cfg pluginConfig, now time.Time)
 			return 0, false
 		}
 		remaining := math.Max(0, 100-w.UsedPercent)
-		// No reset / never-started placeholder: a complete week, not an inferred
-		// imminent reset. Full-but-confirmed windows lose no safety from this.
+		// Only a missing reset or a provider placeholder uses a complete week.
+		// A full window can still have a confirmed imminent reset (e.g. a refill).
 		horizon := 7 * 24 * time.Hour
-		if w.UsedPercent > 0 && !w.ResetAt.IsZero() {
+		if !w.ResetAt.IsZero() && !quotaWindowHasPlaceholderReset(w, choice.Snapshot.RefreshedAt, now) {
 			horizon = w.ResetAt.Sub(now)
 		}
 		if horizon < serialBudgetResetFloor {

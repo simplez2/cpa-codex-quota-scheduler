@@ -24,6 +24,9 @@ type pluginConfig struct {
 	Enabled                      bool
 	Priority                     int
 	SchedulerMode                string
+	AccountConcurrencyEnabled    bool
+	AccountMaxConcurrency        int
+	AccountConcurrencyWait       time.Duration
 	SerialSwitchPercent          float64
 	SerialSoftContinuation       bool
 	SerialAllocationPolicy       string
@@ -78,6 +81,9 @@ type yamlPluginConfig struct {
 	Enabled                      *bool             `yaml:"enabled"`
 	Priority                     *int              `yaml:"priority"`
 	SchedulerMode                string            `yaml:"scheduler_mode"`
+	AccountConcurrencyEnabled    *bool             `yaml:"account_concurrency_enabled"`
+	AccountMaxConcurrency        *int              `yaml:"account_max_concurrency"`
+	AccountConcurrencyWait       string            `yaml:"account_concurrency_wait"`
 	SerialSwitchPercent          *float64          `yaml:"serial_switch_percent"`
 	SerialSoftContinuation       *bool             `yaml:"serial_soft_continuation"`
 	SerialAllocationPolicy       string            `yaml:"serial_allocation_policy"`
@@ -132,6 +138,9 @@ func defaultPluginConfig() pluginConfig {
 		QuotaRefreshBatch:            8,
 		Enabled:                      true,
 		SchedulerMode:                "serial",
+		AccountConcurrencyEnabled:    true,
+		AccountMaxConcurrency:        2,
+		AccountConcurrencyWait:       10 * time.Second,
 		SerialSwitchPercent:          98,
 		SerialAllocationPolicy:       "sustainable",
 		SerialBudgetRebalancePercent: 20,
@@ -205,6 +214,22 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 	}
 	if strings.TrimSpace(in.SchedulerMode) != "" {
 		cfg.SchedulerMode = strings.ToLower(strings.TrimSpace(in.SchedulerMode))
+	}
+	if in.AccountConcurrencyEnabled != nil {
+		cfg.AccountConcurrencyEnabled = *in.AccountConcurrencyEnabled
+	}
+	if in.AccountMaxConcurrency != nil {
+		if *in.AccountMaxConcurrency < 1 || *in.AccountMaxConcurrency > 64 {
+			return cfg, fmt.Errorf("account_max_concurrency must be between 1 and 64")
+		}
+		cfg.AccountMaxConcurrency = *in.AccountMaxConcurrency
+	}
+	if in.AccountConcurrencyWait != "" {
+		wait, err := time.ParseDuration(in.AccountConcurrencyWait)
+		if err != nil || wait < 0 || wait > 30*time.Second {
+			return cfg, fmt.Errorf("account_concurrency_wait must be between 0s and 30s")
+		}
+		cfg.AccountConcurrencyWait = wait
 	}
 	if in.SerialSwitchPercent != nil {
 		cfg.SerialSwitchPercent = *in.SerialSwitchPercent

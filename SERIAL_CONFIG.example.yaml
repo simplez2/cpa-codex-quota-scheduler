@@ -1,4 +1,4 @@
-# Standalone CPA quota scheduler v0.3.10.
+# Standalone CPA quota scheduler v0.3.11.
 plugins:
   enabled: true
   configs:
@@ -6,6 +6,10 @@ plugins:
       enabled: true
       priority: 2000
       scheduler_mode: serial
+      # Native CPA request lifecycle gate, shared by foreground and warmup.
+      account_concurrency_enabled: true
+      account_max_concurrency: 2
+      account_concurrency_wait: 10s
       # Set balanced for concurrent, quota-weighted distribution across accounts.
       # This can also be selected in the Codex 额度调度 panel without editing YAML.
       serial_allocation_policy: sustainable

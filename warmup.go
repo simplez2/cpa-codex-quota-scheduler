@@ -41,10 +41,11 @@ type warmupEntry struct {
 }
 
 type warmupCandidate struct {
-	Snapshot quotaSnapshot
-	Window   quotaWindow
-	RetryAt  time.Time
-	EpochID  string
+	ConcurrencyRequestID string
+	Snapshot             quotaSnapshot
+	Window               quotaWindow
+	RetryAt              time.Time
+	EpochID              string
 }
 
 type warmupAuthBinding struct {
@@ -239,6 +240,8 @@ func (s *schedulerRuntimeState) scheduleWarmup(parent context.Context, skipAuthI
 		return
 	}
 	now = time.Now()
+	s.selectionMu.Lock()
+	defer s.selectionMu.Unlock()
 	s.warmupMu.Lock()
 	if s.warmupRunning || s.warmupTrafficStatusLocked(cfg, now).HoldReason != "" {
 		s.warmupMu.Unlock()
@@ -257,7 +260,15 @@ func (s *schedulerRuntimeState) scheduleWarmup(parent context.Context, skipAuthI
 		releaseInstanceLease()
 		return
 	}
+	slotID, slotOK := s.beginWarmupConcurrency(candidate, cfg)
+	if !slotOK {
+		s.warmupMu.Unlock()
+		releaseInstanceLease()
+		return
+	}
+	candidate.ConcurrencyRequestID = slotID
 	if !s.admitBackgroundWorker() {
+		s.concurrency.release(slotID)
 		s.warmupMu.Unlock()
 		releaseInstanceLease()
 		return
@@ -282,11 +293,13 @@ func (s *schedulerRuntimeState) scheduleWarmup(parent context.Context, skipAuthI
 		s.warmupMu.Unlock()
 		s.wg.Done()
 		releaseInstanceLease()
+		s.concurrency.release(slotID)
 		slog.Warn("codex-quota-scheduler: warmup skipped because admission could not be persisted")
 		return
 	}
 
 	go func() {
+		defer s.concurrency.release(slotID)
 		defer s.wg.Done()
 		defer releaseInstanceLease()
 		defer func() {
@@ -792,6 +805,16 @@ func (s *schedulerRuntimeState) executeWarmup(parent context.Context, cfg plugin
 }
 
 func (s *schedulerRuntimeState) executeCPAWarmup(parent context.Context, cfg pluginConfig, candidate warmupCandidate) {
+	if candidate.ConcurrencyRequestID == "" {
+		s.selectionMu.Lock()
+		id, ok := s.beginWarmupConcurrency(candidate, cfg)
+		s.selectionMu.Unlock()
+		if !ok {
+			s.recordWarmupNotSent(candidate, "account_concurrency_busy")
+			return
+		}
+		defer s.concurrency.release(id)
+	}
 	ctx, cancel := context.WithTimeout(parent, warmupRequestTimeout)
 	defer cancel()
 	if err := ctx.Err(); err != nil {

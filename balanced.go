@@ -14,6 +14,7 @@ const balancedPendingTTL = 2 * time.Hour
 
 type balancedPending struct {
 	Session       string
+	RequestToken  string
 	At            time.Time
 	Model         string
 	Cost          float64
@@ -223,7 +224,7 @@ func (s *schedulerRuntimeState) balancedPick(req pluginapi.SchedulerPickRequest,
 	if len(account.Pending) >= 256 {
 		account.Pending = account.Pending[1:]
 	}
-	account.Pending = append(account.Pending, balancedPending{At: now, Model: normalizeModelName(req.Model), Cost: cost, Session: session, ReservationID: reservation.ID})
+	account.Pending = append(account.Pending, balancedPending{At: now, Model: normalizeModelName(req.Model), Cost: cost, Session: session, RequestToken: schedulerHeader(req.Options, concurrencyHeader), ReservationID: reservation.ID})
 	if session != "" {
 		var index string
 		for _, choice := range choices {
