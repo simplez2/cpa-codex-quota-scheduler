@@ -2,7 +2,7 @@
 
 Standalone CPA plugin for balanced concurrent or serial Codex account selection, native quota polling,
 5h/weekly/monthly windows, persistent 429 quarantine and optional warmup.
-Source version: **0.3.16**. Local builds are not a published release.
+Source version: **0.3.17**. Local builds are not a published release.
 
 ## CPA dashboard
 
@@ -69,6 +69,10 @@ Background worker quiescence during an in-place reconfigure does not invalidate
 verified foreground execution lifecycles. Unloaded plugin generations leave
 native selection and current-generation request headers alone; exact terminal
 callbacks still release their existing stream slots.
+If CPA changes plugin generation between before-auth and credential selection,
+after-auth admission recovers the native RequestID and selected credential before
+upstream execution. This uses the same bounded FIFO and concurrency cap; missing
+native IDs or credentials still fail closed, and terminal callbacks release slots.
 
 Changing the limit or toggling it preserves existing in-flight counts; lowering
 the limit drains existing requests before new admission. Native mixed-provider

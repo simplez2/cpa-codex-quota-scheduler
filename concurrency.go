@@ -41,17 +41,20 @@ type concurrencyRequest struct {
 	WaitReason      string
 }
 type accountConcurrencyGate struct {
-	mu         sync.Mutex
-	requests   map[string]*concurrencyRequest
-	tokens     map[string]string
-	aliases    map[string]string
-	changed    chan struct{}
-	supported  bool
-	waiting    int
-	waits      uint64
-	rejected   uint64
-	sequence   uint64
-	rejections []accountConcurrencyRejection
+	mu            sync.Mutex
+	requests      map[string]*concurrencyRequest
+	tokens        map[string]string
+	completed     map[string]bool
+	completedIDs  []string
+	completedNext int
+	aliases       map[string]string
+	changed       chan struct{}
+	supported     bool
+	waiting       int
+	waits         uint64
+	rejected      uint64
+	sequence      uint64
+	rejections    []accountConcurrencyRejection
 }
 type accountConcurrencyRejection struct {
 	At            time.Time `json:"at"`
@@ -97,6 +100,9 @@ func (g *accountConcurrencyGate) initLocked() {
 		g.tokens = make(map[string]string)
 		g.aliases = make(map[string]string)
 	}
+	if g.completed == nil {
+		g.completed = make(map[string]bool)
+	}
 	if g.changed == nil {
 		g.changed = make(chan struct{})
 	}
@@ -108,12 +114,19 @@ func (g *accountConcurrencyGate) notifyLocked() {
 }
 func (g *accountConcurrencyGate) notify() { g.mu.Lock(); defer g.mu.Unlock(); g.notifyLocked() }
 func (g *accountConcurrencyGate) register(id string, now time.Time) string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.registerLocked(id, now)
+}
+
+func (g *accountConcurrencyGate) registerLocked(id string, now time.Time) string {
 	if id == "" || len(id) > 512 {
 		return ""
 	}
-	g.mu.Lock()
-	defer g.mu.Unlock()
 	g.initLocked()
+	if g.completed[id] {
+		return ""
+	}
 	g.supported = true
 	if r := g.requests[id]; r != nil {
 		return r.Token
@@ -138,9 +151,29 @@ func (g *accountConcurrencyGate) register(id string, now time.Time) string {
 	g.tokens[token] = id
 	return token
 }
+
+// Remember a bounded set of native terminal IDs, including completions received
+// before the new generation sees after-auth. This prevents late recovery from
+// resurrecting a canceled execution; it never expires an active stream slot.
+func (g *accountConcurrencyGate) rememberCompletedLocked(id string) {
+	if id == "" || len(id) > 512 || g.completed[id] {
+		return
+	}
+	g.completed[id] = true
+	if len(g.completedIDs) < concurrencyRegistrationLimit {
+		g.completedIDs = append(g.completedIDs, id)
+		return
+	}
+	delete(g.completed, g.completedIDs[g.completedNext])
+	g.completedIDs[g.completedNext] = id
+	g.completedNext = (g.completedNext + 1) % concurrencyRegistrationLimit
+}
+
 func (g *accountConcurrencyGate) release(id string) *concurrencyRequest {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	g.initLocked()
+	g.rememberCompletedLocked(id)
 	if r := g.requests[id]; r != nil {
 		delete(g.tokens, r.Token)
 		delete(g.requests, id)
@@ -419,6 +452,7 @@ func (s *schedulerRuntimeState) schedulerPick(req pluginapi.SchedulerPickRequest
 	token := schedulerHeader(req.Options, concurrencyHeader)
 	waiting := false
 	waitID := ""
+	lifecycleKnown := false
 	defer func() {
 		if waiting {
 			s.concurrency.endWait(waitID)
@@ -446,17 +480,27 @@ func (s *schedulerRuntimeState) schedulerPick(req pluginapi.SchedulerPickRequest
 		g.initLocked()
 		id := g.tokens[token]
 		request := g.requests[id]
+		if request != nil {
+			lifecycleKnown = true
+		}
 		if request != nil && !request.QueueDeadline.IsZero() {
 			deadline = request.QueueDeadline
 		}
 		enforce := cfg.Enabled && cfg.AccountConcurrencyEnabled && g.supported
-		// Background workers can be quiescing during an in-place reconfigure.
-		// The native execution ledger remains valid and enforces the same cap.
+		// CPA may carry an old generation's token into a newly selected plugin,
+		// or strip the private header while retaining its native lifecycle ID.
+		// Defer to native selection: after-auth admits the exact RequestID and
+		// selected credential under this gate before any upstream dispatch.
 		if enforce && request == nil {
-			g.rejectLocked(request, "account_concurrency_unavailable", cfg)
+			if lifecycleKnown {
+				g.rejectLocked(nil, "account_concurrency_unavailable", cfg)
+				g.mu.Unlock()
+				s.selectionMu.Unlock()
+				return pluginapi.SchedulerPickResponse{}, &accountConcurrencyError{"account_concurrency_unavailable", "CPA execution ended while queued for credential admission"}
+			}
 			g.mu.Unlock()
 			s.selectionMu.Unlock()
-			return pluginapi.SchedulerPickResponse{}, &accountConcurrencyError{"account_concurrency_unavailable", "CPA request lifecycle correlation is unavailable"}
+			return pluginapi.SchedulerPickResponse{Handled: false}, nil
 		}
 		// A rejected lifecycle remains terminal across CPA's alternate credential
 		// retries. Otherwise a busy sticky account disappears from Candidates,
@@ -615,6 +659,7 @@ func (s *schedulerRuntimeState) concurrencyAfter(req pluginapi.RequestInterceptR
 	s.mu.RUnlock()
 	deadline := time.Now().Add(cfg.AccountConcurrencyWait)
 	waiting := false
+	lifecycleChecked := false
 	defer func() {
 		if waiting {
 			s.concurrency.endWait(req.RequestID)
@@ -635,10 +680,22 @@ func (s *schedulerRuntimeState) concurrencyAfter(req pluginapi.RequestInterceptR
 		g.mu.Lock()
 		g.initLocked()
 		r := g.requests[req.RequestID]
+		enabled := cfg.Enabled && cfg.AccountConcurrencyEnabled
+		if !lifecycleChecked {
+			lifecycleChecked = true
+			if isCodex && r == nil && selectedID != "" {
+				// The CPA terminal callback uses the same native RequestID even when
+				// before-auth belonged to an unloaded generation. Register once so
+				// cancellation of a queued lifecycle cannot resurrect it. Never use
+				// client headers, sessions or time expiry as lifecycle substitutes.
+				if g.registerLocked(req.RequestID, time.Now()) != "" {
+					r = g.requests[req.RequestID]
+				}
+			}
+		}
 		if r != nil && !r.QueueDeadline.IsZero() {
 			deadline = r.QueueDeadline
 		}
-		enabled := cfg.Enabled && cfg.AccountConcurrencyEnabled
 		if !isCodex {
 			if r != nil && r.Key != "" {
 				r.Key = ""
@@ -662,8 +719,12 @@ func (s *schedulerRuntimeState) concurrencyAfter(req pluginapi.RequestInterceptR
 			s.selectionMu.Unlock()
 			return concurrencyTermination("account_concurrency_busy", concurrencyRejectionMessage("account_concurrency_busy"))
 		}
-		// A mixed route is selected by CPA. Account it only after the provider
-		// and credential are known, without overriding native provider priority.
+		// A native route (mixed provider or lost generation/header correlation)
+		// is counted after CPA identifies the exact credential. Earlier terminal
+		// rejections still win; busy credentials use the existing bounded FIFO.
+		if r != nil && r.Key == "" && selectedID != "" {
+			r.NativeSelection = true
+		}
 		if r != nil && r.NativeSelection && selectedID != "" {
 			key := g.keyLocked(aliases)
 			if r.Key != key {
