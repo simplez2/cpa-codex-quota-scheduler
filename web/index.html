@@ -42,7 +42,7 @@
     </section>
     <section class="accounts" aria-labelledby="accounts-title">
       <div class="section-header"><div><h2 id="accounts-title">账号额度</h2><p id="updated-at">等待额度快照</p></div><div class="table-tools"><input id="search" type="search" aria-label="筛选账号" placeholder="筛选账号"><label class="auto-refresh"><input id="auto-refresh" type="checkbox" checked>每 15 秒更新</label></div></div>
-      <div class="table-scroll"><table><thead><tr><th scope="col">账号 / 状态</th><th scope="col">5h 剩余</th><th scope="col">周剩余</th><th scope="col">周分钟预算<span class="help">各凭据自身额度 % / 分钟</span></th><th scope="col">凭据并发<span class="help">真实在途 / 上限</span></th><th scope="col">最近查询</th><th scope="col">操作</th></tr></thead><tbody id="accounts-body"></tbody></table></div>
+      <div class="table-scroll"><table><thead><tr><th scope="col">账号 / 状态</th><th scope="col">5h 剩余</th><th scope="col">周剩余</th><th scope="col">周日均预算<span class="help">各凭据自身额度 % / 天</span></th><th scope="col">凭据并发<span class="help">真实在途 / 上限</span></th><th scope="col">最近查询</th><th scope="col">操作</th></tr></thead><tbody id="accounts-body"></tbody></table></div>
       <p id="empty" class="empty" hidden>尚无额度快照。请在“连接与高级”检查 CPA 管理连接，并确认认证文件已启用。</p>
     </section>
     <details class="diagnostic-drawer"><summary>预算与缓存诊断<span>查看调度依据</span></summary>
@@ -54,7 +54,7 @@
     </section>
     </details>
     <div class="details-grid">
-      <section class="detail-panel" aria-labelledby="policy-title"><div class="section-header"><h2 id="policy-title">调配安排</h2><button type="button" data-view="allocation">调整安排</button></div><dl id="policy" class="policy"></dl><p class="muted">分钟预算用于新会话的优先级比较：距重置越近，未用额度越优先。已有会话保持绑定，达到设定阈值或确实不可用时才换号。</p></section>
+      <section class="detail-panel" aria-labelledby="policy-title"><div class="section-header"><h2 id="policy-title">调配安排</h2><button type="button" data-view="allocation">调整安排</button></div><dl id="policy" class="policy"></dl><p class="muted">日均预算按分钟精度计算，用于新会话的优先级比较：距重置越近，未用额度越优先。已有会话保持绑定，达到设定阈值或确实不可用时才换号。</p></section>
       <section class="detail-panel" aria-labelledby="bans-title"><div class="section-header"><h2 id="bans-title">账号恢复</h2><button id="unban-all" class="runtime-action" type="button" disabled>解除全部冷却</button></div><p class="muted">确认上游额度已恢复后，可解除本地冷却。正常到期后会自动探测恢复。</p><ul id="bans-list" class="warmups"></ul></section>
     </div>
     </div>

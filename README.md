@@ -2,14 +2,14 @@
 
 Standalone CPA plugin for balanced concurrent or serial Codex account selection, native quota polling,
 5h/weekly/monthly windows, persistent 429 quarantine and optional warmup.
-Source version: **0.3.14**. Local builds are not a published release.
+Source version: **0.3.15**. Local builds are not a published release.
 
 ## CPA dashboard
 
 After enabling the plugin, refresh CPA Management Center and open **插件 →
 Codex 额度调度**. The plugin management list uses the same display name and the
 stable ID `codex-quota-scheduler`. The dashboard shows the current account,
-5h/weekly remaining quota and resets, per-minute weekly budget, freshness and warmup
+5h/weekly remaining quota and resets, daily weekly budget calculated with minute precision, freshness and warmup
 records. Its 15-second refresh reads the existing cache without upstream or
 model requests. Opening or refreshing the panel does not change settings.
 
@@ -72,13 +72,13 @@ Other providers are unaffected. Missing native lifecycle correlation fails close
 for Codex when protection is enabled. This release requires CPA v8.0.4 or later
 for concurrency protection; older hosts must disable the concurrency setting.
 
-Weekly minute budget uses a confirmed reset even when the remaining quota is
+Weekly daily budget is computed at minute resolution using a confirmed reset even when the remaining quota is
 100%. Full-cycle provider placeholders retain the 7-day fallback. The rate can
 exceed 100%/day when a reset is near: it describes a spending pace before the
 reset, not a new daily quota. The rate is the credential's own remaining weekly percentage divided by exact
 remaining minutes (including fractional minutes); only the final minute is
-bounded to one minute. The panel preserves six significant digits, and the
-management API exposes `weekly_budget_percent_per_minute` while retaining
+bounded to one minute. The panel displays the daily equivalent (minute rate × 1440)
+as `% / day` with six significant digits. The management API exposes `weekly_budget_percent_per_minute` while retaining
 `weekly_budget_percent_per_day` as a compatible conversion. Cached quota
 observations are reused; this calculation adds no upstream quota probes.
 

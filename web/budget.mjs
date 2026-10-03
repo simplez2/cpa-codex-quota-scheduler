@@ -7,7 +7,10 @@ export function weeklyBudgetPercentPerMinute(account) {
   return Number.isFinite(daily) && daily >= 0 ? daily / 1440 : null;
 }
 
-export function formatWeeklyBudgetRate(rate) {
-  if (!Number.isFinite(rate) || rate < 0) return '未知';
-  return rate.toLocaleString('zh-CN', {maximumSignificantDigits: 6}) + '% / 分钟';
+// Keep minute-resolution scheduling telemetry; present its daily equivalent.
+export function formatWeeklyBudgetRate(ratePerMinute) {
+  if (!Number.isFinite(ratePerMinute) || ratePerMinute < 0) return '未知';
+  const daily = ratePerMinute * 1440;
+  if (!Number.isFinite(daily)) return '未知';
+  return daily.toLocaleString('zh-CN', {maximumSignificantDigits: 6}) + '% / 天';
 }

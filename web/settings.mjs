@@ -2,13 +2,13 @@ const plans = [['team_standard','Team Standard · 1×'],['plus','Plus · 1×'],[
 const handoff = [['threshold_only','达到使用阈值'],['reserve_aware','保留安全余量']];
 // Metadata is presentation only. Defaults and validation come from the running
 // plugin so an omitted YAML field is never silently saved as zero or empty.
-export const weeklyAllocationLabel = policy => policy === 'weekly_remaining' ? '按周剩余比例' : '按距重置时间的分钟预算';
+export const weeklyAllocationLabel = policy => policy === 'weekly_remaining' ? '按周剩余比例' : '按距重置时间的日均预算';
 export const fields = [
   ['scheduler_mode','调度模式','allocation','select','已有会话优先保留原凭据，续聊、工具调用与并发请求保持绑定；达到设定阈值或凭据不可用时才换号。新会话按周额度策略和5h重置时间重新选择。串行选优先凭据，均衡并发按权重分配新会话。', [['balanced','均衡并发（会话粘性）'],['serial','串行调配'],['legacy','传统调度'],['shadow','观察对比'],['enforce','动态节奏控制']]],
   ['account_concurrency_enabled','限制每凭据并发','allocation','boolean','默认开启。真实请求、重试和预热共用每个 CPA 凭据的槽位；长请求保留槽位直到 CPA 确认结束。保存后立即生效。'],
   ['account_max_concurrency','每凭据最大并发','allocation','number','1 至 64，默认 2。不同 CPA 凭据独立计数，即使属于同一个账号；调低上限不会中断已开始的请求。',1,64,1],
   ['account_concurrency_wait','并发满时最长等待','allocation','duration','0 至 30 秒，默认 10 秒。两种模式的已绑定会话均等待原凭据；新会话可使用符合额度条件的空闲凭据。超时返回 503；不会突破上限。'],
-  ['serial_allocation_policy','周额度分配方式','allocation','select','串行和均衡并发均生效。分钟预算按各凭据周余量 ÷ 距重置分钟数分配；不足一分钟按一分钟计算；剩余比例只按周余量分配。动态排名只影响新会话或达到切换条件的会话；串行和均衡的已有会话保持绑定优先。5h 在同一周优先级内优先临近重置。', [['sustainable','按距重置时间的分钟预算'],['weekly_remaining','按周剩余比例']]],
+  ['serial_allocation_policy','周额度分配方式','allocation','select','串行和均衡并发均生效。日均预算按各凭据周余量 ÷ 距重置分钟数 × 1440 计算，显示单位为 % / 天；调度保持分钟精度，不足一分钟按一分钟计算；剩余比例只按周余量分配。动态排名只影响新会话或达到切换条件的会话；串行和均衡的已有会话保持绑定优先。5h 在同一周优先级内优先临近重置。', [['sustainable','按距重置时间的日均预算'],['weekly_remaining','按周剩余比例']]],
   ['quota_default_plan','无法识别时的默认套餐','allocation','select','优先自动识别 CPA 返回的套餐；只有标签缺失、未知或缓存过期时使用此默认值。倍率是容量参考。',plans],
   ['serial_budget_rebalance_percent','无会话请求的预算再平衡阈值','allocation','number','仅影响未携带会话标识的串行请求；已有会话不会因为预算排名变化而换号。0 关闭主动再平衡，其他值仍需两次独立额度确认。',0,100,1],
   ['serial_weekly_rebalance_min_hold','无会话请求再平衡前至少持有','allocation','duration','1 分钟至 24 小时。额度耗尽或 429 不受此等待限制。'],
