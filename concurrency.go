@@ -24,6 +24,7 @@ func (e *accountConcurrencyError) Error() string { return e.code + ": " + e.mess
 // This ledger deliberately survives configuration reloads and is independent
 // of quota prediction/debt and the approximate balanced Pending list.
 type concurrencyRequest struct {
+	SessionKey      string
 	Token           string
 	Key             string
 	AuthID          string
@@ -328,7 +329,7 @@ func (s *schedulerRuntimeState) concurrencyPreferred(req pluginapi.SchedulerPick
 	if now.Before(s.balancedClock) {
 		now = s.balancedClock
 	}
-	if preferred == "" && normalizeSchedulerMode(cfg.SchedulerMode) == "balanced" && cfg.StickySeconds > 0 {
+	if preferred == "" && (normalizeSchedulerMode(cfg.SchedulerMode) == "balanced" || normalizeSchedulerMode(cfg.SchedulerMode) == "serial") && cfg.StickySeconds > 0 {
 		binding, ok := s.balancedSessionLocked(schedulerSessionHash(req), now)
 		if !ok {
 			binding, ok = s.balancedSessionLocked(schedulerParentSessionHash(req), now)
@@ -336,7 +337,8 @@ func (s *schedulerRuntimeState) concurrencyPreferred(req pluginapi.SchedulerPick
 		if ok {
 			preferred = binding.AuthID
 		}
-	} else if preferred == "" && normalizeSchedulerMode(cfg.SchedulerMode) == "serial" {
+	}
+	if preferred == "" && normalizeSchedulerMode(cfg.SchedulerMode) == "serial" && (schedulerSessionHash(req) == "" || normalizeSerialSelectionSource(s.serialSelectionSource) == "manual") {
 		preferred = s.serialActiveAuthID
 	}
 	for _, candidate := range req.Candidates {
@@ -345,7 +347,7 @@ func (s *schedulerRuntimeState) concurrencyPreferred(req pluginapi.SchedulerPick
 		}
 		snapshot, found := s.lookupQuotaLocked(candidate.ID, candidateAuthIndex(candidate))
 		choice := inspectSerialCandidate(candidate, snapshot, found, cfg, now)
-		stickyEligible := choice.Eligible || (normalizeSchedulerMode(cfg.SchedulerMode) == "balanced" && choice.Reason == "serial_threshold")
+		stickyEligible := choice.Eligible || (cfg.SerialSoftContinuation && choice.Reason == "serial_threshold")
 		if stickyEligible && banStore.schedulable(candidate.ID, now) && !s.adqProviderCircuitActiveLockedForConcurrency(candidate, now) {
 			return preferred
 		}
@@ -545,6 +547,7 @@ func (s *schedulerRuntimeState) schedulerPick(req pluginapi.SchedulerPickRequest
 			} else {
 				request.Key = g.keyLocked(aliases[response.AuthID])
 				request.AuthID = response.AuthID
+				request.SessionKey = schedulerSessionHash(req)
 			}
 		}
 		g.mu.Unlock()
@@ -716,9 +719,34 @@ func (s *schedulerRuntimeState) rollbackUndispatchedConcurrency(token string) {
 	}
 }
 func (s *schedulerRuntimeState) concurrencyComplete(id string) {
-	if r := s.concurrency.release(id); r != nil && !r.Dispatched {
-		s.rollbackUndispatchedConcurrency(r.Token)
+	r := s.concurrency.release(id)
+	if r == nil {
+		return
 	}
+	if !r.Dispatched {
+		s.rollbackUndispatchedConcurrency(r.Token)
+		return
+	}
+	if r.SessionKey != "" {
+		s.mu.Lock()
+		now := s.balancedTimeLocked(time.Now())
+		if binding, ok := s.balancedSessions[r.SessionKey]; ok && binding.AuthID == r.AuthID {
+			binding.LastUsedAt = now
+			s.balancedSessions[r.SessionKey] = binding
+		}
+		s.mu.Unlock()
+	}
+}
+
+func (g *accountConcurrencyGate) hasActiveSession(session, authID string) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for _, request := range g.requests {
+		if request.SessionKey == session && request.AuthID == authID && request.Key != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *schedulerRuntimeState) beginWarmupConcurrency(candidate warmupCandidate, cfg pluginConfig) (string, bool) {

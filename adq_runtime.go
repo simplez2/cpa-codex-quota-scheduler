@@ -368,6 +368,8 @@ func (s *schedulerRuntimeState) adqInputForChoiceLocked(choice serialCandidate, 
 		Sticky:                false,
 		AbsoluteCapacityKnown: fullyObserved,
 		CapacitySource:        capacitySource,
+		PhaseAnchor:           s.fiveHourPhases[id].ActiveResetAt,
+		PhaseAnchorMode:       s.fiveHourPhases[id].AnchorMode,
 	}, true
 }
 

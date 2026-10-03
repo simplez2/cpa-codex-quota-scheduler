@@ -102,8 +102,8 @@ func TestBalancedStickyIgnoresRelativeBudgetsAndSoftTiers(t *testing.T) {
 	s.cfg.ReserveWeeklyPercent = 20
 	s.cfg.Serial5hHandoffMode = "custom_threshold"
 	s.cfg.Serial5hSwitchPercent = 70
-	s.quotas["a"].Windows[0].UsedPercent = 99.9
-	s.quotas["a"].Windows[1].UsedPercent = 99
+	s.quotas["a"].Windows[0].UsedPercent = 60
+	s.quotas["a"].Windows[1].UsedPercent = 79
 	for i := 0; i < 20; i++ {
 		if s.balancedPick(req, now.Add(time.Second)).AuthID != "a" {
 			t.Fatal("soft budget/threshold preempted a conversation")

@@ -28,6 +28,7 @@ func TestSerial429OnlyDefaultsKeepCurrentAccountAt98And99Percent(t *testing.T) {
 	}
 	req := serialTestRequest()
 	req.Options.Headers = map[string][]string{"X-Session-ID": {"keep-until-429"}}
+	state.bindBalancedSessionLocked(schedulerSessionHash(req), "primary", "index-primary", now)
 	for step, used := range []float64{98, 99, 99.9} {
 		at := now.Add(time.Duration(step) * time.Minute)
 		for _, id := range []string{"primary", "backup"} {
@@ -114,6 +115,7 @@ func TestSerial429OnlyUsage429QuarantinesAndHandsSameSessionToBackup(t *testing.
 	state.quotas["primary"].Windows[0].UsedPercent = 99
 	req := serialTestRequest()
 	req.Options.Headers = map[string][]string{"X-Session-ID": {"usage-429-session"}}
+	state.bindBalancedSessionLocked(schedulerSessionHash(req), "primary", "index-primary", now)
 	if got := state.serialPick(req, now); got.AuthID != "primary" {
 		t.Fatalf("initial account = %#v", got)
 	}

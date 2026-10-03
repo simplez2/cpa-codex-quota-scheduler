@@ -29,6 +29,7 @@ func (s *schedulerRuntimeState) quotaProbeReason(id string, now time.Time) strin
 	p := s.quotaPolls[id]
 	q := s.quotas[id]
 	health := s.authExpiry[id]
+	phase := s.fiveHourPhases[id]
 	epochReason := s.quotaEpochProbeReasonLocked(id, now)
 	s.mu.RUnlock()
 	if !cfg.QuotaProbeOnDemand {
@@ -92,6 +93,9 @@ func (s *schedulerRuntimeState) quotaProbeReason(id string, now time.Time) strin
 	}
 	window, needs := unstartedWarmupWindow(q, now)
 	if !needs {
+		return ""
+	}
+	if normalizeWindowClass(window.Class) == "5h" && phase.ActivateAt.After(now) {
 		return ""
 	}
 	if s.warmupSuppressedAccountsLocked(now, cfg.WarmupRetryAfter)[id] {

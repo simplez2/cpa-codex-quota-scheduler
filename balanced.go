@@ -51,6 +51,11 @@ func balancedWeightWithQuota(choice serialCandidate, cfg pluginConfig, now time.
 	fiveFactor, weeklyFactor := 1.0, 1.0
 	if choice.FiveHourKnown {
 		fiveFactor = math.Max(.01, clampADQ(fiveRemaining, 0, 100)/100)
+		// Spend real expiring 5h capacity first. A moving full placeholder
+		// is dormant capacity and never receives a fabricated deadline boost.
+		if choice.FiveHourCycleActive && choice.FiveHourResetAt.After(now) {
+			fiveFactor *= 300 / math.Max(1, choice.FiveHourResetAt.Sub(now).Minutes())
+		}
 	}
 	if choice.WeeklyKnown {
 		weeklyFactor = clampADQ(weeklyRemaining, 0, 100) / 100
@@ -169,7 +174,7 @@ func (s *schedulerRuntimeState) balancedPick(req pluginapi.SchedulerPickRequest,
 		// A live conversation stays on an available account even if another
 		// plan or weekly budget scores better. Hard quota and CPA's filtered
 		// candidates remain authoritative; soft tiers only place new sessions.
-		if bound && choice.Candidate.ID == binding.AuthID &&
+		if bound && (choice.Eligible || s.cfg.SerialSoftContinuation) && choice.Candidate.ID == binding.AuthID &&
 			(binding.AuthIndex == "" || !found || binding.AuthIndex == snapshot.AuthIndex) {
 			copy := choice
 			sticky = &copy

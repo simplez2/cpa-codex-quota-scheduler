@@ -162,6 +162,7 @@ type schedulerRuntimeState struct {
 	// decisions always take precedence.
 	serialLastSelected    map[string]time.Time
 	serialFiveHourCycle   map[string]time.Time
+	fiveHourPhases        map[string]fiveHourPhaseState
 	serialWeeklyRebalance serialWeeklyRebalanceState
 }
 
@@ -252,6 +253,7 @@ func configureSchedulerRuntime(raw []byte) {
 	schedulerRuntime.serialOverdraft = make(map[string]serialOverdraftBinding)
 	schedulerRuntime.serialLastSelected = make(map[string]time.Time)
 	schedulerRuntime.serialFiveHourCycle = make(map[string]time.Time)
+	schedulerRuntime.fiveHourPhases = make(map[string]fiveHourPhaseState)
 	if schedulerRuntime.pricing == nil {
 		schedulerRuntime.pricing = make(map[string]modelPricing)
 	}
@@ -507,6 +509,11 @@ func (s *schedulerRuntimeState) observeUsage(record pluginapi.UsageRecord) {
 	}
 	now := time.Now()
 	s.recordQuotaDemand(record, now)
+	if !record.Failed && !record.RequestedAt.IsZero() {
+		s.mu.Lock()
+		s.noteFiveHourActivationLocked(s.canonicalAuthIDLocked(record.AuthID, record.AuthIndex), record.AuthIndex, record.RequestedAt)
+		s.mu.Unlock()
+	}
 	s.observeUsageCost(record)
 	s.observeBalancedUsage(record, now)
 	// Provider overload is a transport health signal, not quota exhaustion.
@@ -567,6 +574,7 @@ func (s *schedulerRuntimeState) observeUsage(record pluginapi.UsageRecord) {
 	if authIndex != "" {
 		s.quotas[authIndex] = old
 	}
+	s.observeFiveHourPhaseLocked(old, now)
 	epochSweepStarted := s.beginQuotaEpochResetFromHeadersLocked(authID, previous, old, now)
 	reservations := s.adqReservations
 	s.mu.Unlock()
@@ -1132,6 +1140,7 @@ type persistedBanState struct {
 	SerialOverdraft        map[string]serialOverdraftBinding `json:"serial_overdraft,omitempty"`
 	SerialLastSelected     map[string]time.Time              `json:"serial_last_selected,omitempty"`
 	SerialFiveHourCycle    map[string]time.Time              `json:"serial_five_hour_cycle,omitempty"`
+	FiveHourPhases         map[string]fiveHourPhaseState     `json:"five_hour_phases,omitempty"`
 	QuotaEpoch             quotaEpochState                   `json:"quota_epoch,omitempty"`
 	SavedAt                time.Time                         `json:"saved_at"`
 }
@@ -1246,6 +1255,7 @@ func (s *schedulerRuntimeState) loadBanStateWithConfirmationMode(path string, re
 	}
 	s.authExpiry = cloneAuthExpiryStates(state.AuthExpiry)
 	s.restoreBalancedSessionsLocked(state.BalancedSessions, time.Now())
+	s.restoreFiveHourPhasesLocked(state.FiveHourPhases, state.Warmups, state.SerialFiveHourCycle, time.Now())
 	s.serialActiveAuthID = strings.TrimSpace(state.SerialActiveAuthID)
 	s.quotaRunway = quotaRunwayTracker{}
 	s.quotaNative = make(map[string]quotaSnapshot)
@@ -1332,6 +1342,7 @@ func (s *schedulerRuntimeState) persistBanState() bool {
 	}
 	path := strings.TrimSpace(s.cfg.StatePath)
 	balancedSessions := s.snapshotBalancedSessionsLocked(time.Now())
+	fiveHourPhases := cloneFiveHourPhases(s.fiveHourPhases)
 	serialActiveAuthID := strings.TrimSpace(s.serialActiveAuthID)
 	serialSelectionSource := normalizeSerialSelectionSource(s.serialSelectionSource)
 	serialSelectedAt := s.serialSelectedAt
@@ -1384,7 +1395,8 @@ func (s *schedulerRuntimeState) persistBanState() bool {
 	s.banResetMu.Unlock()
 	state := persistedBanState{
 		QuotaPolls: polls, Quotas: quotas, BalancedSessions: balancedSessions, AuthExpiry: authExpiry,
-		Version:                7,
+		Version:                8,
+		FiveHourPhases:         fiveHourPhases,
 		Bans:                   banStore.snapshot(),
 		Warmups:                warmups,
 		WarmupAttempts:         warmupAttempts,
@@ -1705,6 +1717,7 @@ func isJSONEmptyValue(value reflect.Value) bool {
 }
 
 type runtimeQuotaStatus struct {
+	FiveHourPhase         *runtimeFiveHourPhaseStatus   `json:"five_hour_phase,omitempty"`
 	AuthHealth            *authExpiryStatus             `json:"auth_health,omitempty"`
 	Runway                []quotaRunwayWindowAssessment `json:"runway,omitempty"`
 	Plan                  string                        `json:"plan_prior"`
@@ -1961,6 +1974,7 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 	adqReservations := s.adqReservations
 	adqLastDecision := s.adqLastDecision
 	quotaEpoch := cloneQuotaEpochState(s.quotaEpoch)
+	fiveHourPhases := cloneFiveHourPhases(s.fiveHourPhases)
 	adqCircuits := make(map[string]adqProviderCircuit, len(s.adqProviderCircuits))
 	for authID, circuit := range s.adqProviderCircuits {
 		adqCircuits[authID] = circuit
@@ -2099,6 +2113,10 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 			ActiveWindows: evaluation.ActiveWindows,
 			Reason:        evaluation.Reason,
 		}
+		if phase, exists := fiveHourPhases[canonical]; exists && phase.AuthIndex == snapshot.AuthIndex {
+			status := fiveHourPhaseStatus(phase, now)
+			item.FiveHourPhase = &status
+		}
 		if adqEnabled {
 			circuit := adqCircuits[canonical]
 			if circuit.State == "" && snapshot.AuthIndex != "" {
@@ -2113,6 +2131,9 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 			}
 			adq := runtimeADQAccountFor(snapshot, cfg, adqPolicy, state, circuit, adqReservations, runwayByAuth[canonical], now)
 			if adq != nil {
+				if phase, exists := fiveHourPhases[canonical]; exists && phase.AuthIndex == snapshot.AuthIndex {
+					adq.PhaseAnchorMode, adq.PhaseBucket = phase.AnchorMode, phaseBucket(phase.ActiveResetAt)
+				}
 				item.ADQ = adq
 				if adq.AbsoluteCapacityKnown {
 					adqCalibratedAccounts++

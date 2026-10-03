@@ -47,7 +47,6 @@ func TestSerialBudgetRebalancesByFreshBudgetNotRawWeekly(t *testing.T) {
 	s.quotas["primary"].Windows[1].ResetAt = now.Add(24 * time.Hour)
 	s.quotas["backup"].Windows[1].ResetAt = now.Add(6 * 24 * time.Hour)
 	req := serialTestRequest()
-	req.Options.Headers = map[string][]string{"X-Session-ID": {"same-budget-session"}}
 	if got := s.serialPick(req, now); got.AuthID != "backup" {
 		t.Fatal("unconfirmed preemption")
 	}

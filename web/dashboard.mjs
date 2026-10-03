@@ -9,7 +9,7 @@ const endpoint = base + '/v0/management/plugins/codex-quota-scheduler/scheduler-
 const bansEndpoint = base + '/v0/management/plugins/codex-quota-scheduler/bans';
 const plans = {team_standard:'Team Standard',team_premium:'Team Premium',plus:'Plus',pro_5x:'Pro 5x',pro_20x:'Pro 20x'};
 const upstreamPlans = {team:'Team Standard',self_serve_business_prolite:'Team Premium',plus:'Plus'};
-const reasons = {weekly_budget_rebalance:'按周分钟预算重新平衡',weekly_remaining_rebalance:'按周余量重新平衡',manual:'手动选择',manual_selection:'手动选择',manual_cleared:'恢复自动调配',initial:'首次选择',active_missing:'当前账号已不可用',quota_exhausted:'额度已用尽'};
+const reasons = {weekly_budget_rebalance:'按周分钟预算重新平衡',weekly_remaining_rebalance:'按周余量重新平衡',manual:'手动选择',manual_selection:'手动选择',manual_cleared:'恢复自动调配',initial:'首次选择',active_missing:'当前账号已不可用',quota_exhausted:'额度已用尽',new_session_priority:'新会话按周预算与5h重置优先级选择'};
 const warmupStates = {confirmed:'已确认激活',pending_confirmation:'等待额度确认',attempted:'已尝试',blocked:'已停止重试',failed:'等待重试'};
 const epochAccountStates = {pending:'等待预热',natural:'真实调用已激活',warmed:'自动预热已完成',blocked:'需处理后重试'};
 let state = null, key = '', manual = false, busy = false, timer = null, failures = 0, authEpoch = 0, operating = false;
@@ -59,6 +59,15 @@ function updateCountdown(node) {
 }
 function warmupWait(account, cell) {
  const five=(account.windows||[]).find(w=>w.window==='5h');
+ const phase=account.five_hour_phase;
+ if(phase?.cycle_generation){
+  const mode=phase.anchor_mode==='FIRST_USE_AFTER_RESET'?'首次使用重新锚定已确认':phase.anchor_mode==='FIXED_PROVIDER_WINDOW'?'官方固定周期':'官方锚定方式待确认';
+  const generation=phase.state==='idle_activation_deferred'?'5h 下一周期第 '+(phase.cycle_generation+1)+' 代':'5h 第 '+phase.cycle_generation+' 代';
+  cell.append(element('span','subtext',generation+' · '+mode));
+ }
+ if(state.warmup_enabled && phase?.state==='idle_activation_deferred' && timestamp(phase.activate_not_before)>new Date()){
+  cell.append(element('span','subtext','闲置凭据等待错峰预热；真实请求立即使用'),countdown(phase.activate_not_before,'错峰预热倒计时 '));return;
+ }
  if(!five || (five.cycle_started && !five.placeholder_reset))return;
  if(!state.warmup_enabled){cell.append(element('span','subtext','预热已关闭；实际调用可启动周期'));return;}
  const entry=(state.warmups||[]).find(w=>w.auth_id===account.auth_id && w.window==='5h');
@@ -338,13 +347,13 @@ function renderPolicy() {
     ['调度模式',modes[state.scheduler_mode] || state.scheduler_mode],
     ['每凭据并发',state.concurrency?.enabled ? '上限 '+(state.concurrency.max_per_credential ?? state.concurrency.max_per_account)+' · 全池在途 '+state.concurrency.active+' · 等待 '+state.concurrency.waiting+(state.concurrency.lifecycle_observed ? '' : ' · 等待 CPA 生命周期信号') : '已关闭'],
     ['分配策略',state.scheduler_mode==='balanced'?`新会话${weeklyAllocationLabel(state.serial_allocation_policy)}分配，保留会话粘性`:weeklyAllocationLabel(state.serial_allocation_policy)],
-    ['5h 切换',noReserve ? '额度用尽 / 上游限额时切换' : state.serial_5h_handoff_mode],
+    ['5h 切换',noReserve ? '额度用尽 / 上游限额时切换' : state.serial_5h_handoff_mode==='custom_threshold' ? '已用达到 '+pct(state.serial_5h_switch_percent)+' 时换号' : state.serial_5h_handoff_mode==='reserve_aware' ? '按设定预留余量换号' : '沿用通用阈值'],
     ['5h 预留',noReserve ? '0%（不提前预留）' : pct(state.reserve_5h_percent)],
     [state.scheduler_mode==='balanced'?'并发分配':'主动再平衡最短持有',state.scheduler_mode==='balanced'?'同一会话保持账号，各会话可并发':hold],
     ...(state.scheduler_mode==='balanced' ? [
       ['会话绑定',state.sticky_seconds>0 ? (state.balanced_sticky_bindings||0)+' 个 · 空闲 '+state.sticky_seconds+' 秒后到期' : '已关闭'],
       ['绑定命中 / 不可用换号',(state.balanced_session_hits||0)+' / '+(state.balanced_session_switches||0)],
-      ['缺少会话标识请求',(state.balanced_unkeyed_requests||0)+' 次 · 无标识时按单次请求分配']
+      ...(state.scheduler_mode==='balanced' ? [['缺少会话标识请求',(state.balanced_unkeyed_requests||0)+' 次 · 无标识时按单次请求分配']] : [['最近切换',dateText(state.serial_last_switch_at)]])
     ] : [['最近切换',dateText(state.serial_last_switch_at)]])
   ];
   for (const [label,value] of pairs) {
@@ -434,7 +443,8 @@ function render() {
   $('auto-select').hidden=balanced||!state.serial_manual_selection;
   $('auto-select').disabled=operating||editor.isSaving();
   $('active-detail').textContent = state.serial_active_auth_id ? '选中于 ' + dateText(state.serial_selected_at) + (state.serial_last_switch_reason ? ' · ' + (reasons[state.serial_last_switch_reason] || state.serial_last_switch_reason) : '') : '额度查询继续运行，收到请求后按可用额度选择。';
-  if(balanced)$('active-detail').textContent='新会话按可用预算均衡分配；同一会话续聊、工具调用和并发请求保持账号，只有额度耗尽或账号不可用时换号。切换后继续绑定替换账号。';
+  if(state.scheduler_mode==='serial')$('active-detail').textContent+=' · 已绑定会话优先保留原凭据；此选择供新请求参考。';
+  if(balanced)$('active-detail').textContent='新会话按可用预算均衡分配；同一会话续聊、工具调用和并发请求保持账号，达到设定阈值或账号不可用时才换号。切换后继续绑定替换账号。';
   $('eligible-count').replaceChildren(document.createTextNode(String(accounts.filter(usable).length)),element('small','', ' / ' + accounts.length));
   $('switch-count').textContent = String(state.serial_switches ?? 0);
   $('cooldown-count').textContent = String(state.quarantine?.cooldown ?? 0);

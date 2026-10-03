@@ -1,6 +1,6 @@
 const count = value => Number.isFinite(value) && value >= 0 ? value : 0;
 export const waitReasons = {
- serial_primary:'串行模式等待当前凭据', sticky_credential:'会话等待绑定凭据',
+ serial_primary:'无会话请求等待当前凭据', sticky_credential:'会话等待绑定凭据',
  pinned_credential:'请求等待指定凭据', native_credential:'等待 CPA 选定凭据',
  pool_full:'可用凭据排队', lifecycle_unavailable:'请求生命周期未确认'
 };
@@ -37,7 +37,7 @@ export function concurrencyView(state, usableIds) {
  else if(count(gate.active ?? knownActive)>0){title='请求正在运行';tone='good';}
  else if(!enabled){title='并发保护已关闭';tone='warning';}
  const description=state.scheduler_mode==='serial'
-  ? '串行模式集中使用当前凭据。当前凭据满载时排队，其他凭据空闲也不分担。'
+  ? '已有会话等待绑定凭据，新会话可重新选择可用凭据；未携带会话标识的请求等待当前凭据。'
   : state.scheduler_mode==='balanced'
   ? '新会话分配可用凭据；同一会话等待绑定凭据。空闲凭据不会接走已经绑定的会话。'
   : '当前调度模式与 CPA 选择凭据；每个凭据独立限制并发。';

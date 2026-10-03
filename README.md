@@ -2,7 +2,7 @@
 
 Standalone CPA plugin for balanced concurrent or serial Codex account selection, native quota polling,
 5h/weekly/monthly windows, persistent 429 quarantine and optional warmup.
-Source version: **0.3.13**. Local builds are not a published release.
+Source version: **0.3.14**. Local builds are not a published release.
 
 ## CPA dashboard
 
@@ -144,7 +144,7 @@ based on plan capacity and available budgets. Existing installations keep their
 configured mode until it is changed in the panel.
 
 CPA's plugin scheduler runs before its native affinity selector, so the plugin
-owns its balanced-mode bindings. It consumes CPA's `canonical_session_id` and
+owns the conversation bindings in both serial and balanced modes. It consumes CPA's `canonical_session_id` and
 `caller_scope`, with native session/thread headers as fallbacks. A known CPA
 `parent_session_id` can seed a child binding without coupling later failovers.
 No other plugin is required. Per-request IDs are never used as conversation IDs.
@@ -154,18 +154,21 @@ in the panel; clients must supply a stable session/thread identity for affinity.
 The panel's **会话绑定空闲有效期** (`sticky_seconds`, default 1500 seconds) renews
 on requests and matched completions; a tracked in-flight generation does not
 expire as idle. Set it to 0 to disable affinity. Better relative quota, plan
-weights, or soft budget thresholds never preempt an active conversation. Hard
-quota limits, quarantine/429, an unavailable credential or an incompatible model
-allow failover and rebind the conversation to its replacement. Explicit account
+weights, or temporary budget rankings never preempt an active conversation. A
+configured quota switch threshold, hard quota limit, quarantine/429, unavailable
+credential or incompatible model allows failover and rebind the conversation to its replacement. Explicit account
 pins remain isolated from ordinary conversation bindings. An already emitted
 stream cannot be transparently replayed by this selection change.
 
 Balanced mode first excludes hard-limited/quarantined accounts and prefers
 fresh usable accounts outside the weekly reserve. It then uses smooth weighted
 work accounting, with weight approximately
-`plan multiplier × min(5h remaining fraction, weekly daily budget / (100/7))`.
-Each pace factor has a 0.01 floor, which changes relative share without reserving
-5h capacity. The weekly reserve becomes spendable when the entire eligible
+`plan multiplier × 5h remaining fraction × 5h deadline factor × weekly factor`.
+The confirmed active 5h deadline factor is `300 / max(1, minutes until reset)`;
+dormant placeholders use 1. The weekly factor is the remaining fraction for
+`weekly_remaining`, or the minute budget normalized to a full-week rate for
+`sustainable`. Remaining fractions have a 0.01 scheduling floor; this changes
+relative share without reserving 5h capacity. The weekly reserve becomes spendable when the entire eligible
 pool is inside it. Account-specific pins remain respected.
 
 Every pick immediately debits estimated work under one lock so concurrent
@@ -198,8 +201,13 @@ Credits commit only after a successful reservation; failed admission never
 falls through to unreserved routing. Existing sessions keep their credential
 when this policy changes, and all modes retain the per-credential concurrency gate.
 
-Traffic stays on one committed account. Default `serial_allocation_policy:
-sustainable` first respects hard limits and quarantine, then
+Each identified session keeps its own committed credential in both serial and
+balanced modes. A new session is ranked independently; threshold crossing or
+actual unavailability allows that session to hand off. Changing quota priorities
+or another session's primary does not migrate an existing binding. Requests
+without a session identifier retain the global serial primary.
+
+Default `serial_allocation_policy: sustainable` respects hard limits and quarantine, then
 ranks same-class peers by `(weekly remaining - weekly reserve) / minutes to reset`.
 The exact time remaining is recomputed on each decision, so unchanged cached
 quota earns higher priority as its confirmed reset approaches. The denominator
@@ -207,7 +215,8 @@ is bounded below by one minute; unused placeholders use a full week.
 With equal reset times, 80% weekly outranks 40%. With 40% resetting tomorrow and
 80% resetting in six days, the former has more spendable budget per minute.
 
-Proactive budget handoffs require a 20% relative advantage, two distinct fresh
+For serial requests without a session identifier, proactive budget handoffs
+require a 20% relative advantage, two distinct fresh
 weekly readings of **both** accounts, and a 5-minute primary hold. Configure
 `serial_budget_rebalance_percent` (0 disables budget preemption) and
 `serial_weekly_rebalance_min_hold` (1m-24h). `weekly_remaining` retains the earlier
@@ -220,8 +229,11 @@ The quota endpoint exposes `serial_weekly_rebalance` and the committed reason
 Default `serial_5h_handoff_mode: 429_only` and `reserve_5h_percent: 0` use the
 observed 5h capacity without an early reserve handoff. Reaching 98% or 99% used
 alone keeps the current account; a confirmed hard limit, disallowed state or
-upstream 429 still triggers server-side handoff. Weekly balancing remains active.
-In this mode, 5h ranking uses observed remaining capacity times the plan prior;
+upstream 429 still triggers server-side handoff. Weekly policy ranks new sessions and eligible handoffs. Within the same weekly
+priority tier, serial routing prefers the earliest confirmed active 5h reset;
+balanced routing raises its allocation weight by the remaining 5h horizon.
+Unused moving reset placeholders do not earn deadline priority.
+In this mode, 5h availability uses observed remaining capacity times the plan prior;
 it deducts neither a configured static reserve nor forecast/cache-age estimates.
 Runway diagnostics remain observational and do not change that decision.
 
@@ -232,6 +244,20 @@ at max(static reserve, 50%). Those optional safety handoffs do not wait for the
 budget hold, and drain cannot bypass them. With no safer peer, soft reserves
 remain usable; hard limits always win. `serial_soft_continuation: true` separately
 restores the earlier session continuation past a soft handoff.
+
+Each credential tracks its confirmed 5h reset and cycle generation. Weekly
+bootstrap and the first 5h generation can activate immediately. From the second
+generation, optional idle warmup is placed into persistent 15-minute phase slots
+across the 300-minute window, preserving one immediately activatable credential
+when every confirmed window has ended. Foreground requests always bypass that
+local warmup delay.
+
+A delayed successful activation with a fresh dormant quota observation can
+identify `FIRST_USE_AFTER_RESET` or `FIXED_PROVIDER_WINDOW`; until then capability
+remains `UNKNOWN`. Fixed official windows are not relabeled or moved by a local
+plan. The panel shows generation, confirmed capability, and the idle warmup
+countdown. These plans reduce simultaneous optional activations; they do not
+guarantee that every pool can avoid simultaneous exhaustion under sustained load.
 
 Plan priors default to `team_standard`. `plus` and `team_standard` use 1;
 `pro_5x` and `team_premium` use 5; `pro_20x` uses 20. Set per-auth overrides in

@@ -41,6 +41,7 @@ type warmupEntry struct {
 }
 
 type warmupCandidate struct {
+	ActivateAt           time.Time
 	ConcurrencyRequestID string
 	Snapshot             quotaSnapshot
 	Window               quotaWindow
@@ -424,6 +425,7 @@ func (s *schedulerRuntimeState) findWarmupCandidates(eligible map[string]warmupA
 		}
 		return candidates[i].Snapshot.AuthID < candidates[j].Snapshot.AuthID
 	})
+	candidates = s.planFiveHourWarmups(candidates, now)
 	actionableCandidates := s.countActionableWarmupCandidates(candidates, now, cfg.WarmupRetryAfter)
 	s.mu.Lock()
 	s.warmupCandidatesLast = actionableCandidates
@@ -446,6 +448,9 @@ func (s *schedulerRuntimeState) countActionableWarmupCandidates(candidates []war
 	defer s.warmupMu.Unlock()
 	count := 0
 	for _, candidate := range candidates {
+		if candidate.ActivateAt.After(now) {
+			continue
+		}
 		key := warmupKey(candidate.Snapshot.AuthID, candidate.Window.Class)
 		entry, ok := s.warmups[key]
 		if !s.warmupAccountSuppressesCandidateLocked(candidate, now, retryAfter) &&
@@ -645,6 +650,9 @@ func (s *schedulerRuntimeState) nextWarmupCandidateLocked(candidates []warmupCan
 // Generation changes never shorten a persisted request's suppression period.
 func (s *schedulerRuntimeState) nextWarmupCandidateForGenerationLocked(candidates []warmupCandidate, now time.Time, retryAfter time.Duration, generationClaimedAt time.Time) (warmupCandidate, string, bool) {
 	for _, candidate := range candidates {
+		if candidate.ActivateAt.After(now) {
+			continue
+		}
 		if s.warmupAccountSuppressesCandidateLocked(candidate, now, retryAfter) {
 			continue
 		}
@@ -1162,6 +1170,16 @@ func (s *schedulerRuntimeState) recordWarmupOutcome(candidate warmupCandidate, s
 	epochSuccess := err == nil && status >= 200 && status < 300
 	epochCode, epochBlocked := classifyWarmupFailure(status, err)
 	s.warmupMu.Unlock()
+	if epochSuccess {
+		s.mu.Lock()
+		s.observeFiveHourPhaseLocked(candidate.Snapshot, now)
+		s.noteFiveHourActivationLocked(candidate.Snapshot.AuthID, candidate.Snapshot.AuthIndex, target.AttemptedAt)
+		observed := candidate.Snapshot
+		observed.Windows = windows
+		observed.RefreshedAt = now
+		s.observeFiveHourPhaseLocked(observed, now)
+		s.mu.Unlock()
+	}
 	s.recordQuotaEpochWarmupOutcome(candidate.Snapshot.AuthID, candidate.EpochID, epochSuccess, epochBlocked, epochCode, now)
 	s.persistBanState()
 }
