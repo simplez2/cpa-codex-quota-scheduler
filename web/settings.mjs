@@ -2,13 +2,13 @@ const plans = [['team_standard','Team Standard · 1×'],['plus','Plus · 1×'],[
 const handoff = [['threshold_only','达到使用阈值'],['reserve_aware','保留安全余量']];
 // Metadata is presentation only. Defaults and validation come from the running
 // plugin so an omitted YAML field is never silently saved as zero or empty.
-export const weeklyAllocationLabel = policy => policy === 'weekly_remaining' ? '按周剩余比例' : '按距重置时间的日均预算';
+export const weeklyAllocationLabel = policy => policy === 'weekly_remaining' ? '按周剩余比例' : '按距重置时间的分钟预算';
 export const fields = [
   ['scheduler_mode','调度模式','allocation','select','串行调配集中使用当前凭据，即使其他凭据空闲。均衡并发按会话分配：新会话按所选周额度策略、5h 余量及套餐容量选择凭据；同一会话的续聊、工具调用和并发请求保持绑定。账号不可用时才切换。', [['balanced','均衡并发（会话粘性）'],['serial','串行调配'],['legacy','传统调度'],['shadow','观察对比'],['enforce','动态节奏控制']]],
   ['account_concurrency_enabled','限制每凭据并发','allocation','boolean','默认开启。真实请求、重试和预热共用每个 CPA 凭据的槽位；长请求保留槽位直到 CPA 确认结束。保存后立即生效。'],
   ['account_max_concurrency','每凭据最大并发','allocation','number','1 至 64，默认 2。不同 CPA 凭据独立计数，即使属于同一个账号；调低上限不会中断已开始的请求。',1,64,1],
   ['account_concurrency_wait','并发满时最长等待','allocation','duration','0 至 30 秒，默认 10 秒。串行模式等待当前凭据；均衡模式让新会话使用空闲凭据，已绑定会话等待原凭据。超时返回 503；不会突破上限。'],
-  ['serial_allocation_policy','周额度分配方式','allocation','select','串行和均衡并发均生效。日均预算按周余量 ÷ 距重置天数分配；剩余比例只按周余量分配。均衡模式只影响新会话，已有会话保持绑定。', [['sustainable','按距重置时间的日均预算'],['weekly_remaining','按周剩余比例']]],
+  ['serial_allocation_policy','周额度分配方式','allocation','select','串行和均衡并发均生效。分钟预算按各凭据周余量 ÷ 距重置分钟数分配；不足一分钟按一分钟计算；剩余比例只按周余量分配。均衡模式只影响新会话，已有会话保持绑定。', [['sustainable','按距重置时间的分钟预算'],['weekly_remaining','按周剩余比例']]],
   ['quota_default_plan','无法识别时的默认套餐','allocation','select','优先自动识别 CPA 返回的套餐；只有标签缺失、未知或缓存过期时使用此默认值。倍率是容量参考。',plans],
   ['serial_budget_rebalance_percent','日均预算优势达到多少时换号','allocation','number','百分比；0 关闭主动再平衡。仍需两次独立额度确认。',0,100,1],
   ['serial_weekly_rebalance_min_hold','主动换号前至少持有','allocation','duration','1 分钟至 24 小时。额度耗尽或 429 不受此等待限制。'],

@@ -11,7 +11,7 @@ import (
 // The resource namespace is public. Embed only static assets; account state and
 // credentials must continue to travel through CPA's authenticated management API.
 //
-//go:embed web/index.html web/dashboard.css web/dashboard.mjs web/session.mjs web/settings.mjs web/concurrency.mjs
+//go:embed web/index.html web/dashboard.css web/dashboard.mjs web/session.mjs web/settings.mjs web/concurrency.mjs web/budget.mjs
 var dashboardFiles embed.FS
 
 const dashboardResourcePrefix = "/v0/resource/plugins/" + pluginName
@@ -24,6 +24,7 @@ func dashboardResources() []pluginapi.ResourceRoute {
 		{Path: "/session.mjs"},
 		{Path: "/settings.mjs"},
 		{Path: "/concurrency.mjs"},
+		{Path: "/budget.mjs"},
 	}
 }
 
@@ -45,6 +46,8 @@ func dashboardResource(method, path string) (pluginapi.ManagementResponse, bool)
 		file, contentType = "settings.mjs", "text/javascript; charset=utf-8"
 	case dashboardResourcePrefix + "/concurrency.mjs":
 		file, contentType = "concurrency.mjs", "text/javascript; charset=utf-8"
+	case dashboardResourcePrefix + "/budget.mjs":
+		file, contentType = "budget.mjs", "text/javascript; charset=utf-8"
 	default:
 		return pluginapi.ManagementResponse{}, false
 	}

@@ -1,6 +1,7 @@
 import { resourceBase, readPanelKey, validKey, decodeStored } from './session.mjs';
 import { createSettingsEditor, weeklyAllocationLabel } from './settings.mjs';
 import { concurrencyView, waitReasons, availableQuota } from './concurrency.mjs';
+import { weeklyBudgetPercentPerMinute, formatWeeklyBudgetRate } from './budget.mjs';
 
 const $ = id => document.getElementById(id);
 const base = resourceBase(location.href);
@@ -8,7 +9,7 @@ const endpoint = base + '/v0/management/plugins/codex-quota-scheduler/scheduler-
 const bansEndpoint = base + '/v0/management/plugins/codex-quota-scheduler/bans';
 const plans = {team_standard:'Team Standard',team_premium:'Team Premium',plus:'Plus',pro_5x:'Pro 5x',pro_20x:'Pro 20x'};
 const upstreamPlans = {team:'Team Standard',self_serve_business_prolite:'Team Premium',plus:'Plus'};
-const reasons = {weekly_budget_rebalance:'按周日均预算重新平衡',weekly_remaining_rebalance:'按周余量重新平衡',manual:'手动选择',manual_selection:'手动选择',manual_cleared:'恢复自动调配',initial:'首次选择',active_missing:'当前账号已不可用',quota_exhausted:'额度已用尽'};
+const reasons = {weekly_budget_rebalance:'按周分钟预算重新平衡',weekly_remaining_rebalance:'按周余量重新平衡',manual:'手动选择',manual_selection:'手动选择',manual_cleared:'恢复自动调配',initial:'首次选择',active_missing:'当前账号已不可用',quota_exhausted:'额度已用尽'};
 const warmupStates = {confirmed:'已确认激活',pending_confirmation:'等待额度确认',attempted:'已尝试',blocked:'已停止重试',failed:'等待重试'};
 const epochAccountStates = {pending:'等待预热',natural:'真实调用已激活',warmed:'自动预热已完成',blocked:'需处理后重试'};
 let state = null, key = '', manual = false, busy = false, timer = null, failures = 0, authEpoch = 0, operating = false;
@@ -265,8 +266,10 @@ function renderAccounts() {
     const fiveCell=quotaCell(account.windows?.find(w => w.window === '5h'),false); warmupWait(account,fiveCell);
     row.append(info,fiveCell,quotaCell(account.windows?.find(w => w.window === 'weekly'),true));
     const budget = element('td');
-    const amount = account.weekly_budget_known && Number.isFinite(account.weekly_budget_percent_per_day) ? account.weekly_budget_percent_per_day.toFixed(1) + '% / 天' : '未知';
-    budget.append(element('strong','',amount),element('span','subtext',account.weekly_budget_known ? (account.fresh ? '截至下次周重置' : '缓存估算 · 截至下次周重置') : '缺少有效周窗口或重置时间'));
+    const minuteRate = weeklyBudgetPercentPerMinute(account);
+    const amount = element('strong','',formatWeeklyBudgetRate(minuteRate));
+    if(minuteRate !== null) amount.title='本凭据周余量 ÷ 距重置分钟数；不足一分钟按一分钟计算。折合 '+(minuteRate*1440).toLocaleString('zh-CN',{maximumSignificantDigits:6})+'% / 天';
+    budget.append(amount,element('span','subtext',minuteRate !== null ? (account.fresh ? '截至下次周重置 · 分钟精度' : '缓存估算 · 分钟精度') : '缺少有效周窗口或重置时间'));
     row.append(budget);
     const balanced=state.balanced_accounts?.[account.auth_id];
     if(state.scheduler_mode==='balanced')budget.append(element('span','subtext','已分配 '+(balanced?.picks||0)+' 次 · 在途估计 '+(balanced?.pending_estimate||0)));

@@ -40,7 +40,7 @@ test('weekly allocation options describe both modes and the displayed policy fol
   assert.match(spec[4],/串行和均衡并发均生效/);
   assert.match(spec[4],/已有会话保持绑定/);
   assert.deepEqual(spec[5].map(option=>option[0]),['sustainable','weekly_remaining']);
-  assert.equal(weeklyAllocationLabel('sustainable'),'按距重置时间的日均预算');
+  assert.equal(weeklyAllocationLabel('sustainable'),'按距重置时间的分钟预算');
   assert.equal(weeklyAllocationLabel('weekly_remaining'),'按周剩余比例');
   assert.deepEqual(changesBetween({scheduler_mode:'balanced',serial_allocation_policy:'sustainable'},{scheduler_mode:'balanced',serial_allocation_policy:'weekly_remaining'}),{serial_allocation_policy:'weekly_remaining'});
 });

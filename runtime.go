@@ -1705,31 +1705,32 @@ func isJSONEmptyValue(value reflect.Value) bool {
 }
 
 type runtimeQuotaStatus struct {
-	AuthHealth         *authExpiryStatus             `json:"auth_health,omitempty"`
-	Runway             []quotaRunwayWindowAssessment `json:"runway,omitempty"`
-	Plan               string                        `json:"plan_prior"`
-	PlanWeight         float64                       `json:"five_hour_capacity_weight_prior"`
-	PlanSource         string                        `json:"plan_source"`
-	UpstreamPlanType   string                        `json:"upstream_plan_type,omitempty"`
-	UpstreamPlanSource string                        `json:"upstream_plan_source,omitempty"`
-	UpstreamPlanAt     string                        `json:"upstream_plan_observed_at,omitempty"`
-	UpstreamPlanFresh  bool                          `json:"upstream_plan_fresh"`
-	WeeklyBudgetPerDay float64                       `json:"weekly_budget_percent_per_day"`
-	WeeklyBudgetKnown  bool                          `json:"weekly_budget_known"`
-	AuthID             string                        `json:"auth_id"`
-	AuthIndex          string                        `json:"auth_index,omitempty"`
-	Window             string                        `json:"window"`
-	UsedPercent        float64                       `json:"used_percent"`
-	ResetCredits       int                           `json:"reset_credits"`
-	ResetAt            string                        `json:"reset_at,omitempty"`
-	Fresh              bool                          `json:"fresh"`
-	Eligible           bool                          `json:"eligible"`
-	ActiveWindows      int                           `json:"active_windows"`
-	Reason             string                        `json:"reason,omitempty"`
-	Source             string                        `json:"source,omitempty"`
-	HeaderObservedAt   string                        `json:"header_observed_at,omitempty"`
-	Windows            []runtimeQuotaWindowStatus    `json:"windows,omitempty"`
-	ADQ                *runtimeADQAccountStatus      `json:"adq,omitempty"`
+	AuthHealth            *authExpiryStatus             `json:"auth_health,omitempty"`
+	Runway                []quotaRunwayWindowAssessment `json:"runway,omitempty"`
+	Plan                  string                        `json:"plan_prior"`
+	PlanWeight            float64                       `json:"five_hour_capacity_weight_prior"`
+	PlanSource            string                        `json:"plan_source"`
+	UpstreamPlanType      string                        `json:"upstream_plan_type,omitempty"`
+	UpstreamPlanSource    string                        `json:"upstream_plan_source,omitempty"`
+	UpstreamPlanAt        string                        `json:"upstream_plan_observed_at,omitempty"`
+	UpstreamPlanFresh     bool                          `json:"upstream_plan_fresh"`
+	WeeklyBudgetPerDay    float64                       `json:"weekly_budget_percent_per_day"`
+	WeeklyBudgetPerMinute float64                       `json:"weekly_budget_percent_per_minute"`
+	WeeklyBudgetKnown     bool                          `json:"weekly_budget_known"`
+	AuthID                string                        `json:"auth_id"`
+	AuthIndex             string                        `json:"auth_index,omitempty"`
+	Window                string                        `json:"window"`
+	UsedPercent           float64                       `json:"used_percent"`
+	ResetCredits          int                           `json:"reset_credits"`
+	ResetAt               string                        `json:"reset_at,omitempty"`
+	Fresh                 bool                          `json:"fresh"`
+	Eligible              bool                          `json:"eligible"`
+	ActiveWindows         int                           `json:"active_windows"`
+	Reason                string                        `json:"reason,omitempty"`
+	Source                string                        `json:"source,omitempty"`
+	HeaderObservedAt      string                        `json:"header_observed_at,omitempty"`
+	Windows               []runtimeQuotaWindowStatus    `json:"windows,omitempty"`
+	ADQ                   *runtimeADQAccountStatus      `json:"adq,omitempty"`
 }
 
 type runtimeQuotaWindowStatus struct {
@@ -2139,7 +2140,8 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 		}
 		item.Runway = runwayByAuth[canonical]
 		budgetChoice := inspectSerialCandidate(pluginapi.SchedulerAuthCandidate{ID: canonical}, snapshot, true, cfg, now)
-		item.WeeklyBudgetPerDay, item.WeeklyBudgetKnown = serialWeeklyBudget(budgetChoice, cfg, now)
+		item.WeeklyBudgetPerMinute, item.WeeklyBudgetKnown = serialWeeklyBudgetPerMinute(budgetChoice, cfg, now)
+		item.WeeklyBudgetPerDay = item.WeeklyBudgetPerMinute * weeklyBudgetMinutesPerDay
 		if window.Class != "" {
 			item.Window = window.Class
 			item.UsedPercent = window.UsedPercent

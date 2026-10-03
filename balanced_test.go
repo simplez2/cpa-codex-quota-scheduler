@@ -343,3 +343,45 @@ func TestBalancedADQWeightsAccountForReservationsAndSettling(t *testing.T) {
 		t.Fatalf("local debt ignored: %v", weights)
 	}
 }
+
+func TestBalancedMinuteBudgetDistinguishesResetsWithinSixHours(t *testing.T) {
+	resetBanStoreForTest()
+	defer resetBanStoreForTest()
+	for _, adq := range []bool{false, true} {
+		for _, tc := range []struct{ policy, want string }{{"sustainable", "a"}, {"weekly_remaining", "b"}} {
+			t.Run(fmt.Sprintf("adq=%t/policy=%s", adq, tc.policy), func(t *testing.T) {
+				now := time.Now().UTC()
+				s, req := balancedAllocationFixture(now, adq)
+				s.cfg.SerialAllocationPolicy = tc.policy
+				s.quotas["a"].Windows[1].ResetAt = now.Add(30 * time.Minute)
+				s.quotas["b"].Windows[1].ResetAt = now.Add(2 * time.Hour)
+				if pick := s.balancedPick(withBalancedSession(req, "minute-budget"), now); pick.AuthID != tc.want {
+					t.Fatalf("minute horizon ignored: policy=%s pick=%+v want=%s", tc.policy, pick, tc.want)
+				}
+			})
+		}
+	}
+}
+
+func TestBalancedResetClockPromotesCredentialWithoutNewQuotaReading(t *testing.T) {
+	resetBanStoreForTest()
+	defer resetBanStoreForTest()
+	for _, adq := range []bool{false, true} {
+		for _, tc := range []struct {
+			elapsed time.Duration
+			want    string
+		}{{0, "b"}, {40 * time.Minute, "a"}} {
+			t.Run(fmt.Sprintf("adq=%t/elapsed=%v", adq, tc.elapsed), func(t *testing.T) {
+				now := time.Now().UTC()
+				s, req := balancedAllocationFixture(now, adq)
+				s.cfg.SerialAllocationPolicy = "sustainable"
+				s.cfg.StaleAfter = 2 * time.Hour
+				s.quotas["a"].Windows[1].ResetAt = now.Add(45 * time.Minute)
+				s.quotas["b"].Windows[1].ResetAt = now.Add(time.Hour)
+				if pick := s.balancedPick(withBalancedSession(req, "minute-clock"), now.Add(tc.elapsed)); pick.AuthID != tc.want {
+					t.Fatalf("cached reset clock did not change priority: elapsed=%v pick=%+v want=%s", tc.elapsed, pick, tc.want)
+				}
+			})
+		}
+	}
+}

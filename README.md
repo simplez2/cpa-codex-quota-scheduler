@@ -2,14 +2,14 @@
 
 Standalone CPA plugin for balanced concurrent or serial Codex account selection, native quota polling,
 5h/weekly/monthly windows, persistent 429 quarantine and optional warmup.
-Source version: **0.3.12**. Local builds are not a published release.
+Source version: **0.3.13**. Local builds are not a published release.
 
 ## CPA dashboard
 
 After enabling the plugin, refresh CPA Management Center and open **插件 →
 Codex 额度调度**. The plugin management list uses the same display name and the
 stable ID `codex-quota-scheduler`. The dashboard shows the current account,
-5h/weekly remaining quota and resets, daily weekly budget, freshness and warmup
+5h/weekly remaining quota and resets, per-minute weekly budget, freshness and warmup
 records. Its 15-second refresh reads the existing cache without upstream or
 model requests. Opening or refreshing the panel does not change settings.
 
@@ -72,10 +72,15 @@ Other providers are unaffected. Missing native lifecycle correlation fails close
 for Codex when protection is enabled. This release requires CPA v8.0.4 or later
 for concurrency protection; older hosts must disable the concurrency setting.
 
-Weekly daily budget uses a confirmed reset even when the remaining quota is
+Weekly minute budget uses a confirmed reset even when the remaining quota is
 100%. Full-cycle provider placeholders retain the 7-day fallback. The rate can
 exceed 100%/day when a reset is near: it describes a spending pace before the
-reset, not a new daily quota. A 6-hour minimum horizon bounds this pace.
+reset, not a new daily quota. The rate is the credential's own remaining weekly percentage divided by exact
+remaining minutes (including fractional minutes); only the final minute is
+bounded to one minute. The panel preserves six significant digits, and the
+management API exposes `weekly_budget_percent_per_minute` while retaining
+`weekly_budget_percent_per_day` as a compatible conversion. Cached quota
+observations are reused; this calculation adds no upstream quota probes.
 
 ## Dependencies
 
@@ -181,7 +186,7 @@ Both `serial` and `balanced` expose the same weekly allocation control in the
 panel and retain the existing `serial_allocation_policy` configuration key:
 
 - `sustainable`: weekly remaining quota divided by the time until reset, with
-  the existing six-hour horizon floor and placeholder-reset handling.
+  a one-minute horizon floor and the existing placeholder-reset handling.
 - `weekly_remaining`: weekly remaining fraction, without reset-time weighting.
 
 Balanced routing combines this weekly weight with plan capacity and the remaining
@@ -195,10 +200,12 @@ when this policy changes, and all modes retain the per-credential concurrency ga
 
 Traffic stays on one committed account. Default `serial_allocation_policy:
 sustainable` first respects hard limits and quarantine, then
-ranks same-class peers by `(weekly remaining - weekly reserve) / days to reset`.
-The denominator is bounded below by six hours; unused placeholders use a full week.
+ranks same-class peers by `(weekly remaining - weekly reserve) / minutes to reset`.
+The exact time remaining is recomputed on each decision, so unchanged cached
+quota earns higher priority as its confirmed reset approaches. The denominator
+is bounded below by one minute; unused placeholders use a full week.
 With equal reset times, 80% weekly outranks 40%. With 40% resetting tomorrow and
-80% resetting in six days, the former has more spendable budget per day.
+80% resetting in six days, the former has more spendable budget per minute.
 
 Proactive budget handoffs require a 20% relative advantage, two distinct fresh
 weekly readings of **both** accounts, and a 5-minute primary hold. Configure
