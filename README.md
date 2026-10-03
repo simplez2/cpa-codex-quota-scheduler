@@ -2,7 +2,7 @@
 
 Standalone CPA plugin for balanced concurrent or serial Codex account selection, native quota polling,
 5h/weekly/monthly windows, persistent 429 quarantine and optional warmup.
-Source version: **0.3.11**. Local builds are not a published release.
+Source version: **0.3.12**. Local builds are not a published release.
 
 ## CPA dashboard
 
@@ -177,6 +177,22 @@ traffic and bursts; they do not guarantee avoidance of upstream risk controls.
 
 The following settings apply to the retained **串行调配** mode:
 
+Both `serial` and `balanced` expose the same weekly allocation control in the
+panel and retain the existing `serial_allocation_policy` configuration key:
+
+- `sustainable`: weekly remaining quota divided by the time until reset, with
+  the existing six-hour horizon floor and placeholder-reset handling.
+- `weekly_remaining`: weekly remaining fraction, without reset-time weighting.
+
+Balanced routing combines this weekly weight with plan capacity and the remaining
+5h fraction, distributing estimated work fairly across new sessions. For otherwise
+equal credentials, 40% weekly remaining with one day until reset versus 80% with
+seven days until reset gives weights of 7:2 in sustainable mode and 1:2 in
+weekly-remaining mode. Live reservations and settling debt refine the ADQ weights.
+Credits commit only after a successful reservation; failed admission never
+falls through to unreserved routing. Existing sessions keep their credential
+when this policy changes, and all modes retain the per-credential concurrency gate.
+
 Traffic stays on one committed account. Default `serial_allocation_policy:
 sustainable` first respects hard limits and quarantine, then
 ranks same-class peers by `(weekly remaining - weekly reserve) / days to reset`.
@@ -221,8 +237,8 @@ The panel shows the raw upstream SKU, observation source and override status.
 See [Codex SKU display mapping](https://github.com/openai/codex/blob/d6489472f3c15e87d2d7763a5fde033545c530f8/codex-rs/tui/src/status/helpers.rs#L99)
 and [official pricing](https://developers.openai.com/codex/pricing/). In serial
 mode these multipliers compare 5h capacity within a 5% weekly budget band. In
-balanced mode they scale each account's share, constrained by both remaining
-5h quota and normalized weekly budget. They do not establish fixed weekly
+balanced mode they scale each credential's share by its remaining 5h fraction
+and the selected weekly allocation policy. They do not establish fixed weekly
 capacity. See the official sources, experiments and
 limitations in [the allocation study](research/ALLOCATION_RESEARCH.zh-CN.md).
 

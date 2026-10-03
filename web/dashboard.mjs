@@ -1,5 +1,6 @@
 import { resourceBase, readPanelKey, validKey, decodeStored } from './session.mjs';
-import { createSettingsEditor } from './settings.mjs';
+import { createSettingsEditor, weeklyAllocationLabel } from './settings.mjs';
+import { concurrencyView, waitReasons, availableQuota } from './concurrency.mjs';
 
 const $ = id => document.getElementById(id);
 const base = resourceBase(location.href);
@@ -158,7 +159,7 @@ function pct(value) {
 function banFor(account) {
   return (state.bans || []).find(b=>b.auth_id === account.auth_id || (account.auth_index && b.auth_id === account.auth_index));
 }
-function usable(account) { return account.fresh && account.eligible && !banFor(account); }
+function usable(account) { return availableQuota(account,state.quota_probe_on_demand) && !banFor(account); }
 function feedback(message,kind='error') { $('feedback').textContent=message; $('feedback').dataset.kind=kind; $('feedback').hidden=!message; }
 async function api(path,options={}) {
   if(!key)throw new Error('请先连接当前 CPA。');
@@ -270,7 +271,16 @@ function renderAccounts() {
     const balanced=state.balanced_accounts?.[account.auth_id];
     if(state.scheduler_mode==='balanced')budget.append(element('span','subtext','已分配 '+(balanced?.picks||0)+' 次 · 在途估计 '+(balanced?.pending_estimate||0)));
     const concurrency=(state.concurrency?.credentials || state.concurrency?.accounts)?.[account.auth_id];
-    if(concurrency)budget.append(element('span','subtext','凭据并发 '+concurrency.active+' / '+(state.concurrency.enabled ? concurrency.limit : '不限')+(concurrency.warmup ? ' · 含预热 '+concurrency.warmup : '')+(concurrency.at_limit ? ' · 已达上限' : '')));
+    const execution=element('td','execution-cell');
+    if(concurrency) {
+      execution.append(element('strong','execution-value',concurrency.active+' / '+(state.concurrency.enabled ? concurrency.limit : '不限')));
+      const meter=element('div','bar'),fill=element('div','bar-fill'+(concurrency.at_limit?' saturated':''));
+      fill.style.width=state.concurrency.enabled?Math.min(100,100*concurrency.active/Math.max(1,concurrency.limit))+'%':'0%';meter.append(fill);
+      execution.append(meter,element('span','badge'+(concurrency.at_limit?' warning':' good'),concurrency.at_limit?'满载':concurrency.active?'运行中':'空闲'));
+      if(concurrency.waiting)execution.append(element('span','subtext warning',concurrency.waiting+' 个请求等待 · 最久 '+Math.floor(concurrency.oldest_wait_seconds || 0)+' 秒'));
+      if(concurrency.warmup)execution.append(element('span','subtext','其中预热 '+concurrency.warmup));
+    } else execution.append(element('span','subtext','等待生命周期信号'));
+    row.append(execution);
     const poll = state.quota_polls?.[account.auth_id] || state.quota_polls?.[account.auth_index];
     const observed = (account.windows || []).map(w=>w.observed_at).filter(v=>timestamp(v)).sort().at(-1);
     const freshness = element('td');
@@ -287,6 +297,35 @@ function renderAccounts() {
   $('empty').hidden = visible.length > 0;
   $('empty').textContent = accounts.length ? '没有匹配的账号。' : '尚无额度快照。请在“连接与高级”检查 CPA 管理连接，并确认认证文件已启用。';
 }
+function renderConcurrency() {
+  const view=concurrencyView(state,(state.snapshots || []).filter(usable).map(a=>a.auth_id));
+  $('concurrency-title').textContent=view.title;
+  $('concurrency-health').className='badge '+(view.tone==='good'?'good':view.tone==='warning'?'warning':'');
+  $('concurrency-health').textContent=view.enabled?'按凭据保护':'保护已关闭';
+  $('concurrency-panel').dataset.tone=view.tone;
+  $('concurrency-active').textContent=view.active;
+  $('concurrency-capacity').textContent=view.capacity===null?'当前不显示受保护容量':view.known+' 个已知凭据 · '+view.capacity+' 个总槽位';
+  $('concurrency-waiting').textContent=view.waiting;
+  $('concurrency-free').textContent=view.free===null?'—':view.free;
+  $('concurrency-limit').textContent=view.enabled?view.max:'不限';
+  $('concurrency-wait').textContent=view.wait+' 秒';
+  $('concurrency-description').textContent=view.description;
+  $('concurrency-queue-note').textContent=view.policy+'。请求结束立即释放；长流不会按时间强制释放。'+(view.poolWaiting?'其中 '+view.poolWaiting+' 个请求等待候选池空位。':'')+' 面板刷新读取缓存，不探测上游。';
+  $('concurrency-rejected').textContent=view.rejected+' 次累计';
+  const events=$('concurrency-events');events.replaceChildren();
+  if(!view.events.length)events.append(element('li','empty','暂无拒绝记录。'));
+  for(const record of view.events.slice(0,8)) {
+    const item=element('li','rejection-event');
+    item.append(element('time','subtext',dateText(record.at)),element('strong','',waitReasons[record.reason] || '并发准入未通过'));
+    const info=element('p','',record.code==='account_concurrency_busy'?'排队超时 · 已等待 '+Number(record.waited_seconds || 0).toFixed(1)+' 秒':'生命周期关联未确认');
+    if(record.auth_id)info.append(element('span','subtext account-id',record.auth_id));
+    item.append(info);events.append(item);
+  }
+}
+async function focusAllocation(name) {
+  await showView('allocation');
+  const control=$('setting-'+name);control?.scrollIntoView({block:'center',behavior:matchMedia('(prefers-reduced-motion: reduce)').matches?'instant':'smooth'});control?.focus({preventScroll:true});
+}
 function renderPolicy() {
   const policy = $('policy'); policy.replaceChildren();
   const noReserve = state.serial_5h_handoff_mode === '429_only';
@@ -295,7 +334,7 @@ function renderPolicy() {
   const pairs = [
     ['调度模式',modes[state.scheduler_mode] || state.scheduler_mode],
     ['每凭据并发',state.concurrency?.enabled ? '上限 '+(state.concurrency.max_per_credential ?? state.concurrency.max_per_account)+' · 全池在途 '+state.concurrency.active+' · 等待 '+state.concurrency.waiting+(state.concurrency.lifecycle_observed ? '' : ' · 等待 CPA 生命周期信号') : '已关闭'],
-    ['分配策略',state.scheduler_mode==='balanced'?'新会话按 5h 余量、套餐容量和周日均预算分配':state.serial_allocation_policy === 'sustainable' ? '按周日均预算平衡' : '按周剩余比例平衡'],
+    ['分配策略',state.scheduler_mode==='balanced'?`新会话${weeklyAllocationLabel(state.serial_allocation_policy)}分配，保留会话粘性`:weeklyAllocationLabel(state.serial_allocation_policy)],
     ['5h 切换',noReserve ? '额度用尽 / 上游限额时切换' : state.serial_5h_handoff_mode],
     ['5h 预留',noReserve ? '0%（不提前预留）' : pct(state.reserve_5h_percent)],
     [state.scheduler_mode==='balanced'?'并发分配':'主动再平衡最短持有',state.scheduler_mode==='balanced'?'同一会话保持账号，各会话可并发':hold],
@@ -398,7 +437,7 @@ function render() {
   $('cooldown-count').textContent = String(state.quarantine?.cooldown ?? 0);
   const observed = (state.snapshots || []).flatMap(a=>a.windows || []).map(w=>w.observed_at).filter(v=>timestamp(v)).sort().at(-1);
   $('updated-at').textContent = '最近额度观测 ' + dateText(observed) + ' · ' + String(state.fresh_snapshots ?? 0) + ' 个新鲜快照' + (state.quota_probe_on_demand ? ' · 按需探测，空闲读取缓存' : ' · 周期探测');
-  renderAccounts(); renderPolicy(); renderADQ(); renderQuotaEpoch(); renderWarmups();renderBans();
+  renderAccounts(); renderConcurrency(); renderPolicy(); renderADQ(); renderQuotaEpoch(); renderWarmups();renderBans();
   editor.setAccounts(accounts.map(a=>a.auth_id));
 }
 function notice(message) { $('notice').textContent = message; $('notice').hidden = !message; }
@@ -466,6 +505,8 @@ function syncTheme() {
   document.documentElement.dataset.theme = theme === 'dark' || ((!theme || theme === 'system' || theme === 'auto') && matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'white';
 }
 $('refresh').addEventListener('click',refresh);
+$('edit-scheduler').addEventListener('click',()=>focusAllocation('scheduler_mode'));
+$('edit-concurrency').addEventListener('click',()=>focusAllocation('account_max_concurrency'));
 document.querySelectorAll('[data-view]').forEach(button=>button.addEventListener('click',()=>showView(button.dataset.view)));
 $('auto-select').addEventListener('click',()=>mutate('/serial-active','DELETE',undefined,'已恢复自动调配，后续请求重新选择账号。'));
 $('unban-all').addEventListener('click',()=>confirmOperation('解除全部冷却','将移除所有本地冷却记录。仅在确认相关账号的上游额度已恢复后执行。',()=>mutate('/unban-all','POST',{},'已解除全部本地冷却。')));

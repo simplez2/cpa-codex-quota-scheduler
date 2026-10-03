@@ -105,7 +105,7 @@ import (
 
 const (
 	pluginName    = "codex-quota-scheduler"
-	pluginVersion = "0.3.11"
+	pluginVersion = "0.3.12"
 
 	// providerCodex is the CPA provider key for OpenAI Codex (ChatGPT backend).
 	providerCodex = "codex"
@@ -549,7 +549,7 @@ func pluginRegistration() registration {
 				{Name: "serial_5h_handoff_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"inherit_global", "custom_threshold", "reserve_aware", "429_only"}, Description: "5h-specific handoff policy. Defaults to 429_only: no static, forecast, or cache-age reserve; hard limits, disallowed state, and 429 still trigger handoff. inherit_global uses the global threshold; custom_threshold uses serial_5h_switch_percent; reserve_aware enables the configured reserve and forecast guard."},
 				{Name: "serial_5h_switch_percent", Type: pluginapi.ConfigFieldTypeNumber, Description: "Custom 5h used-percent handoff threshold when serial_5h_handoff_mode is custom_threshold. Defaults to the global serial_switch_percent when omitted."},
 				{Name: "serial_prefer_active_cycle", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Prefer an already-started quota cycle when choosing the next serial auth."},
-				{Name: "serial_allocation_policy", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"sustainable", "weekly_remaining"}, Description: "Default sustainable uses safe 5h headroom then normalized weekly budget until reset. weekly_remaining retains raw weekly percentage ranking."},
+				{Name: "serial_allocation_policy", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"sustainable", "weekly_remaining"}, Description: "Weekly allocation policy for both serial and balanced modes. sustainable uses remaining weekly quota divided by time until reset; weekly_remaining uses remaining weekly fraction. Balanced weights also include plan capacity and 5h headroom; existing session affinity remains authoritative."},
 				{Name: "serial_budget_rebalance_percent", Type: pluginapi.ConfigFieldTypeNumber, Description: "Relative weekly budget advantage before proactive sustainable handoff (default 20 percent, 0 disables); requires independent evidence and minimum hold."},
 				{Name: "serial_soft_continuation", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Legacy session continuation past a soft threshold; defaults false so subsequent session requests follow the replacement."},
 				{Name: "quota_default_plan", Type: pluginapi.ConfigFieldTypeString, Description: "Fallback capacity prior when native plan detection is unavailable: team_standard (default), plus, pro_5x, pro_20x or team_premium. Explicit quota_account_plans overrides take precedence over detection. Priors are not guaranteed weekly limits."},

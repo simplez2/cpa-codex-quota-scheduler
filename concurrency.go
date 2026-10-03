@@ -33,23 +33,44 @@ type concurrencyRequest struct {
 	Dispatched      bool
 	Rejection       string
 	QueueDeadline   time.Time
+	QueueStartedAt  time.Time
+	QueueSequence   uint64
+	WaitKeys        map[string]bool
+	WaitAuthID      string
+	WaitReason      string
 }
 type accountConcurrencyGate struct {
-	mu        sync.Mutex
-	requests  map[string]*concurrencyRequest
-	tokens    map[string]string
-	aliases   map[string]string
-	changed   chan struct{}
-	supported bool
-	waiting   int
-	waits     uint64
-	rejected  uint64
+	mu         sync.Mutex
+	requests   map[string]*concurrencyRequest
+	tokens     map[string]string
+	aliases    map[string]string
+	changed    chan struct{}
+	supported  bool
+	waiting    int
+	waits      uint64
+	rejected   uint64
+	sequence   uint64
+	rejections []accountConcurrencyRejection
 }
+type accountConcurrencyRejection struct {
+	At            time.Time `json:"at"`
+	Code          string    `json:"code"`
+	Reason        string    `json:"reason"`
+	AuthID        string    `json:"auth_id,omitempty"`
+	Mode          string    `json:"mode"`
+	Active        int       `json:"active"`
+	Limit         int       `json:"limit"`
+	WaitedSeconds float64   `json:"waited_seconds"`
+}
+
 type accountConcurrencyAccountStatus struct {
-	Active  int  `json:"active"`
-	Warmup  int  `json:"warmup"`
-	Limit   int  `json:"limit"`
-	AtLimit bool `json:"at_limit"`
+	Active            int     `json:"active"`
+	Warmup            int     `json:"warmup"`
+	Limit             int     `json:"limit"`
+	AtLimit           bool    `json:"at_limit"`
+	Waiting           int     `json:"waiting"`
+	OldestWaitSeconds float64 `json:"oldest_wait_seconds"`
+	CredentialKey     string  `json:"credential_key"`
 }
 type accountConcurrencyStatus struct {
 	Enabled          bool                                       `json:"enabled"`
@@ -61,6 +82,9 @@ type accountConcurrencyStatus struct {
 	Active           int                                        `json:"active"`
 	Waiting          int                                        `json:"waiting"`
 	Waits            uint64                                     `json:"waits"`
+	PoolWaiting      int                                        `json:"pool_waiting"`
+	QueuePolicy      string                                     `json:"queue_policy"`
+	RecentRejections []accountConcurrencyRejection              `json:"recent_rejections"`
 	Rejected         uint64                                     `json:"rejected"`
 	Credentials      map[string]accountConcurrencyAccountStatus `json:"credentials"`
 	Accounts         map[string]accountConcurrencyAccountStatus `json:"accounts"`
@@ -156,6 +180,12 @@ func (g *accountConcurrencyGate) keyLocked(aliases []string) string {
 			}
 		}
 		for _, r := range g.requests {
+			for oldKey := range old {
+				if r.WaitKeys[oldKey] {
+					delete(r.WaitKeys, oldKey)
+					r.WaitKeys[key] = true
+				}
+			}
 			if old[r.Key] {
 				r.Key = key
 			}
@@ -180,6 +210,98 @@ func (g *accountConcurrencyGate) countLocked(key string) (active, warmup int) {
 	}
 	return
 }
+
+// Queue order is per credential. An older bound waiter has priority over new
+// requests and warmup; unrelated credentials remain free to accept work.
+// Pool waiters compete only for their candidate keys. Expired or cancelled
+// registrations cannot reserve priority or release someone else's active slot.
+func (g *accountConcurrencyGate) blockedLocked(key string, request *concurrencyRequest, limit int, now time.Time) bool {
+	active, _ := g.countLocked(key)
+	if active >= limit {
+		return true
+	}
+	for _, older := range g.requests {
+		if older == request || older.QueueSequence == 0 || !older.WaitKeys[key] || older.Rejection != "" {
+			continue
+		}
+		if !older.QueueDeadline.IsZero() && !now.Before(older.QueueDeadline) {
+			continue
+		}
+		if request == nil || request.QueueSequence == 0 || older.QueueSequence < request.QueueSequence {
+			return true
+		}
+	}
+	return false
+}
+func (g *accountConcurrencyGate) startWaitLocked(r *concurrencyRequest, keys map[string]bool, authID, reason string, now time.Time) {
+	if r == nil {
+		return
+	}
+	if r.QueueSequence == 0 {
+		g.sequence++
+		r.QueueSequence = g.sequence
+		g.waits++
+		if r.QueueStartedAt.IsZero() {
+			r.QueueStartedAt = now
+		}
+	}
+	r.WaitKeys, r.WaitAuthID, r.WaitReason = keys, authID, reason
+}
+func (g *accountConcurrencyGate) endWait(id string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.waiting--
+	if r := g.requests[id]; r != nil && r.QueueSequence != 0 {
+		r.QueueSequence = 0
+		r.WaitKeys = nil
+		g.notifyLocked()
+	}
+}
+func (g *accountConcurrencyGate) rejectLocked(r *concurrencyRequest, code string, cfg pluginConfig) {
+	if r != nil && r.Rejection != "" {
+		return
+	}
+	g.rejected++
+	event := accountConcurrencyRejection{At: time.Now(), Code: code, Reason: "lifecycle_unavailable", Mode: normalizeSchedulerMode(cfg.SchedulerMode), Limit: cfg.AccountMaxConcurrency}
+	if r != nil {
+		r.Rejection = code
+		event.AuthID, event.Reason = r.WaitAuthID, r.WaitReason
+		if event.AuthID == "" {
+			event.AuthID = r.AuthID
+		}
+		if event.Reason == "" {
+			event.Reason = "lifecycle_unavailable"
+		}
+		if !r.QueueStartedAt.IsZero() {
+			event.WaitedSeconds = event.At.Sub(r.QueueStartedAt).Seconds()
+			if event.WaitedSeconds < 0 {
+				event.WaitedSeconds = 0
+			}
+		}
+		if len(r.WaitKeys) == 1 {
+			for key := range r.WaitKeys {
+				event.Active, _ = g.countLocked(key)
+			}
+		}
+	}
+	g.rejections = append(g.rejections, event)
+	if len(g.rejections) > 20 {
+		g.rejections = append([]accountConcurrencyRejection(nil), g.rejections[len(g.rejections)-20:]...)
+	}
+}
+func concurrencyWaitReason(req pluginapi.SchedulerPickRequest, preferred string, cfg pluginConfig) string {
+	if serialPinnedAuthID(req) != "" && preferred != "" {
+		return "pinned_credential"
+	}
+	if preferred != "" && normalizeSchedulerMode(cfg.SchedulerMode) == "serial" {
+		return "serial_primary"
+	}
+	if preferred != "" {
+		return "sticky_credential"
+	}
+	return "pool_full"
+}
+
 func (s *schedulerRuntimeState) concurrencyAliases(candidate pluginapi.SchedulerAuthCandidate) []string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -230,6 +352,39 @@ func (s *schedulerRuntimeState) concurrencyPreferred(req pluginapi.SchedulerPick
 	}
 	return ""
 }
+
+// Match the native serial/balanced eligibility predicate before deciding that a
+// free credential can serve queued work. An exhausted idle sibling is not a
+// reason to skip the queue for the remaining usable, busy credential.
+func (s *schedulerRuntimeState) concurrencySchedulable(req pluginapi.SchedulerPickRequest, cfg pluginConfig, now time.Time) map[string]bool {
+	eligible := make(map[string]bool, len(req.Candidates))
+	mode := normalizeSchedulerMode(cfg.SchedulerMode)
+	pinned := serialPinnedAuthID(req)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if now.Before(s.balancedClock) {
+		now = s.balancedClock
+	}
+	for _, candidate := range req.Candidates {
+		if pinned != "" && candidate.ID != pinned {
+			continue
+		}
+		if !banStore.schedulable(candidate.ID, now) || s.adqProviderCircuitActiveLockedForConcurrency(candidate, now) {
+			continue
+		}
+		if mode == "balanced" || mode == "serial" {
+			snapshot, found := s.lookupQuotaLocked(candidate.ID, candidateAuthIndex(candidate))
+			snapshot = s.serialConservativeQuotaLocked(snapshot, now)
+			choice := inspectSerialCandidate(candidate, snapshot, found, cfg, now)
+			if !choice.Eligible && !(mode == "balanced" && choice.Reason == "serial_threshold") {
+				continue
+			}
+		}
+		eligible[candidate.ID] = true
+	}
+	return eligible
+}
+
 func (s *schedulerRuntimeState) adqProviderCircuitActiveLockedForConcurrency(candidate pluginapi.SchedulerAuthCandidate, now time.Time) bool {
 	_, active := s.adqProviderCircuitActiveLocked(candidate.ID, candidateAuthIndex(candidate), now)
 	return active
@@ -255,11 +410,10 @@ func (s *schedulerRuntimeState) schedulerPick(req pluginapi.SchedulerPickRequest
 	deadline := time.Now().Add(initialCfg.AccountConcurrencyWait)
 	token := schedulerHeader(req.Options, concurrencyHeader)
 	waiting := false
+	waitID := ""
 	defer func() {
 		if waiting {
-			s.concurrency.mu.Lock()
-			s.concurrency.waiting--
-			s.concurrency.mu.Unlock()
+			s.concurrency.endWait(waitID)
 		}
 	}()
 	for {
@@ -272,7 +426,9 @@ func (s *schedulerRuntimeState) schedulerPick(req pluginapi.SchedulerPickRequest
 		for _, candidate := range req.Candidates {
 			aliases[candidate.ID] = s.concurrencyAliases(candidate)
 		}
-		preferred := s.concurrencyPreferred(req, cfg, time.Now())
+		now := time.Now()
+		preferred := s.concurrencyPreferred(req, cfg, now)
+		eligible := s.concurrencySchedulable(req, cfg, now)
 		g := &s.concurrency
 		g.mu.Lock()
 		g.initLocked()
@@ -283,10 +439,7 @@ func (s *schedulerRuntimeState) schedulerPick(req pluginapi.SchedulerPickRequest
 		}
 		enforce := cfg.Enabled && cfg.AccountConcurrencyEnabled && g.supported
 		if enforce && (request == nil || stopping) {
-			if request != nil {
-				request.Rejection = "account_concurrency_unavailable"
-			}
-			g.rejected++
+			g.rejectLocked(request, "account_concurrency_unavailable", cfg)
 			g.mu.Unlock()
 			s.selectionMu.Unlock()
 			return pluginapi.SchedulerPickResponse{}, &accountConcurrencyError{"account_concurrency_unavailable", "CPA request lifecycle correlation is unavailable"}
@@ -294,11 +447,17 @@ func (s *schedulerRuntimeState) schedulerPick(req pluginapi.SchedulerPickRequest
 		// A rejected lifecycle remains terminal across CPA's alternate credential
 		// retries. Otherwise a busy sticky account disappears from Candidates,
 		// allowing the same expired request to be silently assigned elsewhere.
-		if enforce && request.Rejection != "" {
+		if request != nil && request.Rejection != "" {
 			code := request.Rejection
 			g.mu.Unlock()
 			s.selectionMu.Unlock()
 			return pluginapi.SchedulerPickResponse{}, &accountConcurrencyError{code, "bounded queue admission already rejected for this execution"}
+		}
+		if enforce && request.QueueSequence != 0 && !now.Before(deadline) {
+			g.rejectLocked(request, "account_concurrency_busy", cfg)
+			g.mu.Unlock()
+			s.selectionMu.Unlock()
+			return pluginapi.SchedulerPickResponse{}, &accountConcurrencyError{"account_concurrency_busy", concurrencyRejectionMessage("account_concurrency_busy")}
 		}
 		// CPA retries attempts sequentially under the same execution RequestID.
 		// Detach the old attempt before admitting its replacement; unrelated requests
@@ -312,34 +471,46 @@ func (s *schedulerRuntimeState) schedulerPick(req pluginapi.SchedulerPickRequest
 		attempt := req
 		attempt.Candidates = nil
 		preferredBusy := false
+		idleEligible := 0
+		waitKeys := make(map[string]bool)
 		for _, candidate := range req.Candidates {
 			key := g.keyLocked(aliases[candidate.ID])
-			active, _ := g.countLocked(key)
-			busy := enforce && active >= cfg.AccountMaxConcurrency
+			busy := enforce && g.blockedLocked(key, request, cfg.AccountMaxConcurrency, now)
 			if candidate.ID == preferred && busy {
 				preferredBusy = true
 			}
 			if !busy {
+				if eligible[candidate.ID] {
+					idleEligible++
+				}
 				attempt.Candidates = append(attempt.Candidates, candidate)
 			}
 		}
-		busy := enforce && (preferredBusy || len(attempt.Candidates) == 0)
+		busy := enforce && (preferredBusy || (len(eligible) > 0 && idleEligible == 0) || len(attempt.Candidates) == 0)
 		if busy {
+			// All credential aliases have been learned before constructing queue keys.
+			for _, candidate := range req.Candidates {
+				if (preferred == "" && eligible[candidate.ID]) || preferred == candidate.ID {
+					waitKeys[g.keyLocked(aliases[candidate.ID])] = true
+				}
+			}
 			if request != nil && request.QueueDeadline.IsZero() {
 				request.QueueDeadline = deadline
 			}
 			if !waiting {
 				waiting = true
 				g.waiting++
-				g.waits++
+				waitID = id
 			}
+			waitAuthID := preferred
+			if waitAuthID == "" && len(req.Candidates) == 1 {
+				waitAuthID = req.Candidates[0].ID
+			}
+			g.startWaitLocked(request, waitKeys, waitAuthID, concurrencyWaitReason(req, preferred, cfg), time.Now())
 			wake := g.changed
 			expired := !time.Now().Before(deadline)
 			if expired {
-				g.rejected++
-				if request != nil {
-					request.Rejection = "account_concurrency_busy"
-				}
+				g.rejectLocked(request, "account_concurrency_busy", cfg)
 			}
 			g.mu.Unlock()
 			s.selectionMu.Unlock()
@@ -390,6 +561,12 @@ func minDuration(a, b time.Duration) time.Duration {
 	}
 	return b
 }
+func concurrencyRejectionMessage(code string) string {
+	if code == "account_concurrency_busy" {
+		return "Codex credential concurrency queue timed out; retry after an active request finishes"
+	}
+	return "CPA could not verify the request lifecycle for Codex concurrency admission"
+}
 func concurrencyTermination(code, message string) pluginapi.RequestInterceptResponse {
 	body, _ := json.Marshal(map[string]any{"error": map[string]string{"type": "server_error", "code": code, "message": message}})
 	return pluginapi.RequestInterceptResponse{Terminate: true, StatusCode: http.StatusServiceUnavailable, ResponseHeaders: http.Header{"Retry-After": []string{"1"}, "Content-Type": []string{"application/json"}}, ResponseBody: body, ClearHeaders: []string{concurrencyHeader}}
@@ -415,9 +592,7 @@ func (s *schedulerRuntimeState) concurrencyAfter(req pluginapi.RequestInterceptR
 	waiting := false
 	defer func() {
 		if waiting {
-			s.concurrency.mu.Lock()
-			s.concurrency.waiting--
-			s.concurrency.mu.Unlock()
+			s.concurrency.endWait(req.RequestID)
 		}
 	}()
 	for {
@@ -445,11 +620,17 @@ func (s *schedulerRuntimeState) concurrencyAfter(req pluginapi.RequestInterceptR
 			s.selectionMu.Unlock()
 			return response
 		}
-		if enabled && r != nil && r.Rejection != "" {
+		if r != nil && r.Rejection != "" {
 			code := r.Rejection
 			g.mu.Unlock()
 			s.selectionMu.Unlock()
-			return concurrencyTermination(code, "The selected Codex account is busy or unavailable; try again after an active request finishes")
+			return concurrencyTermination(code, concurrencyRejectionMessage(code))
+		}
+		if enabled && r != nil && r.QueueSequence != 0 && !time.Now().Before(deadline) {
+			g.rejectLocked(r, "account_concurrency_busy", cfg)
+			g.mu.Unlock()
+			s.selectionMu.Unlock()
+			return concurrencyTermination("account_concurrency_busy", concurrencyRejectionMessage("account_concurrency_busy"))
 		}
 		// A mixed route is selected by CPA. Account it only after the provider
 		// and credential are known, without overriding native provider priority.
@@ -460,20 +641,19 @@ func (s *schedulerRuntimeState) concurrencyAfter(req pluginapi.RequestInterceptR
 				r.AuthID = ""
 				g.notifyLocked()
 			}
-			active, _ := g.countLocked(key)
-			if enabled && r.Key == "" && active >= cfg.AccountMaxConcurrency {
+			if enabled && r.Key == "" && g.blockedLocked(key, r, cfg.AccountMaxConcurrency, time.Now()) {
 				if r.QueueDeadline.IsZero() {
 					r.QueueDeadline = deadline
 				}
 				if !waiting {
 					waiting = true
 					g.waiting++
-					g.waits++
 				}
+				g.startWaitLocked(r, map[string]bool{key: true}, selectedID, "native_credential", time.Now())
 				wake := g.changed
 				expired := !time.Now().Before(deadline)
 				if expired {
-					g.rejected++
+					g.rejectLocked(r, "account_concurrency_busy", cfg)
 				}
 				g.mu.Unlock()
 				s.selectionMu.Unlock()
@@ -497,7 +677,7 @@ func (s *schedulerRuntimeState) concurrencyAfter(req pluginapi.RequestInterceptR
 			r.AuthID = selectedID
 		}
 		if enabled && (req.RequestID == "" || r == nil || r.Key == "" || (selectedID != "" && r.Key != g.keyLocked(aliases))) {
-			g.rejected++
+			g.rejectLocked(r, "account_concurrency_unavailable", cfg)
 			g.mu.Unlock()
 			s.selectionMu.Unlock()
 			return concurrencyTermination("account_concurrency_unavailable", "CPA did not admit this Codex execution through the credential concurrency scheduler")
@@ -550,8 +730,7 @@ func (s *schedulerRuntimeState) beginWarmupConcurrency(candidate warmupCandidate
 	defer g.mu.Unlock()
 	g.initLocked()
 	key := g.keyLocked(aliases)
-	active, _ := g.countLocked(key)
-	if cfg.Enabled && cfg.AccountConcurrencyEnabled && active >= cfg.AccountMaxConcurrency {
+	if cfg.Enabled && cfg.AccountConcurrencyEnabled && g.blockedLocked(key, nil, cfg.AccountMaxConcurrency, time.Now()) {
 		return "", false
 	}
 	var entropy [16]byte
@@ -568,6 +747,9 @@ func (s *schedulerRuntimeState) concurrencyStatus(cfg pluginConfig, quotas map[s
 	defer g.mu.Unlock()
 	g.initLocked()
 	out := accountConcurrencyStatus{Enabled: cfg.Enabled && cfg.AccountConcurrencyEnabled, Supported: g.supported, Scope: "credential", MaxPerCredential: cfg.AccountMaxConcurrency, MaxPerAccount: cfg.AccountMaxConcurrency, WaitSeconds: cfg.AccountConcurrencyWait.Seconds(), Waiting: g.waiting, Waits: g.waits, Rejected: g.rejected, Accounts: map[string]accountConcurrencyAccountStatus{}}
+	out.QueuePolicy = "fifo_per_credential"
+	out.RecentRejections = append([]accountConcurrencyRejection(nil), g.rejections...)
+	now := time.Now()
 	// Keep the original fields as wire aliases for existing panel/API clients.
 	out.Credentials = out.Accounts
 	for _, q := range quotas {
@@ -580,9 +762,22 @@ func (s *schedulerRuntimeState) concurrencyStatus(cfg pluginConfig, quotas map[s
 		}
 		key := g.keyLocked(aliases)
 		active, warmup := g.countLocked(key)
-		out.Accounts[q.AuthID] = accountConcurrencyAccountStatus{Active: active, Warmup: warmup, Limit: cfg.AccountMaxConcurrency, AtLimit: out.Enabled && active >= cfg.AccountMaxConcurrency}
+		item := accountConcurrencyAccountStatus{Active: active, Warmup: warmup, Limit: cfg.AccountMaxConcurrency, AtLimit: out.Enabled && active >= cfg.AccountMaxConcurrency, CredentialKey: key}
+		for _, r := range g.requests {
+			if r.QueueSequence != 0 && r.Rejection == "" && len(r.WaitKeys) == 1 && r.WaitKeys[key] {
+				item.Waiting++
+				elapsed := now.Sub(r.QueueStartedAt).Seconds()
+				if elapsed > item.OldestWaitSeconds {
+					item.OldestWaitSeconds = elapsed
+				}
+			}
+		}
+		out.Accounts[q.AuthID] = item
 	}
 	for _, r := range g.requests {
+		if r.QueueSequence != 0 && r.Rejection == "" && len(r.WaitKeys) > 1 {
+			out.PoolWaiting++
+		}
 		if r.Key != "" {
 			out.Active++
 		}

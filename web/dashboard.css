@@ -622,10 +622,29 @@ dialog p { margin:16px 0 24px; }
   .accounts td:nth-child(2)::before { content:'5h 剩余'; }
   .accounts td:nth-child(3)::before { content:'周剩余'; }
   .accounts td:nth-child(4)::before { content:'周日均预算'; }
-  .accounts td:nth-child(5)::before { content:'最近查询'; }
+  .accounts td:nth-child(5)::before { content:'凭据并发'; }
+  .accounts td:nth-child(6)::before { content:'最近查询'; }
   .accounts td::before { display:block; color:var(--muted); font-size:11px; margin-bottom:7px; }
   .account-actions { display:flex!important; gap:8px; }
   .account-actions button { width:auto; }
   .account-id { max-width:none; }
   .warmup-records .section-header { align-items:flex-start; flex-direction:column; }
 }
+
+/* Native request occupancy is separate from quota and predicted debt. */
+.concurrency-panel{margin:20px 0;padding:22px 24px;border:1px solid var(--line);border-radius:12px;background:var(--surface)}
+.concurrency-panel .section-header{margin-bottom:18px}.concurrency-panel h2{font-size:20px;margin-top:5px}
+.concurrency-readout{display:grid;grid-template-columns:minmax(190px,1fr) 3fr;gap:28px;align-items:center}
+.concurrency-now{display:grid;grid-template-columns:auto 1fr;align-items:baseline;gap:0 12px}
+.concurrency-now>strong{font-size:46px;font-weight:650;line-height:1.1;font-variant-numeric:tabular-nums;letter-spacing:-1.5px}
+.concurrency-now>small{grid-column:1/-1;color:var(--muted);margin-top:9px}
+.concurrency-metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:20px}.concurrency-metrics>div{border-left:1px solid var(--line);padding-left:20px}
+.concurrency-metrics dt{color:var(--muted);font-size:12px;margin-bottom:6px}.concurrency-metrics dd{font-size:23px;font-weight:600}
+.concurrency-explanation{display:flex;gap:20px;align-items:center;justify-content:space-between;margin-top:20px;padding-top:18px;border-top:1px solid var(--line)}
+.concurrency-explanation p{max-width:700px}.concurrency-explanation .toolbar{flex-shrink:0}.concurrency-panel>.subtext{margin-top:10px;line-height:1.6}
+.rejection-history{margin-top:14px;padding-top:12px;border-top:1px solid var(--line)}.rejection-history summary{cursor:pointer;font-size:13px;font-weight:600}.rejection-history summary span{color:var(--muted);font-weight:400;margin-left:9px}
+.rejection-history>p{margin:12px 0}.rejection-history ul{list-style:none;padding:0;margin:0}.rejection-event{display:grid;grid-template-columns:110px 1fr;gap:5px 14px;padding:12px 0;border-bottom:1px solid var(--line)}.rejection-event:last-child{border-bottom:0}.rejection-event p{grid-column:2;line-height:1.5}.rejection-event .account-id{font-size:11px;word-break:break-all}
+.execution-cell{min-width:145px}.execution-value{font-size:18px;font-variant-numeric:tabular-nums}.execution-cell .bar{margin:8px 0}.execution-cell .badge{font-size:11px}.bar-fill.saturated{background:var(--warning)}
+.diagnostic-drawer{margin-top:20px;border:1px solid var(--line);border-radius:12px;background:var(--surface)}.diagnostic-drawer>summary{cursor:pointer;padding:18px 24px;font-weight:600}.diagnostic-drawer>summary span{margin-left:12px;color:var(--muted);font-size:12px;font-weight:400}.diagnostic-drawer .detail-panel{border:0;margin:0}
+@media(max-width:900px){.concurrency-readout{grid-template-columns:1fr;gap:22px}.concurrency-metrics>div:first-child{border-left:0;padding-left:0}.concurrency-explanation{align-items:flex-start;flex-direction:column;gap:12px}.concurrency-explanation .toolbar{flex-wrap:wrap}}
+@media(max-width:520px){.concurrency-panel{padding:18px 16px}.concurrency-panel h2{font-size:17px}.concurrency-now>strong{font-size:38px}.concurrency-metrics{grid-template-columns:repeat(2,1fr);gap:20px 14px}.concurrency-metrics>div:nth-child(3){border-left:0;padding-left:0}.concurrency-metrics dd{font-size:21px}.concurrency-explanation button{min-height:44px}.rejection-event{grid-template-columns:1fr;gap:4px}.rejection-event p{grid-column:1}.diagnostic-drawer>summary{padding:16px}.diagnostic-drawer>summary span{display:block;margin:6px 0 0}}

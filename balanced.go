@@ -40,24 +40,73 @@ type balancedAccountStatus struct {
 	LastPicked time.Time `json:"last_picked"`
 }
 
+// Both policies allocate predicted work, rather than equal request counts.
+// The 5h fraction scales available headroom without adding an admission reserve.
 func balancedWeight(choice serialCandidate, cfg pluginConfig, now time.Time) float64 {
+	return balancedWeightWithQuota(choice, cfg, now, choice.FiveHourRemaining, choice.WeeklyRemaining)
+}
+
+func balancedWeightWithQuota(choice serialCandidate, cfg pluginConfig, now time.Time, fiveRemaining, weeklyRemaining float64) float64 {
 	_, capacity, _ := resolvedQuotaPlan(cfg, choice.Candidate.ID, choice.Snapshot, now)
-	// At identical percentages/reset times, larger plans carry proportionally
-	// more work. The scarcer of 5h headroom and weekly daily budget sets pace.
-	pace := 1.0
+	fiveFactor, weeklyFactor := 1.0, 1.0
 	if choice.FiveHourKnown {
-		pace = math.Max(.01, choice.FiveHourRemaining/100)
+		fiveFactor = math.Max(.01, clampADQ(fiveRemaining, 0, 100)/100)
 	}
-	budget, known := serialWeeklyBudget(choice, cfg, now)
-	if known {
-		if choice.WeeklyProtected {
+	if choice.WeeklyKnown {
+		weeklyFactor = clampADQ(weeklyRemaining, 0, 100) / 100
+		if serialBudgetEnabled(cfg) {
+			// The reserve already determines the candidate tier. Normalize the
+			// remaining fraction by its reset horizon, without capping imminent
+			// resets at a full-week rate or subtracting the reserve twice.
 			copyCfg := cfg
 			copyCfg.ReserveWeeklyPercent = 0
-			budget, _ = serialWeeklyBudget(choice, copyCfg, now)
+			if budget, known := serialWeeklyBudget(choice, copyCfg, now); known && choice.WeeklyRemaining > 0 {
+				weeklyFactor = budget * clampADQ(weeklyRemaining/choice.WeeklyRemaining, 0, 1) / (100.0 / 7)
+			}
 		}
-		pace = math.Min(pace, math.Max(.01, budget/(100.0/7)))
+		// Settled work can briefly consume the scheduling waterline while
+		// telemetry lags. Keep a small fair share; hard gates remain in ADQ.
+		weeklyFactor = math.Max(.01, weeklyFactor)
 	}
-	return capacity * pace
+	return capacity * fiveFactor * weeklyFactor
+}
+
+// Compute a tentative fair-share round. Only a successful ADQ reservation
+// commits these credits; collision retries cannot mint additional credit.
+func (s *schedulerRuntimeState) balancedADQAllocationLocked(choices []serialCandidate, inputs []adqAccountInput, cost float64, now time.Time, policy adqPolicy) (map[string]adqAllocationScore, map[string]float64) {
+	weights := make(map[string]float64, len(inputs))
+	total := 0.0
+	for i, input := range inputs {
+		metrics := adqAssessAccount(input, policy, now)
+		if !metrics.Eligible {
+			continue
+		}
+		five, weekly := 100.0, 100.0
+		if metrics.H > 0 {
+			five = 100 * metrics.HEffective / metrics.H
+		}
+		if metrics.W > 0 {
+			weekly = 100 * metrics.WEffective / metrics.W
+		}
+		weight := balancedWeightWithQuota(choices[i], s.cfg, now, five, weekly)
+		weights[input.ID] = weight
+		total += weight
+	}
+	scores := make(map[string]adqAllocationScore, len(weights))
+	limit := cost * math.Max(8, float64(len(weights))*2)
+	for i, input := range inputs {
+		weight, eligible := weights[input.ID]
+		if !eligible || total <= 0 {
+			continue
+		}
+		account := s.balancedAccounts[choices[i].Candidate.ID]
+		credit, lastPicked := 0.0, time.Time{}
+		if account != nil {
+			credit, lastPicked = account.Credit, account.LastPicked
+		}
+		scores[input.ID] = adqAllocationScore{Credit: math.Max(-limit, math.Min(limit, credit+cost*weight/total)), LastPicked: lastPicked}
+	}
+	return scores, weights
 }
 
 func (s *schedulerRuntimeState) balancedPick(req pluginapi.SchedulerPickRequest, now time.Time) pluginapi.SchedulerPickResponse {
@@ -180,21 +229,24 @@ func (s *schedulerRuntimeState) balancedPick(req pluginapi.SchedulerPickRequest,
 	}
 	selected := ""
 	reservation := adqReservation{}
-	adqSelected, adqReservation, adqOK := s.adqRouteChoicesLocked(req, choices, cost, now, session, func() string {
+	adqSelected, adqReservation, adqOK, adqHandled := s.adqRouteChoicesWithAllocationLocked(req, choices, cost, now, session, func() string {
 		if sticky == nil {
 			return ""
 		}
 		return sticky.Candidate.ID
-	}())
+	}(), true)
 	if adqOK {
-		// ADQ owns the final choice whenever both windows have observed absolute
-		// capacities. The legacy credit score remains a fallback and is never
-		// allowed to overwrite a reserved decision.
+		// ADQ commits the policy's fair-share round only after reservation;
+		// the fallback cannot overwrite this decision or double-credit it.
 		selected = adqSelected
 		reservation = adqReservation
-		if sticky != nil {
+		if sticky != nil && selected == sticky.Candidate.ID {
 			s.balancedSessionHits++
 		}
+	} else if adqHandled {
+		// Complete telemetry with a hard gate/collision is an admission failure,
+		// not permission to bypass reservations through the legacy fallback.
+		return pluginapi.SchedulerPickResponse{}
 	} else {
 		bestScore := math.Inf(-1)
 		for _, choice := range choices {
