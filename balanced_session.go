@@ -97,6 +97,9 @@ func (s *schedulerRuntimeState) balancedSessionValidLocked(key string, binding b
 	if now.Sub(binding.LastUsedAt) <= time.Duration(s.cfg.StickySeconds)*time.Second {
 		return true
 	}
+	if s.concurrency.hasActiveSession(key, binding.AuthID) {
+		return true
+	}
 	// A long generation is active time, not idle time. Its completion renews
 	// the binding so the following tool call does not start another account.
 	if account := s.balancedAccounts[binding.AuthID]; account != nil {

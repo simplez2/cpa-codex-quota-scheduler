@@ -368,6 +368,8 @@ func (s *schedulerRuntimeState) adqInputForChoiceLocked(choice serialCandidate, 
 		Sticky:                false,
 		AbsoluteCapacityKnown: fullyObserved,
 		CapacitySource:        capacitySource,
+		PhaseAnchor:           s.fiveHourPhases[id].ActiveResetAt,
+		PhaseAnchorMode:       s.fiveHourPhases[id].AnchorMode,
 	}, true
 }
 
@@ -397,21 +399,28 @@ func (s *schedulerRuntimeState) adqFilterChoicesLocked(choices []serialCandidate
 }
 
 func (s *schedulerRuntimeState) adqRouteChoicesLocked(req pluginapi.SchedulerPickRequest, choices []serialCandidate, cost float64, now time.Time, sessionKey, stickyAuthID string) (string, adqReservation, bool) {
+	id, reservation, ok, _ := s.adqRouteChoicesWithAllocationLocked(req, choices, cost, now, sessionKey, stickyAuthID, false)
+	return id, reservation, ok
+}
+
+// handled distinguishes unavailable telemetry (legacy fallback) from an ADQ
+// admission failure. A hard rejection must never fall through unreserved.
+func (s *schedulerRuntimeState) adqRouteChoicesWithAllocationLocked(req pluginapi.SchedulerPickRequest, choices []serialCandidate, cost float64, now time.Time, sessionKey, stickyAuthID string, balanced bool) (string, adqReservation, bool, bool) {
 	if len(choices) == 0 || s.adqReservations == nil {
-		return "", adqReservation{}, false
+		return "", adqReservation{}, false, false
 	}
 	policy := s.adqPolicyLocked()
 	excluded := make(map[string]bool)
 	for len(excluded) < len(choices) {
 		available := s.adqFilterChoicesLocked(choices, excluded)
 		if len(available) == 0 {
-			return "", adqReservation{}, false
+			return "", adqReservation{}, false, true
 		}
 		inputs := make([]adqAccountInput, 0, len(available))
 		for _, choice := range available {
 			input, ok := s.adqInputForChoiceLocked(choice, now)
 			if !ok {
-				return "", adqReservation{}, false
+				return "", adqReservation{}, false, false
 			}
 			input.Sticky = false
 			inputs = append(inputs, input)
@@ -441,9 +450,14 @@ func (s *schedulerRuntimeState) adqRouteChoicesLocked(req pluginapi.SchedulerPic
 			weekLimit := maxADQ(0, input.WeeklyRemaining-input.PendingWeekly-input.WeeklyCapacity*adqWeeklySafety(policy))
 			s.adqReservations.SetCapacity(input.ID, fiveLimit, weekLimit)
 		}
-		decision, ok := adqChooseWithDebit(inputs, 0, cost, policy, now)
+		var allocation map[string]adqAllocationScore
+		var weights map[string]float64
+		if balanced {
+			allocation, weights = s.balancedADQAllocationLocked(available, inputs, cost, now, policy)
+		}
+		decision, ok := adqChooseWithAllocation(inputs, 0, cost, policy, now, allocation)
 		if !ok {
-			return "", adqReservation{}, false
+			return "", adqReservation{}, false, true
 		}
 		reservation, ok := s.adqReservations.TryReserve(adqReservationRequest{
 			AuthID: decision.AuthID, SessionKey: session, Model: req.Model,
@@ -464,10 +478,19 @@ func (s *schedulerRuntimeState) adqRouteChoicesLocked(req pluginapi.SchedulerPic
 					break
 				}
 			}
-			return selectedID, reservation, true
+			if balanced {
+				for i, input := range inputs {
+					if score, found := allocation[input.ID]; found {
+						if account := s.balancedAccounts[available[i].Candidate.ID]; account != nil {
+							account.Credit, account.Weight = score.Credit, weights[input.ID]
+						}
+					}
+				}
+			}
+			return selectedID, reservation, true, true
 		}
 		excluded[decision.AuthID] = true
 		s.adqReservationCollisions++
 	}
-	return "", adqReservation{}, false
+	return "", adqReservation{}, false, true
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -209,5 +210,178 @@ func TestBalancedModeIsAcceptedByPanelValidation(t *testing.T) {
 	changes, errors := validatePanelSettings(nil, map[string]any{"scheduler_mode": "balanced"})
 	if len(errors) != 0 || changes["scheduler_mode"] != "balanced" {
 		t.Fatalf("%v %v", changes, errors)
+	}
+}
+
+func balancedAllocationFixture(now time.Time, adq bool) (*schedulerRuntimeState, pluginapi.SchedulerPickRequest) {
+	s, req := balancedFixture(now)
+	s.cfg.ReserveWeeklyPercent = 0
+	s.quotas["a"].Windows[1].UsedPercent = 60
+	s.quotas["a"].Windows[1].ResetAt = now.Add(24 * time.Hour)
+	s.quotas["b"].Windows[1].ResetAt = now.Add(7 * 24 * time.Hour)
+	if adq {
+		s.adqReservations = newADQReservationBook()
+		s.adqPolicy = defaultADQPolicy()
+		s.adqPolicy.WeeklySafetyMargin = 0
+		s.adqPolicy.QuotaSafetyMargin = 0
+	}
+	return s, req
+}
+
+func TestBalancedWeeklyAllocationPoliciesApplyToADQAndFallback(t *testing.T) {
+	resetBanStoreForTest()
+	defer resetBanStoreForTest()
+	for _, adq := range []bool{false, true} {
+		for _, policy := range []string{"sustainable", "weekly_remaining"} {
+			t.Run(fmt.Sprintf("adq=%t/%s", adq, policy), func(t *testing.T) {
+				now := time.Now().UTC()
+				s, req := balancedAllocationFixture(now, adq)
+				s.cfg.SerialAllocationPolicy = policy
+				const rounds = 270
+				for i := 0; i < rounds; i++ {
+					at := now.Add(time.Duration(i) * time.Millisecond)
+					pick := s.balancedPick(withBalancedSession(req, fmt.Sprintf("allocation-%d", i)), at)
+					if !pick.Handled {
+						t.Fatalf("round %d was not admitted", i)
+					}
+					// Release the isolated fake work; keep unchanged observed quotas
+					// so the configured distribution is independently measurable.
+					s.observeBalancedUsage(pluginapi.UsageRecord{AuthID: pick.AuthID, AuthIndex: pick.AuthID, Model: req.Model, RequestedAt: at, Failed: true}, at.Add(time.Microsecond))
+				}
+				wantA := 210.0 // 40/1 : 80/7 = 7:2
+				if policy == "weekly_remaining" {
+					wantA = 90 // 40 : 80 = 1:2
+				}
+				if got := s.balancedAccounts["a"].Picks; math.Abs(float64(got)-wantA) > 1 {
+					t.Fatalf("wrong distribution: a=%d b=%d want a=%.0f", got, s.balancedAccounts["b"].Picks, wantA)
+				}
+				if adq && s.adqDecisions != rounds {
+					t.Fatalf("ADQ path was bypassed: decisions=%d", s.adqDecisions)
+				}
+			})
+		}
+	}
+}
+
+func TestBalancedWeeklyPolicyChangePreservesExistingSession(t *testing.T) {
+	resetBanStoreForTest()
+	defer resetBanStoreForTest()
+	for _, adq := range []bool{false, true} {
+		t.Run(fmt.Sprintf("adq=%t", adq), func(t *testing.T) {
+			now := time.Now().UTC()
+			s, req := balancedAllocationFixture(now, adq)
+			s.cfg.SerialAllocationPolicy = "sustainable"
+			existing := withBalancedSession(req, "existing-session")
+			first := s.balancedPick(existing, now)
+			if first.AuthID != "a" {
+				t.Fatalf("daily-budget first choice: %+v", first)
+			}
+			s.observeBalancedUsage(pluginapi.UsageRecord{AuthID: first.AuthID, AuthIndex: first.AuthID, Model: req.Model, RequestedAt: now, Failed: true}, now.Add(time.Microsecond))
+			s.cfg.SerialAllocationPolicy = "weekly_remaining"
+			freshAt := now.Add(time.Millisecond)
+			fresh := s.balancedPick(withBalancedSession(req, "fresh-session"), now.Add(time.Millisecond))
+			if fresh.AuthID != "b" {
+				t.Fatalf("new policy did not affect fresh session: %+v", fresh)
+			}
+			s.observeBalancedUsage(pluginapi.UsageRecord{AuthID: fresh.AuthID, AuthIndex: fresh.AuthID, Model: req.Model, RequestedAt: freshAt, Failed: true}, freshAt.Add(time.Microsecond))
+			for i := 2; i < 8; i++ {
+				at := now.Add(time.Duration(i) * time.Millisecond)
+				next := s.balancedPick(existing, at)
+				if next.AuthID != first.AuthID {
+					t.Fatalf("policy change moved live session: %+v", next)
+				}
+				s.observeBalancedUsage(pluginapi.UsageRecord{AuthID: next.AuthID, AuthIndex: next.AuthID, Model: req.Model, RequestedAt: at, Failed: true}, at.Add(time.Microsecond))
+			}
+		})
+	}
+}
+
+func TestBalancedADQRejectionDoesNotMintCreditOrBypassReservations(t *testing.T) {
+	resetBanStoreForTest()
+	defer resetBanStoreForTest()
+	now := time.Now().UTC()
+	s, req := balancedAllocationFixture(now, true)
+	for _, id := range []string{"a", "b"} {
+		s.quotas[id].Windows[0].UsedPercent = 99.9999
+	}
+	for i := 0; i < 5; i++ {
+		if pick := s.balancedPick(req, now.Add(time.Duration(i)*time.Millisecond)); pick.Handled {
+			t.Fatalf("reservation failure used unreserved fallback: %+v", pick)
+		}
+	}
+	for id, account := range s.balancedAccounts {
+		if account.Credit != 0 || account.Picks != 0 || len(account.Pending) != 0 {
+			t.Fatalf("rejected work changed allocation for %s: %+v", id, account)
+		}
+	}
+	if s.adqReservationCollisions == 0 {
+		t.Fatal("test never reached the reservation gate")
+	}
+}
+
+func TestBalancedADQWeightsAccountForReservationsAndSettling(t *testing.T) {
+	now := time.Now().UTC()
+	s, req := balancedAllocationFixture(now, true)
+	s.cfg.SerialAllocationPolicy = "weekly_remaining"
+	// Equal percentages/reset anchors: only local unsettled work differs.
+	s.quotas["a"] = quotaSnapshot{AuthID: "a", AuthIndex: "a", RefreshedAt: now, Windows: append([]quotaWindow(nil), s.quotas["b"].Windows...)}
+	choices := []serialCandidate{}
+	inputs := []adqAccountInput{}
+	for _, candidate := range req.Candidates {
+		choice := inspectSerialCandidate(candidate, s.quotas[candidate.ID], true, s.cfg, now)
+		input, ok := s.adqInputForChoiceLocked(choice, now)
+		if !ok {
+			t.Fatal("missing ADQ input")
+		}
+		choices = append(choices, choice)
+		inputs = append(inputs, input)
+	}
+	inputs[0].ReservationFiveHour = 1
+	inputs[0].SettlingWeekly = 5
+	_, weights := s.balancedADQAllocationLocked(choices, inputs, 1, now, s.adqPolicyLocked())
+	if weights["a"] >= weights["b"] {
+		t.Fatalf("local debt ignored: %v", weights)
+	}
+}
+
+func TestBalancedMinuteBudgetDistinguishesResetsWithinSixHours(t *testing.T) {
+	resetBanStoreForTest()
+	defer resetBanStoreForTest()
+	for _, adq := range []bool{false, true} {
+		for _, tc := range []struct{ policy, want string }{{"sustainable", "a"}, {"weekly_remaining", "b"}} {
+			t.Run(fmt.Sprintf("adq=%t/policy=%s", adq, tc.policy), func(t *testing.T) {
+				now := time.Now().UTC()
+				s, req := balancedAllocationFixture(now, adq)
+				s.cfg.SerialAllocationPolicy = tc.policy
+				s.quotas["a"].Windows[1].ResetAt = now.Add(30 * time.Minute)
+				s.quotas["b"].Windows[1].ResetAt = now.Add(2 * time.Hour)
+				if pick := s.balancedPick(withBalancedSession(req, "minute-budget"), now); pick.AuthID != tc.want {
+					t.Fatalf("minute horizon ignored: policy=%s pick=%+v want=%s", tc.policy, pick, tc.want)
+				}
+			})
+		}
+	}
+}
+
+func TestBalancedResetClockPromotesCredentialWithoutNewQuotaReading(t *testing.T) {
+	resetBanStoreForTest()
+	defer resetBanStoreForTest()
+	for _, adq := range []bool{false, true} {
+		for _, tc := range []struct {
+			elapsed time.Duration
+			want    string
+		}{{0, "b"}, {40 * time.Minute, "a"}} {
+			t.Run(fmt.Sprintf("adq=%t/elapsed=%v", adq, tc.elapsed), func(t *testing.T) {
+				now := time.Now().UTC()
+				s, req := balancedAllocationFixture(now, adq)
+				s.cfg.SerialAllocationPolicy = "sustainable"
+				s.cfg.StaleAfter = 2 * time.Hour
+				s.quotas["a"].Windows[1].ResetAt = now.Add(45 * time.Minute)
+				s.quotas["b"].Windows[1].ResetAt = now.Add(time.Hour)
+				if pick := s.balancedPick(withBalancedSession(req, "minute-clock"), now.Add(tc.elapsed)); pick.AuthID != tc.want {
+					t.Fatalf("cached reset clock did not change priority: elapsed=%v pick=%+v want=%s", tc.elapsed, pick, tc.want)
+				}
+			})
+		}
 	}
 }

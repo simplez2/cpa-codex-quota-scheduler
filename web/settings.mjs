@@ -2,25 +2,26 @@ const plans = [['team_standard','Team Standard · 1×'],['plus','Plus · 1×'],[
 const handoff = [['threshold_only','达到使用阈值'],['reserve_aware','保留安全余量']];
 // Metadata is presentation only. Defaults and validation come from the running
 // plugin so an omitted YAML field is never silently saved as zero or empty.
+export const weeklyAllocationLabel = policy => policy === 'weekly_remaining' ? '按周剩余比例' : '按距重置时间的日均预算';
 export const fields = [
+  ['scheduler_mode','调度模式','allocation','select','已有会话优先保留原凭据，续聊、工具调用与并发请求保持绑定；达到设定阈值或凭据不可用时才换号。新会话按周额度策略和5h重置时间重新选择。串行选优先凭据，均衡并发按权重分配新会话。', [['balanced','均衡并发（会话粘性）'],['serial','串行调配'],['legacy','传统调度'],['shadow','观察对比'],['enforce','动态节奏控制']]],
   ['account_concurrency_enabled','限制每凭据并发','allocation','boolean','默认开启。真实请求、重试和预热共用每个 CPA 凭据的槽位；长请求保留槽位直到 CPA 确认结束。保存后立即生效。'],
   ['account_max_concurrency','每凭据最大并发','allocation','number','1 至 64，默认 2。不同 CPA 凭据独立计数，即使属于同一个账号；调低上限不会中断已开始的请求。',1,64,1],
-  ['account_concurrency_wait','并发满时最长等待','allocation','duration','0 至 30 秒，默认 10 秒。同一会话等待原凭据空位；新会话可分配给空闲凭据。全池满载时排队，超时返回明确的忙碌状态。'],
-  ['scheduler_mode','调度模式','allocation','select','均衡并发按会话分配：新会话按余量、周预算及套餐容量选择账号；同一会话的续聊、工具调用和并发请求保持绑定。账号不可用时才切换。', [['balanced','均衡并发（会话粘性）'],['serial','串行调配'],['legacy','传统调度'],['shadow','观察对比'],['enforce','动态节奏控制']]],
-  ['serial_allocation_policy','串行模式的周额度分配方式','allocation','select','均衡并发始终按周日均预算分配。', [['sustainable','按距重置时间的日均预算'],['weekly_remaining','按周剩余比例']]],
+  ['account_concurrency_wait','并发满时最长等待','allocation','duration','0 至 30 秒，默认 10 秒。两种模式的已绑定会话均等待原凭据；新会话可使用符合额度条件的空闲凭据。超时返回 503；不会突破上限。'],
+  ['serial_allocation_policy','周额度分配方式','allocation','select','串行和均衡并发均生效。日均预算按各凭据周余量 ÷ 距重置分钟数 × 1440 计算，显示单位为 % / 天；调度保持分钟精度，不足一分钟按一分钟计算；剩余比例只按周余量分配。动态排名只影响新会话或达到切换条件的会话；串行和均衡的已有会话保持绑定优先。5h 在同一周优先级内优先临近重置。', [['sustainable','按距重置时间的日均预算'],['weekly_remaining','按周剩余比例']]],
   ['quota_default_plan','无法识别时的默认套餐','allocation','select','优先自动识别 CPA 返回的套餐；只有标签缺失、未知或缓存过期时使用此默认值。倍率是容量参考。',plans],
-  ['serial_budget_rebalance_percent','日均预算优势达到多少时换号','allocation','number','百分比；0 关闭主动再平衡。仍需两次独立额度确认。',0,100,1],
-  ['serial_weekly_rebalance_min_hold','主动换号前至少持有','allocation','duration','1 分钟至 24 小时。额度耗尽或 429 不受此等待限制。'],
+  ['serial_budget_rebalance_percent','无会话请求的预算再平衡阈值','allocation','number','仅影响未携带会话标识的串行请求；已有会话不会因为预算排名变化而换号。0 关闭主动再平衡，其他值仍需两次独立额度确认。',0,100,1],
+  ['serial_weekly_rebalance_min_hold','无会话请求再平衡前至少持有','allocation','duration','1 分钟至 24 小时。额度耗尽或 429 不受此等待限制。'],
   ['reserve_weekly_percent','周额度保留比例','allocation','number','百分比；仅在所有账号都进入保留区时才继续使用保留区。',0,99.9,.1],
   ['serial_5h_handoff_mode','5h 换号时机','allocation','select','“额度用尽再切换”不使用静态、预测或缓存年龄预留。',[['429_only','额度用尽 / 上游限额时切换（零预留）'],['custom_threshold','达到指定使用比例'],['reserve_aware','保留指定余量'],['inherit_global','沿用通用阈值']]],
   ['serial_5h_switch_percent','5h 已用比例阈值','allocation','number','仅“达到指定使用比例”模式生效。',.1,100,.1],
   ['reserve_5h_percent','5h 预留比例','allocation','number','零预留模式忽略此项；当前选择不会偷偷扣除余量。',0,99.9,.1],
   ['serial_prefer_active_cycle','优先使用已开始的周期','allocation','boolean','在符合额度条件的账号中优先考虑已开始计时的周期。'],
-  ['serial_soft_continuation','允许旧会话越过软阈值','allocation','boolean','关闭时，后续会话请求跟随新账号；已输出内容的请求不回放。'],
+  ['serial_soft_continuation','允许旧会话越过软阈值','allocation','boolean','默认关闭，达到设定阈值后该会话换号。开启时可继续使用原凭据直到真实不可用；其他会话的换号不迁移本会话，已输出内容的请求不回放。'],
   ['quota_account_plans','每个账号的套餐','allocation','plans','默认自动识别 Team Standard、Team Premium 和 Plus。手动覆盖优先于自动识别，仅影响调度参考，不会更改订阅。'],
   ['quota_probe_on_demand','按需探测额度','allocation','boolean','默认开启。空闲时停止周期探测；新调用产生后按冷却间隔合并查询。初始化、已知周期重置和预热前校验只按事件触发。'],
   ['auth_expiry_auto_repair','自动恢复失效的认证过期标记','allocation','boolean','仅处理明确标记的长期令牌：连续两次原生额度认证成功且凭据未变化后恢复。保留 OAuth/JWT 过期限制；不增加生成或预热请求。'],
-  ['warmup_enabled','自动预热','warmup','boolean','开启后产生少量真实模型请求；已确认周期不重复预热。均衡模式在真实请求进行中及结束后的短暂间隔内暂缓预热。'],
+  ['warmup_enabled','自动预热','warmup','boolean','开启后产生少量真实模型请求；已确认周期不重复预热。周周期先启动；第二代起闲置5h预热按15分钟槽错开，真实请求无需等待。官方固定周期只错开消耗。均衡模式在真实请求进行中及结束后的短暂间隔内暂缓预热。'],
   ['warmup_model','预热模型','warmup','text','填写当前 CPA 支持的模型名称；不会更改客户端的默认模型。'],
   ['warmup_min_interval','两次预热至少间隔','warmup','duration','全局仅控制发送间隔，默认 1 分钟；预算与失败退避按账号独立。'],
   ['warmup_max_per_day','每账号滚动 24 小时最多预热','warmup','number','各账号独立计数，失败也计入本账号次数。',1,1000,1],
@@ -48,7 +49,7 @@ export const fields = [
   ['reserve_monthly_percent','月额度保留比例','expert','number','存在月额度窗口时使用。',0,99.9,.1],
   ['soft_limit_percent','动态调度软阈值','expert','number','已用百分比；主要用于非串行模式。',.1,100,.1],
   ['low_quota_percent','进入低余量区的比例','expert','number','剩余百分比；提升动态消耗估计分位。',.1,100,.1],
-  ['sticky_seconds','会话绑定空闲有效期','allocation','number','秒；默认 1500（25 分钟）。请求和完成时续期，生成中的会话不按空闲过期；0 关闭绑定。均衡模式不因其他账号额度更多而打断绑定。',0,864000,1],
+  ['sticky_seconds','会话绑定空闲有效期','allocation','number','秒；默认 1500（25 分钟）。请求和完成时续期，生成中的会话不按空闲过期；0 关闭绑定。串行和均衡均优先保持绑定，不因动态优先级变化切号；配置阈值和真实不可用仍触发换号。',0,864000,1],
   ['switch_confirmations','动态候选连续获胜次数','expert','number','主要用于非串行会话绑定切换。',1,100,1],
   ['cost_sample_limit','保留的请求成本样本数','expert','number','动态节奏评估的内存样本上限。',32,100000,1],
   ['decision_history_limit','保留的调度决策条数','expert','number','只保留脱敏后的决策记录。',1,10000,1],
@@ -85,7 +86,7 @@ export function createSettingsEditor({api,notify,onSaved,onView}) {
       if(control)for(const input of control.closest('.setting-field').querySelectorAll('input,select'))input.disabled=!draft.account_concurrency_enabled;
     }
     const mode=draft.serial_5h_handoff_mode;
-    for(const name of ['serial_allocation_policy','serial_budget_rebalance_percent','serial_weekly_rebalance_min_hold','serial_prefer_active_cycle','serial_soft_continuation']) {
+    for(const name of ['serial_budget_rebalance_percent','serial_weekly_rebalance_min_hold','serial_prefer_active_cycle','serial_soft_continuation']) {
       const row=controls.get(name)?.closest('.setting-field');if(row)row.hidden=draft.scheduler_mode==='balanced';
     }
     for(const name of ['serial_5h_switch_percent','reserve_5h_percent']) {

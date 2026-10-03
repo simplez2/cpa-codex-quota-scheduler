@@ -47,7 +47,6 @@ func TestSerialBudgetRebalancesByFreshBudgetNotRawWeekly(t *testing.T) {
 	s.quotas["primary"].Windows[1].ResetAt = now.Add(24 * time.Hour)
 	s.quotas["backup"].Windows[1].ResetAt = now.Add(6 * 24 * time.Hour)
 	req := serialTestRequest()
-	req.Options.Headers = map[string][]string{"X-Session-ID": {"same-budget-session"}}
 	if got := s.serialPick(req, now); got.AuthID != "backup" {
 		t.Fatal("unconfirmed preemption")
 	}
@@ -104,8 +103,8 @@ func TestSerialBudgetPlaceholderAndMissingResetAreConservative(t *testing.T) {
 	q.Windows[1].UsedPercent = 60
 	q.Windows[1].ResetAt = now.Add(time.Second)
 	choice := inspectSerialCandidate(pluginapi.SchedulerAuthCandidate{ID: "primary"}, q, true, s.cfg, now)
-	if rate, _ := serialWeeklyBudget(choice, s.cfg, now); rate != 128 {
-		t.Fatalf("reset floor did not bound rate: %v", rate)
+	if rate, _ := serialWeeklyBudget(choice, s.cfg, now); rate != 32*weeklyBudgetMinutesPerDay {
+		t.Fatalf("one-minute reset floor did not bound rate: %v", rate)
 	}
 }
 
@@ -280,4 +279,82 @@ func TestWeeklyBudgetFullProviderPlaceholderStillUsesWeek(t *testing.T) {
 	if _, known := serialWeeklyBudget(choice, s.cfg, now); known {
 		t.Fatal("expired reset used as budget horizon")
 	}
+}
+
+func TestWeeklyBudgetMinutePrecisionAndOwnQuota(t *testing.T) {
+	now := time.Date(2026, 10, 3, 9, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name    string
+		horizon time.Duration
+		minutes float64
+	}{
+		{"hours_minutes_seconds", 13*time.Hour + 17*time.Minute + 7*time.Second, 797 + 7.0/60},
+		{"under_six_hours", 59*time.Minute + 30*time.Second, 59.5},
+		{"one_and_half_minutes", 90 * time.Second, 1.5},
+		{"one_minute", time.Minute, 1},
+		{"seconds_before_reset", 20 * time.Second, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newBudgetTestState(now)
+			s.cfg.ReserveWeeklyPercent = 0
+			s.cfg.QuotaAccountPlans = map[string]string{"primary": "pro_20x"}
+			q := s.quotas["primary"]
+			q.Windows[1] = quotaWindow{Class: "weekly", WindowSeconds: 604800, UsedPercent: 60, Allowed: true, ResetAt: now.Add(tc.horizon), ObservedAt: now, Source: quotaSourceProbe}
+			choice := inspectSerialCandidate(pluginapi.SchedulerAuthCandidate{ID: "primary"}, q, true, s.cfg, now)
+			rate, known := serialWeeklyBudgetPerMinute(choice, s.cfg, now)
+			want := 40 / tc.minutes
+			if !known || math.Abs(rate-want) > 1e-9 {
+				t.Fatalf("rate=%v known=%v want=%v", rate, known, want)
+			}
+			daily, dailyKnown := serialWeeklyBudget(choice, s.cfg, now)
+			if !dailyKnown || math.Abs(daily-rate*weeklyBudgetMinutesPerDay) > 1e-9 {
+				t.Fatalf("legacy daily rate diverged: %v %v", daily, rate)
+			}
+		})
+	}
+}
+
+func TestWeeklyBudgetMinuteClockProgressAndExpiredReset(t *testing.T) {
+	now := time.Date(2026, 10, 3, 9, 0, 0, 0, time.UTC)
+	s := newBudgetTestState(now)
+	s.cfg.ReserveWeeklyPercent = 0
+	q := s.quotas["primary"]
+	q.Windows[1] = quotaWindow{Class: "weekly", WindowSeconds: 604800, UsedPercent: 60, Allowed: true, ResetAt: now.Add(31 * time.Minute), ObservedAt: now, Source: quotaSourceProbe}
+	choice := inspectSerialCandidate(pluginapi.SchedulerAuthCandidate{ID: "primary"}, q, true, s.cfg, now)
+	for _, elapsed := range []time.Duration{0, time.Minute} {
+		rate, known := serialWeeklyBudgetPerMinute(choice, s.cfg, now.Add(elapsed))
+		want := 40 / (31 - elapsed.Minutes())
+		if !known || math.Abs(rate-want) > 1e-9 {
+			t.Fatalf("elapsed=%v rate=%v known=%v want=%v", elapsed, rate, known, want)
+		}
+	}
+	if _, known := serialWeeklyBudgetPerMinute(choice, s.cfg, now.Add(31*time.Minute)); known {
+		t.Fatal("expired cycle still has a usable minute budget")
+	}
+}
+
+func TestWeeklyBudgetStatusPublishesOwnMinuteRateAndCompatibleDailyRate(t *testing.T) {
+	now := time.Now().UTC()
+	s := newBudgetTestState(now)
+	s.cfg.ReserveWeeklyPercent = 0
+	s.cfg.QuotaAccountPlans = map[string]string{"primary": "pro_20x"}
+	s.quotas["primary"].Windows[1] = quotaWindow{Class: "weekly", WindowSeconds: 604800, UsedPercent: 60, Allowed: true, ResetAt: now.Add(31 * time.Minute), ObservedAt: now, Source: quotaSourceProbe}
+	before := time.Now()
+	report := s.status()
+	after := time.Now()
+	for _, account := range report.Snapshots {
+		if account.AuthID != "primary" {
+			continue
+		}
+		low := 40 / now.Add(31*time.Minute).Sub(before).Minutes()
+		high := 40 / now.Add(31*time.Minute).Sub(after).Minutes()
+		if !account.WeeklyBudgetKnown || account.WeeklyBudgetPerMinute < low-1e-9 || account.WeeklyBudgetPerMinute > high+1e-9 {
+			t.Fatalf("minute status not based on own quota/time: %+v range=[%v,%v]", account, low, high)
+		}
+		if account.WeeklyBudgetPerDay != account.WeeklyBudgetPerMinute*weeklyBudgetMinutesPerDay {
+			t.Fatal("daily compatibility field diverged from minute rate")
+		}
+		return
+	}
+	t.Fatal("primary credential missing from runtime status")
 }

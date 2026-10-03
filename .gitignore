@@ -22,3 +22,15 @@ Thumbs.db
 research/concurrency-v0311/
 
 .playwright-cli/
+
+research/concurrency-v0312/
+output/playwright/
+research/minute-v0313/
+
+research/affinity-v0314/
+
+research/daily-v0315/
+
+research/lifecycle-v0316/
+
+research/lifecycle-v0317/

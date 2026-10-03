@@ -55,12 +55,11 @@ func TestSerialWeeklyColdStartPrioritizesWeeklyCapacity(t *testing.T) {
 	}
 }
 
-func TestSerialWeeklyRequiresIndependentObservationsAndRebindsSessions(t *testing.T) {
+func TestSerialWeeklyUnkeyedPoolRequiresIndependentObservations(t *testing.T) {
 	resetBanStoreForTest()
 	now := time.Now()
 	state := newWeeklyBalanceTestState(now)
 	req := serialTestRequest()
-	req.Options.Headers = map[string][]string{"X-Session-ID": {"weekly-balance-session"}}
 	state.serialOverdraft = map[string]serialOverdraftBinding{"other-session": {AuthID: "primary", LastUsedAt: now}}
 	if got := state.serialPick(req, now); got.AuthID != "primary" {
 		t.Fatalf("switched without confirmation: %#v", got)
@@ -306,10 +305,11 @@ func TestSerialWeeklyRebalanceConfig(t *testing.T) {
 	}
 }
 
-func TestSerialWeeklyBalancesEightHoursOfDemandAcrossPool(t *testing.T) {
+func TestSerialStickyUsesEightHoursAcrossPoolWithThresholdHandoffs(t *testing.T) {
 	resetBanStoreForTest()
 	now := time.Now()
 	s := newWeeklyBalanceTestState(now)
+	s.cfg.Serial5hHandoffMode, s.cfg.Serial5hSwitchPercent = "custom_threshold", 98
 	s.serialActiveAuthID = ""
 	s.serialSelectedAt = time.Time{}
 	req := serialTestRequest()
@@ -324,7 +324,7 @@ func TestSerialWeeklyBalancesEightHoursOfDemandAcrossPool(t *testing.T) {
 		}}
 	}
 	uses := make(map[string]int)
-	weeklySwitches := 0
+	thresholdSwitches := 0
 	for tick := 0; tick < 240; tick++ {
 		at := now.Add(time.Duration(tick) * 2 * time.Minute)
 		for _, candidate := range req.Candidates {
@@ -341,8 +341,8 @@ func TestSerialWeeklyBalancesEightHoursOfDemandAcrossPool(t *testing.T) {
 		if !picked.Handled {
 			t.Fatalf("pool unavailable at tick %d", tick)
 		}
-		if s.serialSwitches > before && s.serialLastSwitchReason == "weekly_rebalance" {
-			weeklySwitches++
+		if s.serialSwitches > before && s.serialLastSwitchReason == "serial_threshold" {
+			thresholdSwitches++
 		}
 		q := s.quotas[picked.AuthID]
 		q.Windows[0].UsedPercent += 1.5
@@ -366,10 +366,10 @@ func TestSerialWeeklyBalancesEightHoursOfDemandAcrossPool(t *testing.T) {
 			max = remaining
 		}
 	}
-	if max-min > s.cfg.SerialWeeklyRebalancePercent+2 || weeklySwitches < 4 {
-		t.Fatalf("pool not balanced: min=%v max=%v weekly_switches=%d", min, max, weeklySwitches)
+	if max-min > s.cfg.SerialWeeklyRebalancePercent+2 || thresholdSwitches < 3 {
+		t.Fatalf("pool not balanced: min=%v max=%v threshold_switches=%d", min, max, thresholdSwitches)
 	}
-	t.Logf("8h simulation: requests=%v weekly_remaining_range=%.1f..%.1f weekly_switches=%d", uses, min, max, weeklySwitches)
+	t.Logf("8h simulation: requests=%v weekly_remaining_range=%.1f..%.1f threshold_switches=%d", uses, min, max, thresholdSwitches)
 }
 
 func TestSerialWeeklyCycleChangeAndChallengerChangeRestartEvidence(t *testing.T) {

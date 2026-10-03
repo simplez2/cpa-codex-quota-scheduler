@@ -434,6 +434,7 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 			snapshot = mergePartialQuotaSnapshot(s.quotas[id], snapshot, time.Now(), cfg.StaleAfter)
 			s.quotas[id] = snapshot
 			s.quotas[auth.AuthIndex] = snapshot
+			s.observeFiveHourPhaseLocked(snapshot, time.Now())
 			s.updateCalibrationsLocked(map[string]quotaSnapshot{id: snapshot}, now)
 			epochTransition = s.observeQuotaEpochProbeLocked(id, previousSnapshot, snapshot, inventory, time.Now())
 			settlementSnapshot = snapshot
