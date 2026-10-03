@@ -395,6 +395,12 @@ func (s *schedulerRuntimeState) adqProviderCircuitActiveLockedForConcurrency(can
 // Selection and slot admission share selectionMu with synthetic warmup. No
 // network call or waiting holds it. Busy sticky conversations stay bound.
 func (s *schedulerRuntimeState) schedulerPick(req pluginapi.SchedulerPickRequest) (pluginapi.SchedulerPickResponse, error) {
+	s.mu.RLock()
+	detached := s.detached
+	s.mu.RUnlock()
+	if detached {
+		return pluginapi.SchedulerPickResponse{Handled: false}, nil
+	}
 	if schedulerRequestGenerationDisabled(req) || len(req.Candidates) == 0 || !codexOnlySchedulerRequest(req) {
 		// Preserve CPA's native mixed-provider routing. If it selects Codex,
 		// after-auth admission uses CPA's selected_auth_id and the same ledger.
@@ -422,8 +428,12 @@ func (s *schedulerRuntimeState) schedulerPick(req pluginapi.SchedulerPickRequest
 		s.selectionMu.Lock()
 		s.mu.RLock()
 		cfg := s.cfg
-		stopping := s.stopping
+		detached := s.detached
 		s.mu.RUnlock()
+		if detached {
+			s.selectionMu.Unlock()
+			return pluginapi.SchedulerPickResponse{Handled: false}, nil
+		}
 		aliases := make(map[string][]string, len(req.Candidates))
 		for _, candidate := range req.Candidates {
 			aliases[candidate.ID] = s.concurrencyAliases(candidate)
@@ -440,7 +450,9 @@ func (s *schedulerRuntimeState) schedulerPick(req pluginapi.SchedulerPickRequest
 			deadline = request.QueueDeadline
 		}
 		enforce := cfg.Enabled && cfg.AccountConcurrencyEnabled && g.supported
-		if enforce && (request == nil || stopping) {
+		// Background workers can be quiescing during an in-place reconfigure.
+		// The native execution ledger remains valid and enforces the same cap.
+		if enforce && request == nil {
 			g.rejectLocked(request, "account_concurrency_unavailable", cfg)
 			g.mu.Unlock()
 			s.selectionMu.Unlock()
@@ -575,6 +587,16 @@ func concurrencyTermination(code, message string) pluginapi.RequestInterceptResp
 	return pluginapi.RequestInterceptResponse{Terminate: true, StatusCode: http.StatusServiceUnavailable, ResponseHeaders: http.Header{"Retry-After": []string{"1"}, "Content-Type": []string{"application/json"}}, ResponseBody: body, ClearHeaders: []string{concurrencyHeader}}
 }
 func (s *schedulerRuntimeState) concurrencyBefore(req pluginapi.RequestInterceptRequest) pluginapi.RequestInterceptResponse {
+	// Registration and native detachment are ordered under the same gate.
+	// A stale Before callback cannot install a token after shutdown completes.
+	s.selectionMu.Lock()
+	defer s.selectionMu.Unlock()
+	s.mu.RLock()
+	detached := s.detached
+	s.mu.RUnlock()
+	if detached {
+		return pluginapi.RequestInterceptResponse{}
+	}
 	token := s.concurrency.register(strings.TrimSpace(req.RequestID), time.Now())
 	response := pluginapi.RequestInterceptResponse{ClearHeaders: []string{concurrencyHeader}}
 	if token != "" {
@@ -603,7 +625,12 @@ func (s *schedulerRuntimeState) concurrencyAfter(req pluginapi.RequestInterceptR
 		aliases := s.concurrencyAliases(pluginapi.SchedulerAuthCandidate{ID: selectedID, Attributes: map[string]string{"auth_index": selectedIndex}})
 		s.mu.RLock()
 		cfg = s.cfg
+		detached := s.detached
 		s.mu.RUnlock()
+		if detached {
+			s.selectionMu.Unlock()
+			return pluginapi.RequestInterceptResponse{}
+		}
 		g := &s.concurrency
 		g.mu.Lock()
 		g.initLocked()

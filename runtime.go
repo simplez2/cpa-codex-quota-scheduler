@@ -88,6 +88,7 @@ type schedulerRuntimeState struct {
 	cancel                      context.CancelFunc
 	wg                          sync.WaitGroup
 	stopping                    bool
+	detached                    bool // Native shutdown has removed this generation from CPA.
 	warmupMu                    sync.Mutex
 	warmupRunning               bool
 	warmups                     map[string]warmupEntry
@@ -220,6 +221,7 @@ func configureSchedulerRuntime(raw []byte) {
 	schedulerRuntime.lastError = ""
 	schedulerRuntime.refreshes = 0
 	schedulerRuntime.stopping = false
+	schedulerRuntime.detached = false
 	schedulerRuntime.warmups = make(map[string]warmupEntry)
 	schedulerRuntime.warmupAttempts = nil
 	schedulerRuntime.warmupCandidatesLast = 0
@@ -291,6 +293,15 @@ func configureSchedulerRuntime(raw []byte) {
 func (s *schedulerRuntimeState) stop() {
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
+	// CPA can retain a selector/session-cache reference after removing the
+	// plugin's request hooks. Retired callbacks must pass control back to CPA
+	// while exact terminal events still drain this generation's old slots.
+	s.selectionMu.Lock()
+	s.mu.Lock()
+	s.detached = true
+	s.mu.Unlock()
+	s.selectionMu.Unlock()
+	s.concurrency.notify()
 	s.stopLocked()
 }
 
