@@ -39,6 +39,11 @@ func TestDemandPollingConsumesActivityOnceAndPreservesIdleCache(t *testing.T) {
 		t.Fatal("idle poll or fabricated freshness")
 	}
 	s.observeUsage(pluginapi.UsageRecord{Provider: "codex", Generate: true, AuthID: "a"})
+	// Windows can report the same clock tick for the previous probe and new
+	// usage. Make the collision deterministic instead of depending on timers.
+	poll := s.quotaPolls["a"]
+	poll.AttemptedAt = poll.LastUsageAt
+	s.quotaPolls["a"] = poll
 	makeDue()
 	s.refreshOnce(context.Background())
 	if calls != 2 {
@@ -171,7 +176,7 @@ func TestImmediateRecoveryProbeOverridesStandbyBackoff(t *testing.T) {
 	now := time.Now()
 	s := newRefreshTestState(t, "http://unused.test")
 	s.quotaPolls["a"] = quotaPollState{
-		AttemptedAt: now.Add(-time.Hour),
+		AttemptedAt: now,
 		NextAt:      now.Add(30 * time.Minute),
 		Failures:    2,
 		Error:       "quota_http_429",

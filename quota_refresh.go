@@ -19,12 +19,15 @@ import (
 // reset its backoff. It contains no upstream credentials.
 type quotaPollState struct {
 	LastUsageAt time.Time
-	Reason      string
-	AuthIndex   string
-	AttemptedAt time.Time
-	NextAt      time.Time
-	Failures    int
-	Error       string
+	// UsagePending records event order even when the clock reports the same
+	// timestamp for a probe and a later usage callback.
+	UsagePending bool
+	Reason       string
+	AuthIndex    string
+	AttemptedAt  time.Time
+	NextAt       time.Time
+	Failures     int
+	Error        string
 }
 
 const quotaRefreshRequestTimeout = 10 * time.Second
@@ -405,6 +408,7 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 		poll.Reason = reason
 		poll.AuthIndex = auth.AuthIndex
 		poll.AttemptedAt = now
+		poll.UsagePending = false
 		s.recordQuotaEpochProbeAttemptLocked(id, reason, now)
 		poll.NextAt = now.Add(interval)
 		// A reset timestamp schedules an observation; it never proves renewed quota.
@@ -443,6 +447,12 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 			s.mu.Lock()
 			current := s.quotaPolls[id]
 			if current.AuthIndex == auth.AuthIndex && current.AttemptedAt.Equal(now) && current.Error == previousPoll.Error && current.Failures == previousPoll.Failures {
+				// Cancellation cannot consume demand or erase an event which
+				// arrived while this HTTP request was in flight.
+				previousPoll.UsagePending = previousPoll.UsagePending || current.UsagePending
+				if current.LastUsageAt.After(previousPoll.LastUsageAt) {
+					previousPoll.LastUsageAt = current.LastUsageAt
+				}
 				// Preserve a guard extended by a concurrent response or recovery.
 				if current.NextAt.After(attemptNextAt) {
 					previousPoll.NextAt = current.NextAt

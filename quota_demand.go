@@ -23,6 +23,7 @@ func (s *schedulerRuntimeState) recordQuotaDemand(record pluginapi.UsageRecord, 
 	}
 	p := s.quotaPolls[id]
 	p.LastUsageAt = now
+	p.UsagePending = true
 	s.quotaPolls[id] = p
 }
 
@@ -97,6 +98,7 @@ func (s *schedulerRuntimeState) requestImmediateQuotaProbe(authID string, now ti
 	}
 	p := s.quotaPolls[authID]
 	p.LastUsageAt = now
+	p.UsagePending = true
 	p.NextAt = time.Time{}
 	s.quotaPolls[authID] = p
 }
@@ -130,7 +132,7 @@ func (s *schedulerRuntimeState) quotaProbeReason(id string, now time.Time) strin
 	if cfg.ContinuityEnabled && now.Before(continuityUntil) {
 		return "continuity"
 	}
-	if p.LastUsageAt.After(p.AttemptedAt) {
+	if p.UsagePending || p.LastUsageAt.After(p.AttemptedAt) {
 		return "usage"
 	}
 	if p.AttemptedAt.IsZero() || (q.RefreshedAt.IsZero() && p.Failures < 3) {

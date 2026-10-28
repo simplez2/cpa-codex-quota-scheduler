@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/simplez2/cpa-codex-quota-scheduler/cpasdk/pluginapi"
 )
 
 func quotaDeadlineInventory(w http.ResponseWriter, count int) {
@@ -100,6 +102,10 @@ func TestQuotaRefreshDeadlineCancellationStopsSlowRequest(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("quota request never started")
 	}
+	state.mu.RLock()
+	demandAt := state.quotaPolls["a"].AttemptedAt
+	state.mu.RUnlock()
+	state.recordQuotaDemand(pluginapi.UsageRecord{AuthID: "a"}, demandAt)
 	cancel()
 	select {
 	case <-done:
@@ -111,6 +117,9 @@ func TestQuotaRefreshDeadlineCancellationStopsSlowRequest(t *testing.T) {
 	}
 	if !state.quotas["a"].RefreshedAt.Equal(before.RefreshedAt) {
 		t.Fatal("cancellation advanced quota observation")
+	}
+	if !state.quotaPolls["a"].LastUsageAt.Equal(demandAt) || state.quotaProbeReason("a", demandAt) != "usage" {
+		t.Fatal("cancellation discarded usage recorded while the quota request was in flight")
 	}
 }
 
