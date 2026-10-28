@@ -12,7 +12,7 @@ GitHub CI 和 Release 工作流。
 ### SEC-001：管理清单请求会跟随重定向（中）
 
 - 规则：GO-HTTPCLIENT-001。
-- 位置：`warmup.go` 的 `cpaManagementAuthFiles`。
+- 位置：`warmup.go:1359` 的 `cpaManagementAuthFiles`。
 - 证据：原来的 `http.Client{Timeout: 15 * time.Second}` 使用默认重定向策略。
   两个不同端口、同主机的隔离 HTTP 服务复现了请求跳转；原实现返回成功，
   跳转目标收到一次携带管理凭证的请求。
@@ -26,7 +26,7 @@ GitHub CI 和 Release 工作流。
 
 - 位置：`README.md` 的 Dependencies、面板登录说明，以及 `SECURITY.md`。
 - 证据：README 曾声称插件从不读取 OAuth/PAT；实际上 `auth_expiry.go` 的
-  `readAuthExpiryDocument` 会调用 `host.auth.get`。默认开启的过期标记修复
+  `readAuthExpiryDocument`（`auth_expiry.go:63`）会调用 `host.auth.get`。默认开启的过期标记修复
   在严格校验后还会上传认证文件。面板也已支持默认勾选的 24 小时记住登录。
 - 修复：更正这些陈述，新增 `CPA_PERMISSIONS.md`，逐项列出 capability、
   管理 API、宿主回调、密钥、文件权限和浏览器存储要求。
