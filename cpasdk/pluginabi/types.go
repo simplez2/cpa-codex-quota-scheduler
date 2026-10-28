@@ -31,6 +31,8 @@ const (
 
 	// MethodSchedulerPick asks a scheduler plugin to select an auth candidate.
 	MethodSchedulerPick = "scheduler.pick"
+	// MethodSchedulerContinuity asks for a non-blocking pre-execution quota assessment.
+	MethodSchedulerContinuity = "scheduler.continuity"
 	// MethodModelRoute asks a router plugin to select a plugin executor for a matching request.
 	MethodModelRoute = "model.route"
 
@@ -63,21 +65,22 @@ const (
 	MethodManagementRegister = "management.register"
 	MethodManagementHandle   = "management.handle"
 
-	MethodHostHTTPDo             = "host.http.do"
-	MethodHostHTTPDoStream       = "host.http.do_stream"
-	MethodHostHTTPStreamRead     = "host.http.stream_read"
-	MethodHostHTTPStreamClose    = "host.http.stream_close"
-	MethodHostModelExecute       = "host.model.execute"
-	MethodHostModelExecuteStream = "host.model.execute_stream"
-	MethodHostModelStreamRead    = "host.model.stream_read"
-	MethodHostModelStreamClose   = "host.model.stream_close"
-	MethodHostStreamEmit         = "host.stream.emit"
-	MethodHostStreamClose        = "host.stream.close"
-	MethodHostLog                = "host.log"
-	MethodHostAuthList           = "host.auth.list"
-	MethodHostAuthGet            = "host.auth.get"
-	MethodHostAuthGetRuntime     = "host.auth.get_runtime"
-	MethodHostAuthSave           = "host.auth.save"
+	MethodHostHTTPDo               = "host.http.do"
+	MethodHostHTTPDoStream         = "host.http.do_stream"
+	MethodHostHTTPStreamRead       = "host.http.stream_read"
+	MethodHostHTTPStreamClose      = "host.http.stream_close"
+	MethodHostModelExecute         = "host.model.execute"
+	MethodHostModelExecuteStream   = "host.model.execute_stream"
+	MethodHostModelStreamRead      = "host.model.stream_read"
+	MethodHostModelStreamClose     = "host.model.stream_close"
+	MethodHostStreamEmit           = "host.stream.emit"
+	MethodHostStreamClose          = "host.stream.close"
+	MethodHostLog                  = "host.log"
+	MethodHostAuthList             = "host.auth.list"
+	MethodHostAuthGet              = "host.auth.get"
+	MethodHostAuthGetRuntime       = "host.auth.get_runtime"
+	MethodHostAuthSave             = "host.auth.save"
+	MethodHostRoutingResetCooldown = "host.routing.reset_cooldown"
 )
 
 type Envelope struct {

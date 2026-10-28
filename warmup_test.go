@@ -60,14 +60,14 @@ func TestUnstartedWarmupWindowRecognizesMissingAndPlaceholderReset(t *testing.T)
 	}
 }
 
-func TestWarmupWindowPrefersFiveHourOverWeekly(t *testing.T) {
+func TestWarmupWindowPrefersWeeklyBootstrapOverFiveHourPhase(t *testing.T) {
 	now := time.Now()
 	window, ok := unstartedWarmupWindow(quotaSnapshot{Windows: []quotaWindow{
 		{Class: "weekly", UsedPercent: 0, Allowed: true},
 		{Class: "5h", UsedPercent: 0, Allowed: true},
 	}}, now)
-	if !ok || window.Class != "5h" {
-		t.Fatalf("window = %#v, ok=%v; want 5h", window, ok)
+	if !ok || window.Class != "weekly" {
+		t.Fatalf("window = %#v, ok=%v; want weekly bootstrap", window, ok)
 	}
 }
 
@@ -138,32 +138,73 @@ func TestCPAAuthFilesEndpoint(t *testing.T) {
 	}
 }
 
-func TestWarmupEligibleAuthsRequiresActiveCPACredential(t *testing.T) {
+func TestWarmupEligibleAuthsIncludesRecoverableErrorCredential(t *testing.T) {
 	files := []cpaAuthFileEntry{
 		{ID: "imported", AuthIndex: "idx-imported", Provider: "codex", Status: "active", Note: "imported account"},
 		{ID: "gateway", AuthIndex: "idx-gateway", Provider: "codex", Status: "active", Note: "imported account"},
 		{ID: "native", AuthIndex: "idx-native", Provider: "codex", Status: "active", Note: "Official OAuth"},
+		{ID: "recoverable", AuthIndex: "idx-recoverable", Provider: "codex", Status: "error", Unavailable: true, Note: "historical 429"},
 		{ID: "disabled", AuthIndex: "idx-disabled", Provider: "codex", Status: "disabled", Disabled: true, Note: "imported account"},
 		{ID: "third-party", AuthIndex: "idx-third", Provider: "openai", Status: "active", Note: "unrelated note"},
 	}
 	got := warmupEligibleAuths(files)
 	wantBindings := map[string]warmupAuthBinding{
-		"imported":     {AuthID: "imported", AuthIndex: "idx-imported"},
-		"idx-imported": {AuthID: "imported", AuthIndex: "idx-imported"},
-		"gateway":      {AuthID: "gateway", AuthIndex: "idx-gateway"},
-		"idx-gateway":  {AuthID: "gateway", AuthIndex: "idx-gateway"},
-		"native":       {AuthID: "native", AuthIndex: "idx-native"},
-		"idx-native":   {AuthID: "native", AuthIndex: "idx-native"},
+		"imported":        {AuthID: "imported", AuthIndex: "idx-imported"},
+		"idx-imported":    {AuthID: "imported", AuthIndex: "idx-imported"},
+		"gateway":         {AuthID: "gateway", AuthIndex: "idx-gateway"},
+		"idx-gateway":     {AuthID: "gateway", AuthIndex: "idx-gateway"},
+		"native":          {AuthID: "native", AuthIndex: "idx-native"},
+		"idx-native":      {AuthID: "native", AuthIndex: "idx-native"},
+		"recoverable":     {AuthID: "recoverable", AuthIndex: "idx-recoverable"},
+		"idx-recoverable": {AuthID: "recoverable", AuthIndex: "idx-recoverable"},
 	}
 	for key, want := range wantBindings {
 		if binding, ok := got[key]; !ok || binding != want {
-			t.Fatalf("active CPA binding for %q = %#v, ok=%v want %#v", key, binding, ok, want)
+			t.Fatalf("recoverable CPA binding for %q = %#v, ok=%v want %#v", key, binding, ok, want)
 		}
 	}
 	for _, key := range []string{"disabled", "idx-disabled", "third-party", "idx-third"} {
 		if _, ok := got[key]; ok {
 			t.Fatalf("%q must not be warmup eligible", key)
 		}
+	}
+}
+
+func TestStrictCPAAuthEligibilityStillRejectsHistoricalError(t *testing.T) {
+	files := []cpaAuthFileEntry{
+		{ID: "active", AuthIndex: "idx-active", Provider: "codex", Status: "active"},
+		{ID: "error", AuthIndex: "idx-error", Provider: "codex", Status: "error"},
+		{ID: "unavailable", AuthIndex: "idx-unavailable", Provider: "codex", Unavailable: true},
+	}
+	got, _ := eligibleCPACodexAuthsWithStats(files)
+	if len(got) != 2 || got["active"].AuthID != "active" || got["idx-active"].AuthID != "active" {
+		t.Fatalf("strict eligibility = %#v; want only the active credential", got)
+	}
+}
+
+func TestRecoverableErrorCredentialReachesFreshWarmupCandidate(t *testing.T) {
+	resetBanStoreForTest()
+	defer resetBanStoreForTest()
+	now := time.Now().UTC().Truncate(time.Second)
+	cfg := defaultPluginConfig()
+	cfg.StatePath = ""
+	state := schedulerRuntimeState{
+		cfg: cfg,
+		quotas: map[string]quotaSnapshot{
+			"recoverable": {
+				AuthID: "recoverable", AuthIndex: "idx-recoverable", RefreshedAt: now,
+				Windows: []quotaWindow{
+					{Class: "5h", WindowSeconds: 18000, UsedPercent: 0, Allowed: true, ResetAt: now.Add(5 * time.Hour), ObservedAt: now},
+					{Class: "weekly", WindowSeconds: 604800, UsedPercent: 0, Allowed: true, ResetAt: now.Add(7 * 24 * time.Hour), ObservedAt: now},
+				},
+			},
+		},
+		quotaPolls: map[string]quotaPollState{"recoverable": {AuthIndex: "idx-recoverable"}},
+	}
+	eligible := warmupEligibleAuths([]cpaAuthFileEntry{{ID: "recoverable", AuthIndex: "idx-recoverable", Provider: "codex", Status: "error", Unavailable: true}})
+	candidates := state.findWarmupCandidates(eligible, nil, now)
+	if len(candidates) != 1 || candidates[0].Snapshot.AuthID != "recoverable" {
+		t.Fatalf("recoverable warmup candidates = %#v", candidates)
 	}
 }
 
@@ -178,13 +219,12 @@ func TestWarmupEligibilityDiagnosticsExplainRejectedAuths(t *testing.T) {
 		{ID: "other", AuthIndex: "idx-other", Provider: "openai", Status: "active", Note: "unrelated note"},
 	}
 	eligible, stats := warmupEligibleAuthsWithStats(files)
-	if len(eligible) != 4 || stats.Seen != len(files) || stats.Eligible != 2 {
+	if len(eligible) != 6 || stats.Seen != len(files) || stats.Eligible != 3 {
 		t.Fatalf("eligible=%#v stats=%#v", eligible, stats)
 	}
 	wantRejected := map[string]int{
 		"disabled":           1,
 		"unavailable":        1,
-		"inactive_status":    1,
 		"missing_auth_index": 1,
 		"provider_mismatch":  1,
 	}

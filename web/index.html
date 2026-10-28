@@ -8,18 +8,21 @@
   <script type="module" src="./dashboard.mjs"></script>
 </head>
 <body>
+<div class="ambient-scene" aria-hidden="true"><div class="ambient-orbit"></div><div class="ambient-line"></div></div>
+<svg class="glass-filter-host" aria-hidden="true" width="0" height="0"><defs><filter id="quota-glass" x="0%" y="0%" width="100%" height="100%" color-interpolation-filters="sRGB"><feImage id="glass-map" x="0" y="0" width="100%" height="100%" preserveAspectRatio="none" result="map"/><feDisplacementMap in="SourceGraphic" in2="map" scale="-20" xChannelSelector="R" yChannelSelector="G"/></filter></defs></svg>
 <main class="dashboard">
   <header class="page-header">
-    <div><div class="eyebrow">CODEX <span>v{{VERSION}}</span></div><h1>额度调度</h1><p>查看余量、安排调配、管理预热，都在这里完成。</p></div>
-    <div class="toolbar"><span id="connection" role="status">正在连接</span><button id="refresh" type="button">刷新</button></div>
+    <div class="brand"><div class="eyebrow"><span class="brand-mark" aria-hidden="true">C<span>/</span>Q</span> CODEX CONTROL <span class="version">v{{VERSION}}</span></div><h1>额度<span class="title-outline">调度</span><span class="title-dot" aria-hidden="true">.</span></h1><p>看清每一份余量，让每一次调用从容有序。</p></div>
+    <div class="header-controls"><span id="connection" role="status">正在连接</span><div class="toolbar"><button id="theme-toggle" class="icon-button" type="button" aria-label="切换配色" title="切换配色"><svg data-theme-icon="sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.5 1.5m11 11L19 19M5 19l1.5-1.5m11-11L19 5"/></svg><svg data-theme-icon="moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/></svg></button><button id="refresh" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5M6 7a7 7 0 0 1 11-1l3 3M4 15l3 3a7 7 0 0 0 11-1"/></svg><span>刷新状态</span></button></div><span class="header-caption">YOUR POOL. IN SYNC.</span></div>
   </header>
   <div id="notice" class="notice" role="alert" hidden></div>
   <div id="feedback" class="feedback" role="status" hidden></div>
   <form id="login" class="login" hidden>
-    <h2>连接当前 CPA</h2>
-    <p>未找到此 CPA 的已保存登录信息。输入管理密钥后查看额度，密钥仅用于本次页面。</p>
+    <div class="section-label">01 / CONNECT</div><h2>连接你的账号池<span class="title-dot">.</span></h2>
+    <p>输入管理密钥连接当前 CPA，可选择保持 24 小时登录。</p>
     <label for="management-key">管理密钥</label>
     <div class="login-input"><input id="management-key" type="password" autocomplete="off" required maxlength="4096"><button type="submit">连接</button></div>
+    <label class="auto-refresh remember-login"><input id="remember-login" type="checkbox" checked>保持登录 24 小时 · 仅当前 CPA</label>
   </form>
   <div id="content" hidden>
     <nav class="view-nav" aria-label="额度调度功能">
@@ -29,23 +32,52 @@
       <button type="button" data-view="advanced" aria-pressed="false">连接与高级</button>
     </nav>
     <div id="view-overview" data-panel>
+    <div class="command-grid">
     <section class="overview" aria-label="当前调度">
       <div class="primary"><div class="section-label">当前账号 <span id="selection-mode" class="badge"></span></div><h2 id="active-account">等待选择</h2><p id="active-detail"></p><button id="auto-select" class="runtime-action subtle" type="button" hidden>恢复自动调配</button></div>
       <dl class="metrics"><div><dt>可用账号</dt><dd id="eligible-count">—</dd></div><div><dt>已切换</dt><dd id="switch-count">—</dd></div><div><dt>冷却中</dt><dd id="cooldown-count">—</dd></div></dl>
     </section>
+    <section class="pool-weekly-panel" aria-labelledby="pool-weekly-title">
+      <div class="section-header"><div><div class="section-label">WEEKLY RESERVE</div><h2 id="pool-weekly-title">全池周额度</h2></div><button id="edit-pool-weights" type="button">周换算 <span aria-hidden="true">↗</span></button></div>
+      <div class="pool-display"><div class="pool-weekly-readout"><span class="pool-caption">本周剩余</span><strong id="pool-weekly-percent">—</strong><span id="pool-weekly-used">等待额度</span></div><div class="quota-lens" aria-hidden="true"><div class="lens-core"><span>WEEKLY</span><span>RESERVE</span></div><svg viewBox="0 0 220 220"><circle class="lens-track" cx="110" cy="110" r="94"/><circle id="pool-lens-ring" class="lens-fill" cx="110" cy="110" r="94" pathLength="100" stroke-dasharray="0 100"/><circle class="lens-inner" cx="110" cy="110" r="73"/></svg><span class="lens-dot"></span></div></div>
+      <div id="pool-weekly-progress" class="pool-weekly-progress" role="progressbar" aria-label="全账号池周额度剩余" aria-valuemin="0" aria-valuemax="100"><span id="pool-weekly-fill"></span></div>
+      <p id="pool-weekly-caption" class="pool-window-caption">各账号当前周窗口</p>
+      <dl class="pool-summary"><div><dt>已观测剩余</dt><dd id="pool-weekly-balance">—</dd></div><div><dt>折算总容量</dt><dd id="pool-weekly-total">—</dd></div><div><dt>额度覆盖率</dt><dd id="pool-weekly-coverage">—</dd></div><div><dt>最早重置</dt><dd id="pool-weekly-reset">等待确认</dd></div></dl>
+      <div class="pool-status"><span id="pool-weekly-quality" class="badge">等待观测</span><span id="pool-weekly-scope">全账号池</span></div>
+      <p id="pool-weekly-detail" class="subtext">等待账号池周额度快照。</p><details class="pool-method"><summary>周额度统计口径</summary><p class="muted">各账号周剩余按周换算容量加权。5h 耗尽或冷却仍保留其周余额；额度缺失时显示范围。各账号采用自身当前周窗口，并非统一自然周；重置时间显示最先到期的一个账号，不代表全池同时恢复。余额不等于当前可调用量。</p></details>
+    </section>
+    <section id="pool-five-hour-panel" class="pool-weekly-panel" aria-labelledby="pool-5h-title">
+      <div class="section-header"><div><div class="section-label">FIVE-HOUR RESERVE</div><h2 id="pool-5h-title">有上限账号 · 5h 额度</h2></div><button id="edit-pool-5h-weights" type="button">5h 换算 <span aria-hidden="true">↗</span></button></div>
+      <div class="pool-display"><div class="pool-weekly-readout"><span class="pool-caption">5h 剩余</span><strong id="pool-5h-percent">—</strong><span id="pool-5h-used">等待额度</span></div><div class="quota-lens" aria-hidden="true"><div class="lens-core"><span>5 HOURS</span><span>LIMITED POOL</span></div><svg viewBox="0 0 220 220"><circle class="lens-track" cx="110" cy="110" r="94"/><circle id="pool-5h-ring" class="lens-fill" cx="110" cy="110" r="94" pathLength="100" stroke-dasharray="0 100"/><circle class="lens-inner" cx="110" cy="110" r="73"/></svg><span class="lens-dot"></span></div></div>
+      <div id="pool-5h-progress" class="pool-weekly-progress" role="progressbar" aria-label="有 5h 限制账号的额度剩余" aria-valuemin="0" aria-valuemax="100"><span id="pool-5h-fill"></span></div>
+      <p id="pool-5h-caption" class="pool-window-caption">仅统计有 5h 限制的账号</p>
+      <dl class="pool-summary"><div><dt>已观测剩余</dt><dd id="pool-5h-balance">—</dd></div><div><dt>折算总容量</dt><dd id="pool-5h-total">—</dd></div><div><dt>额度覆盖率</dt><dd id="pool-5h-coverage">—</dd></div><div><dt>最早重置</dt><dd id="pool-5h-reset">等待确认</dd></div></dl>
+      <div class="pool-status"><span id="pool-5h-quality" class="badge">等待观测</span><span id="pool-5h-scope">等待账号范围</span></div>
+      <p id="pool-5h-detail" class="subtext">等待有 5h 限制账号的额度快照。</p><details class="pool-method"><summary>5h 额度统计口径</summary><p class="muted">仅有 5h 限制的账号按独立的 5h 换算容量加权。当前完整接口响应未返回 5h 限制或已手动排除的账号不进入分子、分母。数据缺失不会当作无限额；待确认账号单列，百分比仅代表已确认范围。重置后等新观测，不自动补成 100%；5h 与周额度不直接比较或取最小值。</p></details>
+    </section>
+    <section id="concurrency-panel" class="concurrency-panel" aria-labelledby="concurrency-title">
+      <div class="section-header"><div><div class="section-label">02 / LIVE TRAFFIC</div><h2 id="concurrency-title">等待调用</h2></div><span id="concurrency-health" class="badge">等待状态</span></div>
+      <div class="concurrency-readout"><div class="concurrency-now"><strong id="concurrency-active">—</strong><span>正在运行</span><small id="concurrency-capacity">等待凭据状态</small></div><dl class="concurrency-metrics"><div><dt>正在排队</dt><dd id="concurrency-waiting">—</dd></div><div><dt>可用空位</dt><dd id="concurrency-free">—</dd></div><div><dt>每凭据上限</dt><dd id="concurrency-limit">—</dd></div><div><dt>排队上限</dt><dd id="concurrency-wait">—</dd></div></dl></div>
+      <div class="concurrency-explanation"><p id="concurrency-description"></p><div class="toolbar"><button id="edit-scheduler" type="button">调整调度模式</button><button id="edit-concurrency" type="button">调整并发上限</button></div></div>
+      <p id="concurrency-queue-note" class="subtext"></p>
+      <details class="rejection-history"><summary>排队超时与拒绝记录 <span id="concurrency-rejected">0</span></summary><p class="muted">记录来自本次插件运行。历史拒绝不代表当前仍然满载，也不代表额度耗尽。</p><ul id="concurrency-events"></ul></details>
+    </section>
+    </div>
     <section class="accounts" aria-labelledby="accounts-title">
-      <div class="section-header"><div><h2 id="accounts-title">账号额度</h2><p id="updated-at">等待额度快照</p></div><div class="table-tools"><input id="search" type="search" aria-label="筛选账号" placeholder="筛选账号"><label class="auto-refresh"><input id="auto-refresh" type="checkbox" checked>每 15 秒更新</label></div></div>
-      <div class="table-scroll"><table><thead><tr><th scope="col">账号 / 状态</th><th scope="col">5h 剩余</th><th scope="col">周剩余</th><th scope="col">周日均预算<span class="help">各账号自身额度 % / 天</span></th><th scope="col">最近查询</th><th scope="col">操作</th></tr></thead><tbody id="accounts-body"></tbody></table></div>
+      <div class="section-header"><div><div class="section-label">03 / YOUR ACCOUNTS</div><h2 id="accounts-title">账号额度</h2><p id="updated-at">等待额度快照</p></div><div class="table-tools"><input id="search" type="search" aria-label="筛选账号" placeholder="搜索账号…"><label class="auto-refresh"><input id="auto-refresh" type="checkbox" checked>每 15 秒更新</label></div></div>
+      <div class="table-scroll"><table><thead><tr><th scope="col">账号 / 状态</th><th scope="col">5h 剩余</th><th scope="col">周剩余</th><th scope="col">周日均预算<span class="help">各凭据自身额度 % / 天</span></th><th scope="col">凭据并发<span class="help">真实在途 / 上限</span></th><th scope="col">最近查询</th><th scope="col">操作</th></tr></thead><tbody id="accounts-body"></tbody></table></div>
       <p id="empty" class="empty" hidden>尚无额度快照。请在“连接与高级”检查 CPA 管理连接，并确认认证文件已启用。</p>
     </section>
+    <details class="diagnostic-drawer"><summary>预算与缓存诊断<span>查看调度依据</span></summary>
     <section id="adq-diagnostics" class="detail-panel adq-diagnostics" aria-labelledby="adq-title">
       <div class="section-header"><div><h2 id="adq-title">ADQ 调度诊断</h2><p id="adq-status-text">等待调度状态</p></div><span id="adq-mode" class="badge">—</span></div>
       <dl id="adq-metrics" class="policy adq-metrics"></dl>
       <div id="adq-circuits" class="adq-circuits" hidden></div>
       <details id="adq-account-details" class="adq-account-details"><summary>查看账号级指标</summary><div class="table-scroll"><table class="adq-table"><thead><tr><th scope="col">账号</th><th scope="col">容量 / 有效额度</th><th scope="col">阶段 / 缓存</th><th scope="col">填满概率 / 锁定成本</th><th scope="col">Runway / Provider</th></tr></thead><tbody id="adq-accounts"></tbody></table></div></details>
     </section>
+    </details>
     <div class="details-grid">
-      <section class="detail-panel" aria-labelledby="policy-title"><div class="section-header"><h2 id="policy-title">调配安排</h2><button type="button" data-view="allocation">调整安排</button></div><dl id="policy" class="policy"></dl><p class="muted">日均预算用于比较周额度消耗节奏，不是每日硬上限，也不表示下一次切换的固定顺序。</p></section>
+      <section class="detail-panel" aria-labelledby="policy-title"><div class="section-header"><h2 id="policy-title">调配安排</h2><button type="button" data-view="allocation">调整安排</button></div><dl id="policy" class="policy"></dl><p class="muted">日均预算按分钟精度计算，用于新会话的优先级比较：距重置越近，未用额度越优先。已有会话保持绑定，达到设定阈值或确实不可用时才换号。</p></section>
       <section class="detail-panel" aria-labelledby="bans-title"><div class="section-header"><h2 id="bans-title">账号恢复</h2><button id="unban-all" class="runtime-action" type="button" disabled>解除全部冷却</button></div><p class="muted">确认上游额度已恢复后，可解除本地冷却。正常到期后会自动探测恢复。</p><ul id="bans-list" class="warmups"></ul></section>
     </div>
     </div>

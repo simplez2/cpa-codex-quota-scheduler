@@ -6,7 +6,10 @@ import (
 	"time"
 )
 
-const serialBudgetResetFloor = 6 * time.Hour
+const (
+	serialBudgetResetFloor    = time.Minute
+	weeklyBudgetMinutesPerDay = 24 * 60
+)
 
 // Plan multipliers are approximate 5h priors, not guaranteed message counts or
 // weekly capacities. These are configuration aliases, not native SKU mappings.
@@ -52,10 +55,17 @@ func quotaPlanWeight(plan string) float64 {
 
 func serialBudgetEnabled(cfg pluginConfig) bool { return cfg.SerialAllocationPolicy == "sustainable" }
 
-// Compute a normalized weekly percentage budget per day. Keep this independent
-// of plan weight: multiplying by 20 here would drain a Pro account's weekly
-// fraction before small accounts contribute, stranding its future 5h cycles.
+// Preserve daily units for existing comparisons and management API consumers.
+// The shared calculation uses the exact remaining minutes, with only a one-minute
+// floor so a reset seconds away cannot produce an unbounded scheduling weight.
 func serialWeeklyBudget(choice serialCandidate, cfg pluginConfig, now time.Time) (float64, bool) {
+	rate, known := serialWeeklyBudgetPerMinute(choice, cfg, now)
+	return rate * weeklyBudgetMinutesPerDay, known
+}
+
+// Compute each credential's own weekly percentage budget per minute. Keep this
+// independent of plan weight: a 20x prior must not scale its own quota percentage.
+func serialWeeklyBudgetPerMinute(choice serialCandidate, cfg pluginConfig, now time.Time) (float64, bool) {
 	if !choice.QuotaKnown || !choice.WeeklyKnown {
 		return 0, false
 	}
@@ -85,7 +95,7 @@ func serialWeeklyBudget(choice serialCandidate, cfg pluginConfig, now time.Time)
 		if horizon > 7*24*time.Hour {
 			horizon = 7 * 24 * time.Hour
 		}
-		rate := math.Max(0, remaining-cfg.ReserveWeeklyPercent) / (horizon.Hours() / 24)
+		rate := math.Max(0, remaining-cfg.ReserveWeeklyPercent) / horizon.Minutes()
 		if !found || rate < budget {
 			budget = rate
 			found = true

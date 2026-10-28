@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"path/filepath"
 	"testing"
@@ -40,6 +42,11 @@ func withWarmupManagementState(t *testing.T, entries map[string]warmupEntry) {
 }
 
 func TestRecoveryRoutesReportPersistenceFailureAfterMemoryChange(t *testing.T) {
+	oldReset := managementResetCPACredentialCooldown
+	managementResetCPACredentialCooldown = func(context.Context, string) (pluginapi.HostRoutingResetCooldownResponse, error) {
+		return pluginapi.HostRoutingResetCooldownResponse{AuthIndex: "idx-acct", Models: []string{"gpt-6.1-sol"}}, nil
+	}
+	t.Cleanup(func() { managementResetCPACredentialCooldown = oldReset })
 	for _, route := range []string{"unban", "unban-all", "warmup-retry"} {
 		t.Run(route, func(t *testing.T) {
 			resetBanStoreForTest()
@@ -65,6 +72,78 @@ func managementResponseJSON(t *testing.T, response pluginapi.ManagementResponse)
 		t.Fatalf("decode management response: %v body=%s", err, response.Body)
 	}
 	return payload
+}
+
+func TestUnbanRequestsImmediateQuotaProbe(t *testing.T) {
+	resetBanStoreForTest()
+	defer resetBanStoreForTest()
+	withWarmupManagementState(t, nil)
+	now := time.Now()
+	schedulerRuntime.mu.Lock()
+	oldPolls := schedulerRuntime.quotaPolls
+	schedulerRuntime.quotaPolls = map[string]quotaPollState{
+		"acct": {AttemptedAt: now.Add(-time.Hour), NextAt: now.Add(time.Hour), Failures: 1, Error: "quota_http_429"},
+	}
+	schedulerRuntime.mu.Unlock()
+	t.Cleanup(func() {
+		schedulerRuntime.mu.Lock()
+		schedulerRuntime.quotaPolls = oldPolls
+		schedulerRuntime.mu.Unlock()
+	})
+	oldReset := managementResetCPACredentialCooldown
+	managementResetCPACredentialCooldown = func(_ context.Context, authID string) (pluginapi.HostRoutingResetCooldownResponse, error) {
+		if authID != "acct" {
+			t.Fatalf("cooldown reset auth_id = %q", authID)
+		}
+		return pluginapi.HostRoutingResetCooldownResponse{AuthIndex: "idx-acct", Models: []string{"gpt-6.1-sol"}}, nil
+	}
+	t.Cleanup(func() { managementResetCPACredentialCooldown = oldReset })
+	banStore.set("acct", banEntry{ResetAt: now.Add(time.Hour), Window: "5h", Kind: banKindQuota})
+	response := dispatchManagement(pluginapi.ManagementRequest{
+		Method: http.MethodPost,
+		Path:   managementRoutePrefix + "/unban",
+		Body:   []byte(`{"auth_id":"acct"}`),
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.StatusCode, response.Body)
+	}
+	payload := managementResponseJSON(t, response)
+	if payload["cpa_cooldown_reset"] != true || payload["cpa_auth_index"] != "idx-acct" {
+		t.Fatalf("CPA cooldown reset was not reported: %v", payload)
+	}
+	schedulerRuntime.mu.RLock()
+	poll := schedulerRuntime.quotaPolls["acct"]
+	schedulerRuntime.mu.RUnlock()
+	if !poll.NextAt.IsZero() || poll.LastUsageAt.Before(now) {
+		t.Fatalf("unban did not request an immediate quota probe: %+v", poll)
+	}
+	if poll.Error != "quota_http_429" || poll.Failures != 1 {
+		t.Fatalf("unban forged a fresh quota result: %+v", poll)
+	}
+}
+
+func TestUnbanPreservesLocalBanWhenCPACooldownResetFails(t *testing.T) {
+	resetBanStoreForTest()
+	defer resetBanStoreForTest()
+	withWarmupManagementState(t, nil)
+	now := time.Now()
+	oldReset := managementResetCPACredentialCooldown
+	managementResetCPACredentialCooldown = func(context.Context, string) (pluginapi.HostRoutingResetCooldownResponse, error) {
+		return pluginapi.HostRoutingResetCooldownResponse{}, fmt.Errorf("host unavailable")
+	}
+	t.Cleanup(func() { managementResetCPACredentialCooldown = oldReset })
+	banStore.set("acct", banEntry{ResetAt: now.Add(time.Hour), Window: "5h", Kind: banKindQuota})
+	response := dispatchManagement(pluginapi.ManagementRequest{Method: http.MethodPost, Path: managementRoutePrefix + "/unban", Body: []byte(`{"auth_id":"acct"}`)})
+	if response.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status=%d body=%s", response.StatusCode, response.Body)
+	}
+	if _, ok := banStore.lookup("acct"); !ok {
+		t.Fatal("local quarantine was cleared after CPA reset failure")
+	}
+	payload := managementResponseJSON(t, response)
+	if payload["error"] != "cpa_cooldown_reset_failed" {
+		t.Fatalf("unexpected error response: %v", payload)
+	}
 }
 
 func TestWarmupRetryManagementRouteClearsOnlyBlockedTarget(t *testing.T) {

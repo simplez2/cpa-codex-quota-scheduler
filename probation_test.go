@@ -276,6 +276,12 @@ func TestSchedulerAllowsOnlyOneConcurrentHalfOpenDecision(t *testing.T) {
 	}
 	handled := 0
 	for response := range results {
+		if response.Reject {
+			if !response.Handled || response.AuthID != "" {
+				t.Fatalf("invalid explicit rejection: %#v", response)
+			}
+			continue
+		}
 		if response.Handled {
 			handled++
 			if response.AuthID != "acct" {

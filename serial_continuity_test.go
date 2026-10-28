@@ -65,6 +65,7 @@ func TestSerialContinuityIgnoresRestoredSoftBinding(t *testing.T) {
 	state.serialSelectedAt = now
 	req := serialTestRequest()
 	req.Options.Headers = map[string][]string{"X-Session-ID": {"restored-conversation"}}
+	state.bindBalancedSessionLocked(schedulerSessionHash(req), "backup", "", now)
 	session := schedulerSessionHash(req)
 	state.serialOverdraft = map[string]serialOverdraftBinding{
 		session: {AuthID: "primary", LastUsedAt: now.Add(-time.Minute)},
@@ -218,8 +219,8 @@ func TestSerialSafetyReserveCannotBeBypassedByDrain(t *testing.T) {
 			cfg.Serial5hHandoffMode = "inherit_global"
 			q.Windows[0].UsedPercent = 99
 			legacy := inspectSerialCandidate(serialTestRequest().Candidates[1], q, true, cfg, now)
-			if !legacy.Eligible || !legacy.DrainActive {
-				t.Fatalf("explicit threshold-only drain compatibility was lost: %#v", legacy)
+			if legacy.Eligible || !legacy.DrainActive || legacy.Reason != "serial_threshold" {
+				t.Fatalf("near-reset priority bypassed configured threshold: %#v", legacy)
 			}
 		})
 	}

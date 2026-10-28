@@ -721,7 +721,18 @@ func adqChoose(accounts []adqAccountInput, demandPerHour float64, p adqPolicy, n
 	return adqChooseWithDebit(accounts, demandPerHour, 0, p, now)
 }
 
+type adqAllocationScore struct {
+	Credit     float64
+	LastPicked time.Time
+}
+
 func adqChooseWithDebit(accounts []adqAccountInput, demandPerHour, requestCost float64, p adqPolicy, now time.Time) (adqDecision, bool) {
+	return adqChooseWithAllocation(accounts, demandPerHour, requestCost, p, now, nil)
+}
+
+// Balanced routing supplies tentative fair-share scores. ADQ still filters
+// hard limits, preserves sticky sessions and evaluates the projected pool.
+func adqChooseWithAllocation(accounts []adqAccountInput, demandPerHour, requestCost float64, p adqPolicy, now time.Time, allocation map[string]adqAllocationScore) (adqDecision, bool) {
 	requestCost = maxADQ(requestCost, 0)
 	metrics := make([]adqAccountMetrics, 0, len(accounts))
 	for _, in := range accounts {
@@ -766,6 +777,14 @@ func adqChooseWithDebit(accounts []adqAccountInput, demandPerHour, requestCost f
 					better = true
 				}
 			}
+			if allocation != nil && chosen >= 0 {
+				score, best := allocation[metrics[i].AuthID], allocation[metrics[chosen].AuthID]
+				if score.Credit != best.Credit {
+					better = score.Credit > best.Credit
+				} else if !score.LastPicked.Equal(best.LastPicked) {
+					better = score.LastPicked.Before(best.LastPicked)
+				}
+			}
 			if better {
 				chosen = i
 				bestVec = vec
@@ -782,6 +801,9 @@ func adqChooseWithDebit(accounts []adqAccountInput, demandPerHour, requestCost f
 	}
 	m := metrics[chosen]
 	reason := fmt.Sprintf("选择 %s：保持 FullWidth=%d，当前 p_fill=%.0f%%，完整 5h p_fill=%.0f%%，预计 Q_lock P95=%.3g，weekly waterline=%.1f%%，runway=%.0f 分钟。", m.AuthID, before.FullWidth, m.PFillCurrent*100, m.PFillFull*100, m.QLockP95, m.WeeklyWaterline*100, m.RunwayFinalSeconds/60)
+	if allocation != nil {
+		reason = "按周额度分配策略的公平份额调度；" + reason
+	}
 	if sticky >= 0 {
 		reason = fmt.Sprintf("保持 %s：session 粘性仍然有效；当前账号周/5h有效额度均大于0。", m.AuthID)
 	}

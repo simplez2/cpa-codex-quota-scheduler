@@ -323,12 +323,14 @@ func TestAccountConcurrencyGuardStripsSpoofedHeadersAndStopsNativeFallback(t *te
 	if got := s.concurrencyAfter(pluginapi.RequestInterceptRequest{RequestID: "native-id", ToFormat: "codex"}); !got.Terminate || got.StatusCode != 503 {
 		t.Fatal("unreserved native fallback could exceed cap")
 	}
+	s.concurrencyComplete("native-id")
+	before = s.concurrencyBefore(pluginapi.RequestInterceptRequest{RequestID: "admitted-id"})
 	req := base
 	req.Options.Headers = map[string][]string(before.Headers)
 	if _, err := s.schedulerPick(req); err != nil {
 		t.Fatal(err)
 	}
-	got := s.concurrencyAfter(pluginapi.RequestInterceptRequest{RequestID: "native-id", ToFormat: "codex"})
+	got := s.concurrencyAfter(pluginapi.RequestInterceptRequest{RequestID: "admitted-id", ToFormat: "codex"})
 	if got.Terminate || len(got.ClearHeaders) != 1 {
 		t.Fatal("admitted request blocked or internal correlation forwarded")
 	}
@@ -384,6 +386,14 @@ func TestAccountConcurrencyMixedRouteAccountsOnlyNativeCodexSelection(t *testing
 		t.Fatal("third party affected")
 	}
 	s.concurrencyComplete("mixed-one")
+	if !s.concurrencyAfter(after).Terminate {
+		t.Fatal("a timed-out execution was resurrected after release")
+	}
+	s.concurrencyComplete("mixed-two")
+	fresh := correlatedConcurrencyRequest(s, base, "mixed-fresh", "")
+	fresh.Providers = first.Providers
+	s.schedulerPick(fresh)
+	after.RequestID = "mixed-fresh"
 	if s.concurrencyAfter(after).Terminate {
 		t.Fatal("released slot was not available to native route")
 	}
@@ -490,4 +500,172 @@ func TestAccountConcurrencyExpiredStickyCannotMoveWhenNativeRetryFiltersBoundAut
 	if response, err := s.schedulerPick(queued); err == nil || response.Handled {
 		t.Fatalf("expired native retry escaped sticky account: %+v %v", response, err)
 	}
+}
+
+func TestAccountConcurrencyQueueOrderScopedToCredential(t *testing.T) {
+	var g accountConcurrencyGate
+	now := time.Now()
+	g.register("older", now)
+	g.register("newer", now)
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	older, newer := g.requests["older"], g.requests["newer"]
+	older.QueueDeadline, newer.QueueDeadline = now.Add(time.Minute), now.Add(time.Minute)
+	g.startWaitLocked(older, map[string]bool{"auth:a": true}, "a", "sticky_credential", now)
+	g.startWaitLocked(newer, map[string]bool{"auth:a": true}, "a", "sticky_credential", now)
+	if g.blockedLocked("auth:a", older, 1, now) {
+		t.Fatal("oldest waiter did not own the available slot")
+	}
+	if !g.blockedLocked("auth:a", newer, 1, now) || !g.blockedLocked("auth:a", nil, 1, now) {
+		t.Fatal("new traffic or warmup jumped the queue")
+	}
+	if g.blockedLocked("auth:b", newer, 1, now) {
+		t.Fatal("queue blocked an unrelated credential")
+	}
+	older.QueueDeadline = now.Add(-time.Millisecond)
+	if g.blockedLocked("auth:a", newer, 1, now) {
+		t.Fatal("expired waiter still reserved priority")
+	}
+	older.QueueDeadline = now.Add(time.Minute)
+	g.keyLocked([]string{"auth:a", "index:shared"})
+	canonical := g.keyLocked([]string{"auth:0", "index:shared"})
+	if !newer.WaitKeys[canonical] || !g.blockedLocked(canonical, newer, 1, now) {
+		t.Fatal("alias reconciliation erased queue priority")
+	}
+	delete(g.requests, "older")
+	if g.blockedLocked(canonical, newer, 1, now) {
+		t.Fatal("cancelled waiter blocked new work")
+	}
+}
+func TestAccountConcurrencyNativeTimeoutCannotRetryOtherCredential(t *testing.T) {
+	resetBanStoreForTest()
+	defer resetBanStoreForTest()
+	s, base := balancedFixture(time.Now())
+	s.cfg.AccountMaxConcurrency, s.cfg.AccountConcurrencyWait = 1, 0
+	base.Providers = []string{"codex", "gemini"}
+	for _, id := range []string{"active", "queued"} {
+		s.schedulerPick(correlatedConcurrencyRequest(s, base, id, ""))
+	}
+	after := pluginapi.RequestInterceptRequest{RequestID: "active", ToFormat: "codex", Metadata: map[string]any{"selected_auth_id": "a"}}
+	if s.concurrencyAfter(after).Terminate {
+		t.Fatal("first native execution was rejected")
+	}
+	after.RequestID = "queued"
+	if !s.concurrencyAfter(after).Terminate {
+		t.Fatal("busy native execution was admitted")
+	}
+	after.Metadata["selected_auth_id"] = "b"
+	if !s.concurrencyAfter(after).Terminate {
+		t.Fatal("expired native execution escaped to an idle credential")
+	}
+	status := concurrencyCount(s)
+	if status.Rejected != 1 || len(status.RecentRejections) != 1 || status.RecentRejections[0].AuthID != "a" || status.RecentRejections[0].Reason != "native_credential" || status.Active != 1 || status.Waiting != 0 {
+		t.Fatalf("incorrect rejection diagnostic: %+v", status)
+	}
+}
+func TestAccountConcurrencyWarmupYieldsToQueuedForeground(t *testing.T) {
+	s, _ := balancedFixture(time.Now())
+	now := time.Now()
+	s.concurrency.register("queued", now)
+	s.concurrency.mu.Lock()
+	r := s.concurrency.requests["queued"]
+	r.QueueDeadline = now.Add(time.Minute)
+	key := s.concurrency.keyLocked([]string{"auth:a"})
+	s.concurrency.startWaitLocked(r, map[string]bool{key: true}, "a", "sticky_credential", now)
+	s.concurrency.waiting++
+	s.concurrency.mu.Unlock()
+	candidate := warmupCandidate{Snapshot: s.quotas["a"]}
+	candidate.Snapshot.AuthID = "a"
+	if _, ok := s.beginWarmupConcurrency(candidate, s.cfg); ok {
+		t.Fatal("warmup jumped queued foreground work")
+	}
+	status := concurrencyCount(s)
+	if status.Accounts["a"].Waiting != 1 || status.PoolWaiting != 0 || status.Accounts["a"].Active != 0 {
+		t.Fatalf("wrong bound queue status: %+v", status)
+	}
+	s.concurrency.endWait("queued")
+	if id, ok := s.beginWarmupConcurrency(candidate, s.cfg); !ok {
+		t.Fatal("finished queue still blocked warmup")
+	} else {
+		s.concurrency.release(id)
+	}
+}
+
+func TestAccountConcurrencyExpiredQueueCannotTakeNewlyFreeSlot(t *testing.T) {
+	for _, native := range []bool{false, true} {
+		t.Run(fmt.Sprintf("native_%t", native), func(t *testing.T) {
+			resetBanStoreForTest()
+			defer resetBanStoreForTest()
+			s, base := balancedFixture(time.Now())
+			s.cfg.AccountMaxConcurrency = 1
+			s.cfg.AccountConcurrencyWait = time.Second
+			req := correlatedConcurrencyRequest(s, base, "expired", "")
+			s.concurrency.mu.Lock()
+			r := s.concurrency.requests["expired"]
+			r.NativeSelection = native
+			r.QueueDeadline = time.Now().Add(-time.Millisecond)
+			key := s.concurrency.keyLocked([]string{"auth:a"})
+			s.concurrency.startWaitLocked(r, map[string]bool{key: true}, "a", "sticky_credential", time.Now().Add(-time.Second))
+			s.concurrency.mu.Unlock()
+			if native {
+				got := s.concurrencyAfter(pluginapi.RequestInterceptRequest{RequestID: "expired", ToFormat: "codex", Metadata: map[string]any{"selected_auth_id": "a"}})
+				if !got.Terminate || !strings.Contains(string(got.ResponseBody), "account_concurrency_busy") {
+					t.Fatal("expired native waiter took a free slot")
+				}
+			} else if got, err := s.schedulerPick(req); err == nil || got.Handled {
+				t.Fatal("expired waiter took a free slot")
+			}
+			s.cfg.AccountConcurrencyEnabled = false
+			if got := s.concurrencyAfter(pluginapi.RequestInterceptRequest{RequestID: "expired", ToFormat: "codex"}); !got.Terminate {
+				t.Fatal("disabling protection resurrected a terminal lifecycle")
+			}
+			if concurrencyCount(s).Active != 0 || concurrencyCount(s).Rejected != 1 {
+				t.Fatal("expired waiter consumed capacity or was recorded twice")
+			}
+		})
+	}
+}
+func TestAccountConcurrencyUsableBusyCredentialQueuesDespiteExhaustedSibling(t *testing.T) {
+	resetBanStoreForTest()
+	defer resetBanStoreForTest()
+	s, base := balancedFixture(time.Now())
+	s.cfg.AccountMaxConcurrency = 1
+	s.cfg.AccountConcurrencyWait = time.Second
+	exhausted := s.quotas["b"]
+	for i := range exhausted.Windows {
+		exhausted.Windows[i].UsedPercent = 100
+		exhausted.Windows[i].LimitReached = true
+	}
+	s.quotas["b"] = exhausted
+	first, err := s.schedulerPick(correlatedConcurrencyRequest(s, base, "active", ""))
+	if err != nil || first.AuthID != "a" {
+		t.Fatalf("initial pick: %+v %v", first, err)
+	}
+	queued := correlatedConcurrencyRequest(s, base, "queued", "")
+	done := make(chan error, 1)
+	go func() {
+		response, err := s.schedulerPick(queued)
+		if err == nil && response.AuthID != "a" {
+			err = fmt.Errorf("queue selected %q", response.AuthID)
+		}
+		done <- err
+	}()
+	deadline := time.Now().Add(time.Second)
+	for concurrencyCount(s).Waiting == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if concurrencyCount(s).Waiting != 1 {
+		s.concurrencyComplete("queued")
+		t.Fatal("idle exhausted credential bypassed usable credential queue")
+	}
+	s.concurrencyComplete("active")
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("queued request did not use released capacity")
+	}
+	s.concurrencyComplete("queued")
 }

@@ -1,8 +1,8 @@
 # Build the Codex Quota Scheduler plugin into a Windows .dll.
 #
 # Requirements:
-#   - Go (this plugin needs Go 1.21+; it vendors the CPA SDK locally so it
-#     does NOT require the Go 1.26 that the full CLIProxyAPI module needs)
+#   - Go (source syntax is Go 1.21-compatible; use maintained Go 1.26.10+
+#     for release builds). The CPA SDK is included locally.
 #   - A C compiler (CGO is mandatory for CPA plugins). On Windows install
 #     MinGW-w64, e.g. via winget:
 #         winget install -e --id MartinStorsjo.LLVM-MinGW.UCRT

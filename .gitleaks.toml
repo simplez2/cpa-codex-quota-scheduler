@@ -1,0 +1,7 @@
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Synthetic request lifecycle ID in the CPA patch tests; not a bearer credential."
+regexTarget = "match"
+regexes = ['''^cliproxyexecutor\.RequestLifecycleIDMetadataKey: "execution-123"$''']

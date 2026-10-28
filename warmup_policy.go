@@ -165,7 +165,13 @@ func (s *schedulerRuntimeState) warmupSuppressedAccountsLocked(now time.Time, re
 // Recheck immediately before dispatch. Inventory discovery and the instance
 // lease can take time; quota headers or real traffic can change the decision.
 func (s *schedulerRuntimeState) warmupCandidateStillEligible(candidate warmupCandidate, now time.Time) bool {
+	if candidate.ActivateAt.After(now) {
+		return false
+	}
 	if _, banned := banStore.lookup(candidate.Snapshot.AuthID); banned {
+		return false
+	}
+	if s.recovery.hasAuth(candidate.Snapshot.AuthID, candidate.Snapshot.AuthIndex) {
 		return false
 	}
 	s.mu.RLock()

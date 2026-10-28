@@ -19,12 +19,15 @@ import (
 // reset its backoff. It contains no upstream credentials.
 type quotaPollState struct {
 	LastUsageAt time.Time
-	Reason      string
-	AuthIndex   string
-	AttemptedAt time.Time
-	NextAt      time.Time
-	Failures    int
-	Error       string
+	// UsagePending records event order even when the clock reports the same
+	// timestamp for a probe and a later usage callback.
+	UsagePending bool
+	Reason       string
+	AuthIndex    string
+	AttemptedAt  time.Time
+	NextAt       time.Time
+	Failures     int
+	Error        string
 }
 
 const quotaRefreshRequestTimeout = 10 * time.Second
@@ -49,10 +52,28 @@ type nativeQuotaWindow struct {
 	ResetAfter  *int64          `json:"reset_after_seconds"`
 }
 type nativeRateLimit struct {
-	Allowed      *bool              `json:"allowed"`
-	LimitReached *bool              `json:"limit_reached"`
-	Primary      *nativeQuotaWindow `json:"primary_window"`
-	Secondary    *nativeQuotaWindow `json:"secondary_window"`
+	Allowed       *bool              `json:"allowed"`
+	LimitReached  *bool              `json:"limit_reached"`
+	Primary       *nativeQuotaWindow `json:"primary_window"`
+	Secondary     *nativeQuotaWindow `json:"secondary_window"`
+	primarySeen   bool
+	secondarySeen bool
+}
+
+func (r *nativeRateLimit) UnmarshalJSON(raw []byte) error {
+	type nativeRateLimitFields nativeRateLimit
+	var fields nativeRateLimitFields
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return err
+	}
+	var present map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &present); err != nil {
+		return err
+	}
+	*r = nativeRateLimit(fields)
+	_, r.primarySeen = present["primary_window"]
+	_, r.secondarySeen = present["secondary_window"]
+	return nil
 }
 
 // parseNativeQuota accepts the native wham/usage schema. ObservedAt is captured
@@ -128,6 +149,23 @@ func parseNativeQuota(raw []byte, authID, index string, observedAt time.Time) (q
 		return quotaSnapshot{}, errors.New("missing_quota_windows")
 	}
 	out.Windows = normalizeQuotaWindowSet(out.Windows, observedAt, observedAt, 15*time.Minute)
+	// Only a complete account-wide pair can prove absence. An omitted slot is
+	// different from an explicitly null slot and may be a partial response.
+	out.FiveHourLimitStatus = "unknown"
+	if limit.primarySeen && limit.secondarySeen {
+		out.FiveHourLimitStatus = "not_reported"
+	}
+	out.FiveHourLimitObservedAt = observedAt
+	for _, window := range out.Windows {
+		class := normalizeWindowClass(window.Class)
+		if class == "5h" {
+			out.FiveHourLimitStatus = "limited"
+			break
+		}
+		if class != "weekly" && class != "monthly" {
+			out.FiveHourLimitStatus = "unknown"
+		}
+	}
 	return out, nil
 }
 
@@ -240,6 +278,9 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 	}
 	cancelInventory()
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return // Stopping a generation is not an upstream/inventory failure.
+		}
 		reason := "cpa_inventory_unavailable"
 		if errors.Is(err, context.DeadlineExceeded) {
 			reason = "cpa_inventory_timeout"
@@ -267,14 +308,22 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 		if p := s.quotaPolls[id]; p.AuthIndex != auth.AuthIndex {
 			s.quotaRunway.ForgetAuth(id)
 			delete(s.quotaNative, id)
+			delete(s.continuityDemandUntil, id)
 			s.resetSerialWeeklyEvidenceForAuthLocked(id)
 			delete(s.quotaPolls, id)
+		}
+		// Older versions persisted shutdown cancellation as a failed quota read.
+		// Retry that read normally, without inventing a successful observation.
+		if p := s.quotaPolls[id]; p.Error == context.Canceled.Error() {
+			p.Error, p.Failures, p.NextAt = "", 0, time.Time{}
+			s.quotaPolls[id] = p
 		}
 	}
 	for id := range s.quotaPolls {
 		if _, ok := inventory[id]; !ok {
 			s.quotaRunway.ForgetAuth(id)
 			delete(s.quotaNative, id)
+			delete(s.continuityDemandUntil, id)
 			s.resetSerialWeeklyEvidenceForAuthLocked(id)
 			delete(s.quotaPolls, id)
 		}
@@ -291,6 +340,7 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 		activeID = ""
 	}
 	s.mu.Unlock()
+	s.pruneContinuityUsage(inventory)
 	// Quota polling is read-only; generation ownership is claimed only after a
 	// valid inventory, keeping model warmups fenced by the existing owner lease.
 	if _, active, claimErr := s.claimGenerationAfterSuccessfulRefresh(); claimErr != nil || !active {
@@ -341,11 +391,12 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 		}
 		s.mu.Lock()
 		poll := s.quotaPolls[id]
-		if now.Before(poll.NextAt) {
+		if now.Before(poll.NextAt) && !(strings.HasPrefix(reason, "epoch_") && poll.Failures == 0) {
 			s.mu.Unlock()
 			continue
 		}
 		interval := s.quotaPollIntervalLocked(id, activeID, now)
+		previousPoll := poll
 		if !strings.HasPrefix(reason, "epoch_") {
 			if deferUntil := quotaHeaderCacheDeadline(s.quotas[id], poll, cfg, interval, now); deferUntil.After(now) {
 				poll.NextAt = deferUntil
@@ -357,6 +408,7 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 		poll.Reason = reason
 		poll.AuthIndex = auth.AuthIndex
 		poll.AttemptedAt = now
+		poll.UsagePending = false
 		s.recordQuotaEpochProbeAttemptLocked(id, reason, now)
 		poll.NextAt = now.Add(interval)
 		// A reset timestamp schedules an observation; it never proves renewed quota.
@@ -367,6 +419,7 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 			}
 		}
 		s.quotaPolls[id] = poll
+		attemptNextAt := poll.NextAt
 		s.quotaRefreshRequests++
 		s.quotaRefreshRequestedAt = now
 		s.mu.Unlock()
@@ -390,6 +443,26 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 			fetchErr = requestCtx.Err()
 		}
 		cancelRequest()
+		if errors.Is(fetchErr, context.Canceled) {
+			s.mu.Lock()
+			current := s.quotaPolls[id]
+			if current.AuthIndex == auth.AuthIndex && current.AttemptedAt.Equal(now) && current.Error == previousPoll.Error && current.Failures == previousPoll.Failures {
+				// Cancellation cannot consume demand or erase an event which
+				// arrived while this HTTP request was in flight.
+				previousPoll.UsagePending = previousPoll.UsagePending || current.UsagePending
+				if current.LastUsageAt.After(previousPoll.LastUsageAt) {
+					previousPoll.LastUsageAt = current.LastUsageAt
+				}
+				// Preserve a guard extended by a concurrent response or recovery.
+				if current.NextAt.After(attemptNextAt) {
+					previousPoll.NextAt = current.NextAt
+				}
+				s.quotaPolls[id] = previousPoll
+			}
+			s.mu.Unlock()
+			s.persistBanState()
+			return
+		}
 		if !s.generationOwnerActive() {
 			return
 		}
@@ -420,20 +493,40 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 		} else {
 			poll.Failures = 0
 			poll.Error = ""
+			// The prior schedule was computed before this response existed. A
+			// newly observed, earlier reset must also trigger a fresh probe; the
+			// timestamp itself never establishes that the quota has refilled.
+			// Do not shorten a guard changed while this request was in flight.
+			if poll.AuthIndex == auth.AuthIndex && poll.AttemptedAt.Equal(now) && poll.NextAt.Equal(attemptNextAt) {
+				for _, window := range snapshot.Windows {
+					if !window.ResetAt.After(now) || quotaWindowHasPlaceholderReset(window, snapshot.RefreshedAt, snapshot.RefreshedAt) {
+						continue
+					}
+					resetProbe := window.ResetAt.Add(2 * time.Second)
+					if resetProbe.Before(poll.NextAt) {
+						poll.NextAt = resetProbe
+					}
+				}
+			}
 			if snapshot.Plan.Type == "" {
 				snapshot.Plan.Type = normalizeNativePlanType(auth.IDToken.PlanType)
 				if snapshot.Plan.Type != "" {
 					snapshot.Plan.Source = "cpa_auth_files"
 				}
 			}
+			if snapshot.AccountID == "" {
+				snapshot.AccountID = normalizeNativePlanType(auth.IDToken.AccountID)
+			}
 			s.quotaRunway.Observe(snapshot, time.Now())
 			if s.quotaNative == nil {
 				s.quotaNative = make(map[string]quotaSnapshot)
 			}
+			s.recovery.observe(snapshot, time.Now(), cfg.StaleAfter)
 			s.quotaNative[id] = snapshot
 			snapshot = mergePartialQuotaSnapshot(s.quotas[id], snapshot, time.Now(), cfg.StaleAfter)
 			s.quotas[id] = snapshot
 			s.quotas[auth.AuthIndex] = snapshot
+			s.observeFiveHourPhaseLocked(snapshot, time.Now())
 			s.updateCalibrationsLocked(map[string]quotaSnapshot{id: snapshot}, now)
 			epochTransition = s.observeQuotaEpochProbeLocked(id, previousSnapshot, snapshot, inventory, time.Now())
 			settlementSnapshot = snapshot
@@ -477,8 +570,8 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 	if s.confirmPendingWarmups(snapshotCopy, time.Now()) {
 		s.persistBanState()
 	}
-	s.releaseElapsedQuotaCooldowns(snapshotCopy, time.Now())
-	s.reconcileExternallyResetQuotaBans(snapshotCopy, time.Now())
+	// Elapsed reset timestamps and quota reads are not successful model calls.
+	// Retain quarantine until a single owned half-open execution succeeds.
 	s.persistBanState()
 	if batchCtx.Err() == nil {
 		s.scheduleWarmup(ctx, nil)

@@ -500,7 +500,7 @@ func TestSerialSchedulerKeepsCurrentWhenEveryBackupReachedSoftThreshold(t *testi
 	}
 }
 
-func TestSerialSchedulerDrainAllowsActivePastThresholdNearReset(t *testing.T) {
+func TestSerialSchedulerDeadlinePriorityHonorsThresholdNearReset(t *testing.T) {
 	resetBanStoreForTest()
 	now := time.Now()
 	state := newSerialTestState(now)
@@ -512,8 +512,8 @@ func TestSerialSchedulerDrainAllowsActivePastThresholdNearReset(t *testing.T) {
 
 	state.mu.Lock()
 	primary := state.quotas["primary"]
-	// A draining 5h window may cross its soft threshold while weekly quota is
-	// healthy. Drain no longer vetoes weekly reserve/balance protection.
+	// Imminent expiry improves selection priority but does not raise the
+	// configured utilization threshold.
 	primary.Windows = append(primary.Windows, quotaWindow{
 		Class: "5h", UsedPercent: 99, Allowed: true, ResetAt: now.Add(10 * time.Minute), ObservedAt: now,
 	})
@@ -523,8 +523,8 @@ func TestSerialSchedulerDrainAllowsActivePastThresholdNearReset(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !got.Handled || got.AuthID != "primary" {
-		t.Fatalf("drain mode did not keep active auth: %#v", got)
+	if !got.Handled || got.AuthID != "backup" {
+		t.Fatalf("deadline priority bypassed the configured threshold: %#v", got)
 	}
 }
 
@@ -651,7 +651,7 @@ func TestSerialStatePersistenceIncludesActiveAuth(t *testing.T) {
 	if err := json.Unmarshal(raw, &persisted); err != nil {
 		t.Fatal(err)
 	}
-	if persisted.Version != 7 || persisted.SerialActiveAuthID != "primary" || persisted.SerialSwitches != 3 || persisted.SerialFallbacks != 7 {
+	if persisted.Version != 8 || persisted.SerialActiveAuthID != "primary" || persisted.SerialSwitches != 3 || persisted.SerialFallbacks != 7 {
 		t.Fatalf("serial persistence = %#v", persisted)
 	}
 }
@@ -1084,6 +1084,7 @@ func TestSortSerialCandidatesKeepsWeeklyReserveProtected(t *testing.T) {
 func TestSortSerialCandidatesHysteresisIsInputOrderIndependent(t *testing.T) {
 	now := time.Now()
 	cfg := defaultPluginConfig()
+	cfg.SerialAllocationPolicy = "weekly_remaining"
 	base := []serialCandidate{
 		{Candidate: pluginapi.SchedulerAuthCandidate{ID: "a"}, WeeklyKnown: true, WeeklyRemaining: 50, FiveHourKnown: true, FiveHourUsed: 40, LastSelectedAt: now.Add(-time.Hour)},
 		{Candidate: pluginapi.SchedulerAuthCandidate{ID: "b"}, WeeklyKnown: true, WeeklyRemaining: 49, FiveHourKnown: true, FiveHourUsed: 10, LastSelectedAt: now.Add(-2 * time.Hour)},
