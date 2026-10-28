@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {changesBetween,conflictingFields,equal,fields,weeklyAllocationLabel} from './settings.mjs';
+import {changesBetween,conflictingFields,equal,fields,weeklyAllocationLabel,continuitySummary} from './settings.mjs';
 
 test('patch includes only edited fields and preserves zero reserve',()=>{
   const initial={reserve_5h_percent:0,serial_5h_handoff_mode:'429_only',warmup_enabled:false,priority:2000};
@@ -22,6 +22,15 @@ test('unrelated config edits do not conflict and omitted defaults stay distinct'
 test('every control has a distinct key and a Chinese label',()=>{
   assert.equal(new Set(fields.map(f=>f[0])).size,fields.length);
   for(const spec of fields)assert.match(spec[1],/[\u4e00-\u9fff]/);
+});
+
+test('continuity reports observed host advice without claiming an active queue',()=>{
+  assert.match(continuitySummary(),/未提供/);
+  assert.equal(continuitySummary({enabled:false}),'已关闭');
+  assert.match(continuitySummary({enabled:true,host_calls:0}),/尚未收到宿主/);
+  assert.match(continuitySummary({enabled:true,host_calls:3,last_action:'wait',last_reason:'five_hour_exhausted'}),/最近检查建议等待.*5h 恢复/);
+  assert.match(continuitySummary({enabled:true,host_calls:4,last_action:'ready',last_reason:'weekly_only_available'}),/仅周限账号可接续/);
+  assert.doesNotMatch(continuitySummary({enabled:true,host_calls:3,last_action:'wait'}),/正在排队|自动恢复成功/);
 });
 
 test('per-credential concurrency controls are editable in allocation and save independently',()=>{

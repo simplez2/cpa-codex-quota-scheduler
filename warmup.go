@@ -393,7 +393,7 @@ func (s *schedulerRuntimeState) findWarmupCandidates(eligible map[string]warmupA
 		}
 		// Quarantined credentials recover only through the serialized half-open
 		// scheduler path. Warmup must never bypass that lease with a second probe.
-		if _, quarantined := banStore.lookup(binding.AuthID); quarantined {
+		if _, quarantined := banStore.lookup(binding.AuthID); quarantined || s.recovery.hasAuth(binding.AuthID, binding.AuthIndex) {
 			skippedBanned++
 			continue
 		}
@@ -570,11 +570,11 @@ func unstartedWarmupWindow(snapshot quotaSnapshot, now time.Time) (quotaWindow, 
 
 func warmupWindowRank(class string) int {
 	switch class {
-	case "5h":
+	case "monthly":
 		return 0
 	case "weekly":
 		return 1
-	case "monthly":
+	case "5h":
 		return 2
 	default:
 		return 10
@@ -994,7 +994,9 @@ func (s *schedulerRuntimeState) recordWarmupStreamError(candidate warmupCandidat
 func (s *schedulerRuntimeState) recordWarmup429(candidate warmupCandidate, cfg pluginConfig, headers http.Header, requestedAt time.Time, transport string) {
 	now := time.Now()
 	entry, authoritative := quarantineEntryFor429(headers, now, cfg.FallbackBan, cfg.MaxBan)
+	entry.LocalBackoff, entry.LocalBackoffMax = cfg.HalfOpenRetryAfter, cfg.MaxBan
 	banStore.record429(candidate.Snapshot.AuthID, entry, requestedAt)
+	s.recovery.require(candidate.Snapshot.AuthID, candidate.Snapshot.AuthIndex, now, entry.ResetAt)
 	s.markSerialUnavailable(candidate.Snapshot.AuthID, "warmup_429", now)
 	s.persistAfterBanChange()
 	slog.Warn("codex-quota-scheduler: warmup received 429; credential quarantined",
@@ -1372,7 +1374,10 @@ func cpaManagementAuthFiles(ctx context.Context, cfg pluginConfig) ([]cpaAuthFil
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+managementKey)
-	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	// Keep the management bearer key at the configured endpoint, including
+	// redirects to a different port on the same hostname.
+	client := &http.Client{Timeout: 15 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -1480,10 +1485,20 @@ func warmupEligibleAuths(files []cpaAuthFileEntry) map[string]warmupAuthBinding 
 }
 
 func warmupEligibleAuthsWithStats(files []cpaAuthFileEntry) (map[string]warmupAuthBinding, warmupAuthEligibilityStats) {
-	return eligibleCPACodexAuthsWithStats(files)
+	return cpaCodexAuthsWithStats(files, true)
 }
 
 func eligibleCPACodexAuthsWithStats(files []cpaAuthFileEntry) (map[string]warmupAuthBinding, warmupAuthEligibilityStats) {
+	return cpaCodexAuthsWithStats(files, false)
+}
+
+// A quota probe can recover a credential after CPA has already retained a
+// historical 429 as status=error/unavailable. Warmup may reconsider that
+// recoverable state, but its candidate stage still requires a fresh native
+// snapshot with headroom and rejects local quarantine or a real poll error.
+// Strict inventory users, including manual serial selection, keep the active
+// credential requirement.
+func cpaCodexAuthsWithStats(files []cpaAuthFileEntry, recoverStatusError bool) (map[string]warmupAuthBinding, warmupAuthEligibilityStats) {
 	eligible := make(map[string]warmupAuthBinding)
 	stats := newWarmupAuthEligibilityStats()
 	for _, file := range files {
@@ -1500,11 +1515,13 @@ func eligibleCPACodexAuthsWithStats(files []cpaAuthFileEntry) (map[string]warmup
 			stats.reject("disabled")
 			continue
 		}
-		if file.Unavailable {
+		status := strings.TrimSpace(file.Status)
+		recoverableError := recoverStatusError && strings.EqualFold(status, "error")
+		if file.Unavailable && !recoverableError {
 			stats.reject("unavailable")
 			continue
 		}
-		if status := strings.TrimSpace(file.Status); status != "" && !strings.EqualFold(status, "active") {
+		if status != "" && !strings.EqualFold(status, "active") && !recoverableError {
 			stats.reject("inactive_status")
 			continue
 		}

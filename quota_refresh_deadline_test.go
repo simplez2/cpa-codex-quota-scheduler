@@ -106,11 +106,36 @@ func TestQuotaRefreshDeadlineCancellationStopsSlowRequest(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("stopping refresh waited for slow upstream timeout")
 	}
-	if requests.Load() != 1 || state.quotaPolls["a"].Error != context.Canceled.Error() || state.quotaPolls["a"].Failures != 1 {
-		t.Fatalf("cancellation was ignored or marked successful: requests=%d poll=%+v", requests.Load(), state.quotaPolls["a"])
+	if requests.Load() != 1 || state.quotaPolls["a"].Error != "" || state.quotaPolls["a"].Failures != 0 || !state.quotaPolls["a"].NextAt.IsZero() {
+		t.Fatalf("shutdown cancellation left a failure/backoff: requests=%d poll=%+v", requests.Load(), state.quotaPolls["a"])
 	}
 	if !state.quotas["a"].RefreshedAt.Equal(before.RefreshedAt) {
 		t.Fatal("cancellation advanced quota observation")
+	}
+}
+
+func TestQuotaRefreshLegacyCanceledPollRetriesWithoutErasingRealFailures(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "auth-files") {
+			quotaDeadlineInventory(w, 2)
+			return
+		}
+		requests.Add(1)
+		_ = json.NewEncoder(w).Encode(cpaAPICallResponse{StatusCode: 200, Body: nativeQuotaTestBody(40)})
+	}))
+	defer server.Close()
+	state := newRefreshTestState(t, server.URL)
+	quotaDeadlineSeed(state)
+	guard := time.Now().Add(30 * time.Minute)
+	state.quotaPolls["a"] = quotaPollState{AuthIndex: "idx-a", Error: context.Canceled.Error(), Failures: 1, NextAt: guard}
+	state.quotaPolls["b"] = quotaPollState{AuthIndex: "idx-b", Error: "quota_http_401", Failures: 2, NextAt: guard}
+	state.refreshOnce(context.Background())
+	if requests.Load() != 1 || state.quotaPolls["a"].Error != "" || state.quotas["a"].Windows[0].UsedPercent != 40 {
+		t.Fatalf("legacy cancellation remained deferred: requests=%d poll=%+v", requests.Load(), state.quotaPolls["a"])
+	}
+	if p := state.quotaPolls["b"]; p.Error != "quota_http_401" || p.Failures != 2 || !p.NextAt.Equal(guard) {
+		t.Fatalf("real authentication failure guard erased: %+v", p)
 	}
 }
 

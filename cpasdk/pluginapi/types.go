@@ -519,6 +519,30 @@ type SchedulerPickResponse struct {
 	DelegateBuiltin string
 	// Handled reports whether the plugin made a scheduling decision.
 	Handled bool
+	// Reject prevents fallback to a built-in scheduler when selection is known
+	// to be blocked; CPA v8.0.44 supports this wire contract.
+	Reject       bool
+	RejectReason string
+	RejectCode   string
+}
+
+// SchedulerContinuityRequest is sent before host cooldown filtering. Candidates
+// are refreshed by the host on every call and already satisfy its provider,
+// model, explicit pin, enabled-credential, and other non-quota constraints.
+type SchedulerContinuityRequest struct {
+	RequestID                  string               `json:"request_id"`
+	Pick                       SchedulerPickRequest `json:"pick"`
+	PreviousAttemptRejected429 bool                 `json:"previous_attempt_rejected_429,omitempty"`
+}
+
+// SchedulerContinuityResponse is advisory: ready never selects an account.
+// The host owns cancellable waiting and still performs normal final admission.
+type SchedulerContinuityResponse struct {
+	Action       string `json:"action"`
+	Reason       string `json:"reason,omitempty"`
+	RetryAfterMS int64  `json:"retry_after_ms,omitempty"`
+	MaxWaitMS    int64  `json:"max_wait_ms,omitempty"`
+	ResetAt      string `json:"reset_at,omitempty"`
 }
 
 // ModelRouteRequest describes the original request context offered to a model router plugin.
@@ -765,6 +789,21 @@ type HostAuthSaveResponse struct {
 	Name string `json:"name"`
 	// Path is the saved auth file path.
 	Path string `json:"path"`
+}
+
+// HostRoutingResetCooldownRequest asks the host to clear quota and cooldown
+// routing state for one credential without modifying its token document.
+type HostRoutingResetCooldownRequest struct {
+	// AuthIndex identifies the credential index.
+	AuthIndex string `json:"auth_index"`
+}
+
+// HostRoutingResetCooldownResponse reports the cleared credential and models.
+type HostRoutingResetCooldownResponse struct {
+	// AuthIndex identifies the credential index.
+	AuthIndex string `json:"auth_index"`
+	// Models lists the model keys whose routing state was reset.
+	Models []string `json:"models"`
 }
 
 // HTTPRequest describes an upstream HTTP request issued through the host.

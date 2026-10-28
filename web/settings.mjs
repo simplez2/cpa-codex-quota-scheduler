@@ -1,13 +1,28 @@
+import {poolWeeklyDefaults,poolWeeklyLabels} from './pool.mjs';
 const plans = [['team_standard','Team Standard · 1×'],['plus','Plus · 1×'],['pro_5x','Pro 5x · 5×'],['team_premium','Team Premium · 5×'],['pro_20x','Pro 20x · 20×']];
 const handoff = [['threshold_only','达到使用阈值'],['reserve_aware','保留安全余量']];
 // Metadata is presentation only. Defaults and validation come from the running
 // plugin so an omitted YAML field is never silently saved as zero or empty.
 export const weeklyAllocationLabel = policy => policy === 'weekly_remaining' ? '按周剩余比例' : '按距重置时间的日均预算';
+export function continuitySummary(status) {
+  if (!status) return '宿主未提供额度续行状态';
+  if (!status.enabled) return '已关闭';
+  if (!(Number(status.host_calls) > 0)) return '已配置 · 尚未收到宿主续行检查';
+  const actions={ready:'最近检查可继续',wait:'最近检查建议等待',unavailable:'最近检查无可恢复候选',disabled:'最近检查已关闭'};
+  const reasons={weekly_only_available:'仅周限账号可接续',five_hour_exhausted:'等待 5h 恢复',five_hour_recheck:'等待新观测确认 5h 恢复',pacing:'5h 余量将尽，放缓请求',pacing_recheck:'预测余量不足，等待额度复查',quota_unknown:'额度仍需确认',no_eligible_account:'当前无可用账号'};
+  const action=actions[status.last_action] || '已收到宿主续行检查';
+  const reason=reasons[status.last_reason];
+  return action+(reason?' · '+reason:'');
+}
 export const fields = [
   ['scheduler_mode','调度模式','allocation','select','已有会话优先保留原凭据，续聊、工具调用与并发请求保持绑定；达到设定阈值或凭据不可用时才换号。新会话按周额度策略和5h重置时间重新选择。串行选优先凭据，均衡并发按权重分配新会话。', [['balanced','均衡并发（会话粘性）'],['serial','串行调配'],['legacy','传统调度'],['shadow','观察对比'],['enforce','动态节奏控制']]],
   ['account_concurrency_enabled','限制每凭据并发','allocation','boolean','默认开启。真实请求、重试和预热共用每个 CPA 凭据的槽位；长请求保留槽位直到 CPA 确认结束。保存后立即生效。'],
   ['account_max_concurrency','每凭据最大并发','allocation','number','1 至 64，默认 2。不同 CPA 凭据独立计数，即使属于同一个账号；调低上限不会中断已开始的请求。',1,64,1],
   ['account_concurrency_wait','并发满时最长等待','allocation','duration','0 至 30 秒，默认 10 秒。两种模式的已绑定会话均等待原凭据；新会话可使用符合额度条件的空闲凭据。超时返回 503；不会突破上限。'],
+  ['continuity_enabled','额度不足时自动等待恢复','allocation','boolean','需要支持额度续行的 CPA 宿主。执行前检查可用账号；所有可用账号受 5h 限制时等待恢复，再重新选号。客户端断开或到达最长等待后结束。仅周限账号仍可接续使用。'],
+  ['continuity_pacing','5h 额度将尽时提前放缓','allocation','boolean','按已确认的 5h 余量与消耗速度推算，在用尽前分散请求。仅周限账号可用时继续执行。未知额度不会视为无限，手动排除统计不会解除账号限制。'],
+  ['continuity_max_wait','额度恢复最长等待','allocation','duration','1 秒至 24 小时，默认 6 小时，包含放缓等待。客户端、反向代理的连接与总时长限制也必须允许该等待。'],
+  ['continuity_poll_interval','等待期间重新检查间隔','allocation','duration','1 秒至 5 分钟，默认 30 秒。重新检查缓存与当前候选；额度查询仍遵守已有刷新、失败退避和 Retry-After。'],
   ['serial_allocation_policy','周额度分配方式','allocation','select','串行和均衡并发均生效。日均预算按各凭据周余量 ÷ 距重置分钟数 × 1440 计算，显示单位为 % / 天；调度保持分钟精度，不足一分钟按一分钟计算；剩余比例只按周余量分配。动态排名只影响新会话或达到切换条件的会话；串行和均衡的已有会话保持绑定优先。5h 在同一周优先级内优先临近重置。', [['sustainable','按距重置时间的日均预算'],['weekly_remaining','按周剩余比例']]],
   ['quota_default_plan','无法识别时的默认套餐','allocation','select','优先自动识别 CPA 返回的套餐；只有标签缺失、未知或缓存过期时使用此默认值。倍率是容量参考。',plans],
   ['serial_budget_rebalance_percent','无会话请求的预算再平衡阈值','allocation','number','仅影响未携带会话标识的串行请求；已有会话不会因为预算排名变化而换号。0 关闭主动再平衡，其他值仍需两次独立额度确认。',0,100,1],
@@ -19,6 +34,9 @@ export const fields = [
   ['serial_prefer_active_cycle','优先使用已开始的周期','allocation','boolean','在符合额度条件的账号中优先考虑已开始计时的周期。'],
   ['serial_soft_continuation','允许旧会话越过软阈值','allocation','boolean','默认关闭，达到设定阈值后该会话换号。开启时可继续使用原凭据直到真实不可用；其他会话的换号不迁移本会话，已输出内容的请求不回放。'],
   ['quota_account_plans','每个账号的套餐','allocation','plans','默认自动识别 Team Standard、Team Premium 和 Plus。手动覆盖优先于自动识别，仅影响调度参考，不会更改订阅。'],
+  ['pool_weekly_capacity_weights','总池周额度换算','allocation','weights','每种套餐的周容量折成多少个 Team。默认普通 Team、Plus 为 1，Team 5x、Pro 5x 为 5，Pro 20x 为 10。只影响总额度统计。'],
+  ['pool_5h_capacity_weights','有 5h 限制账号的容量换算','allocation','weights','与周额度分别设置。默认普通 Team、Plus 为 1，Team 5x、Pro 5x 为 5，Pro 20x 为 10。只影响 5h 统计，不代表上游承诺的固定调用次数。'],
+  ['pool_5h_excluded_accounts','不参与 5h 统计的账号','allocation','excluded','仅勾选你已确认没有 5h 限制的账号。自动识别会跳过当前完整额度响应中未返回 5h 限制的账号；查询失败仍显示待确认。此处不改变周额度、切号或预热。'],
   ['quota_probe_on_demand','按需探测额度','allocation','boolean','默认开启。空闲时停止周期探测；新调用产生后按冷却间隔合并查询。初始化、已知周期重置和预热前校验只按事件触发。'],
   ['auth_expiry_auto_repair','自动恢复失效的认证过期标记','allocation','boolean','仅处理明确标记的长期令牌：连续两次原生额度认证成功且凭据未变化后恢复。保留 OAuth/JWT 过期限制；不增加生成或预热请求。'],
   ['warmup_enabled','自动预热','warmup','boolean','开启后产生少量真实模型请求；已确认周期不重复预热。周周期先启动；第二代起闲置5h预热按15分钟槽错开，真实请求无需等待。官方固定周期只错开消耗。均衡模式在真实请求进行中及结束后的短暂间隔内暂缓预热。'],
@@ -31,9 +49,9 @@ export const fields = [
   ['quota_refresh_batch','每轮最多查询账号数','advanced','number','请求按顺序发送；默认 8。',1,100,1],
   ['stale_after','快照有效期','advanced','duration','必须不短于当前账号查询间隔。'],
   ['fallback_ban','429 未提供重置时间时冷却','advanced','duration','无法确定上游重置时间时使用。'],
-  ['max_ban','自动冷却最长时间','advanced','duration','必须不短于上述默认冷却。'],
-  ['half_open_probe_timeout','恢复探测最长占用','advanced','duration','1 分钟至 2 小时；同一账号只允许一个恢复探测。'],
-  ['half_open_retry_after','恢复探测失败后等待','advanced','duration','至少 1 秒且不超过默认冷却。'],
+  ['max_ban','本地自动退避上限','advanced','duration','必须不短于上述默认冷却；不会截短上游明确要求的 Retry-After。'],
+  ['half_open_probe_timeout','恢复探测预约期限','advanced','duration','1 分钟至 2 小时；同一凭据只允许一个恢复探测。已发送的探测等待真实结束，不因计时到期放出第二个。'],
+  ['half_open_retry_after','恢复探测失败后的基础等待','advanced','duration','至少 1 秒且不超过默认冷却；连续失败递增退避，更长的上游冷却要求优先。'],
   ['cpa_management_url','CPA 内部管理请求地址','connection','url','插件从服务器内部访问此地址，通常以 /v0/management/api-call 结尾。'],
   ['cpa_management_key_file','管理密钥文件路径','connection','text','服务器或容器中的已挂载文件路径；面板不会读取或显示密钥内容。'],
   ['state_path','调度状态文件路径','connection','text','保存账号选择、额度缓存、冷却及预热记录。更换路径前需迁移已有状态。'],
@@ -85,6 +103,10 @@ export function createSettingsEditor({api,notify,onSaved,onView}) {
       const control=controls.get(name);
       if(control)for(const input of control.closest('.setting-field').querySelectorAll('input,select'))input.disabled=!draft.account_concurrency_enabled;
     }
+    for (const name of ['continuity_pacing','continuity_max_wait','continuity_poll_interval']) {
+      const control=controls.get(name);
+      if(control)for(const input of control.closest('.setting-field').querySelectorAll('input,select'))input.disabled=!draft.continuity_enabled;
+    }
     const mode=draft.serial_5h_handoff_mode;
     for(const name of ['serial_budget_rebalance_percent','serial_weekly_rebalance_min_hold','serial_prefer_active_cycle','serial_soft_continuation']) {
       const row=controls.get(name)?.closest('.setting-field');if(row)row.hidden=draft.scheduler_mode==='balanced';
@@ -131,6 +153,18 @@ export function createSettingsEditor({api,notify,onSaved,onView}) {
     }
     if(!ids.length)list.append(make('p','muted','读取到账号后可在此单独指定套餐。'));
   }
+  function excludedRows() {
+    const list=byId('pool-5h-exclusions');if(!list)return;list.replaceChildren();
+    const selected=new Set(draft.pool_5h_excluded_accounts||[]);
+    const ids=[...new Set([...accounts,...selected])].sort();
+    for(const [index,id] of ids.entries()) {
+      const label=make('label','pool-exclusion'),input=make('input');input.type='checkbox';input.checked=selected.has(id);input.id='pool-5h-exclude-'+index;
+      input.setAttribute('aria-label','从 5h 统计排除 '+id);
+      input.addEventListener('change',()=>{const next=new Set(draft.pool_5h_excluded_accounts||[]);if(input.checked)next.add(id);else next.delete(id);draft.pool_5h_excluded_accounts=[...next].sort();update();});
+      label.append(input,make('span','account-id',id));list.append(label);
+    }
+    if(!ids.length)list.append(make('p','muted','读取到账号后可在此标记。'));
+  }
   function mount() {
     for(const group of ['allocation','warmup','advanced','connection','expert'])byId('fields-'+group).replaceChildren();
     controls.clear();
@@ -142,6 +176,18 @@ export function createSettingsEditor({api,notify,onSaved,onView}) {
       row.append(heading);
       if(type==='plans') {
         const plansBox=make('div','');plansBox.id='account-plans';row.append(plansBox);
+      } else if(type==='excluded') {
+        const box=make('div','pool-exclusions');box.id='pool-5h-exclusions';row.append(box);
+      } else if(type==='weights') {
+        const box=make('div','capacity-weights');
+        for(const [plan,text] of Object.entries(poolWeeklyLabels)) {
+          const label=make('label','',text),input=make('input');input.type='number';input.min=.001;input.max=1000;input.step='any';input.required=true;
+          input.id='setting-'+name+'-'+plan;input.setAttribute('aria-label',text+'折算 Team 容量');input.value=draft[name]?.[plan]??poolWeeklyDefaults[plan];
+          input.addEventListener('input',()=>{draft[name]={...poolWeeklyDefaults,...draft[name],[plan]:input.value===''?null:Number(input.value)};update();});
+          label.append(input,make('span','subtext','Team'));box.append(label);
+          if(!controls.has(name))controls.set(name,input);
+        }
+        row.append(box);
       } else {
         const control=make(type==='select'?'select':'input');control.id='setting-'+name;control.name=name;
         if(type==='select')for(const [value,text]of spec[5])control.append(new Option(text,value));
@@ -164,7 +210,7 @@ export function createSettingsEditor({api,notify,onSaved,onView}) {
       if(help && help!=='serial'){const text=make('p','field-help',help);text.id='help-'+name;row.append(text);controls.get(name)?.setAttribute('aria-describedby',text.id);}
       byId('fields-'+group).append(row);
     }
-    planRows();update();
+    planRows();excludedRows();update();
   }
   async function load(force=false) {
     if(loaded&&!force)return;
@@ -194,7 +240,9 @@ export function createSettingsEditor({api,notify,onSaved,onView}) {
     const changes=changed();if(!Object.keys(changes).length)return;
     for(const name of Object.keys(changes)) {
       const control=controls.get(name);
-      if(control&&!control.checkValidity()){onView(fields.find(s=>s[0]===name)[2].replace(/connection|expert/,'advanced'));control.closest('details')?.setAttribute('open','');control.reportValidity();return;}
+      for(const input of control?.closest('.setting-field')?.querySelectorAll('input,select')||[]) {
+        if(!input.checkValidity()){onView(fields.find(s=>s[0]===name)[2].replace(/connection|expert/,'advanced'));input.closest('details')?.setAttribute('open','');input.reportValidity();return;}
+      }
     }
     saving=true;const ticket=serial;update();
     try {
@@ -229,7 +277,7 @@ export function createSettingsEditor({api,notify,onSaved,onView}) {
   byId('discard-settings').addEventListener('click',async()=>{if(saving)return;try{await load(true);notify('已重新读取 CPA 设置，未保存的修改已放弃。','success');}catch(e){notify(e.message);}});
   window.addEventListener('beforeunload',event=>{if(dirty()){event.preventDefault();event.returnValue='';}});
   return {load,dirty,
-    setAccounts(values){const next=[...values].sort();if(equal(next,accounts))return;accounts=next;if(loaded)planRows();},
+    setAccounts(values){const next=[...values].sort();if(equal(next,accounts))return;accounts=next;if(loaded){planRows();excludedRows();}},
     reset(){serial++;initial={};draft={};raw={};loaded=false;saving=false;loading=null;accounts=[];form.inert=false;controls.clear();form.querySelectorAll('.settings-fields').forEach(n=>n.replaceChildren());byId('save-bar').hidden=true;},
     isSaving:()=>saving
   };

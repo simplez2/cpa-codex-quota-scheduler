@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
+	"github.com/simplez2/cpa-codex-quota-scheduler/cpasdk/pluginabi"
 	"github.com/simplez2/cpa-codex-quota-scheduler/cpasdk/pluginapi"
 )
 
@@ -162,5 +164,52 @@ func TestDemandRetainsCachedPlanWithoutRefreshingObservation(t *testing.T) {
 	_, _, source = resolvedQuotaPlan(cfg, "a", q, now)
 	if source != "default" {
 		t.Fatal("periodic behavior changed")
+	}
+}
+
+func TestImmediateRecoveryProbeOverridesStandbyBackoff(t *testing.T) {
+	now := time.Now()
+	s := newRefreshTestState(t, "http://unused.test")
+	s.quotaPolls["a"] = quotaPollState{
+		AttemptedAt: now.Add(-time.Hour),
+		NextAt:      now.Add(30 * time.Minute),
+		Failures:    2,
+		Error:       "quota_http_429",
+	}
+	s.requestImmediateQuotaProbe("a", now)
+	poll := s.quotaPolls["a"]
+	if !poll.NextAt.IsZero() || !poll.LastUsageAt.Equal(now) {
+		t.Fatalf("immediate probe did not clear standby backoff: %+v", poll)
+	}
+	if poll.Error != "quota_http_429" || poll.Failures != 2 {
+		t.Fatalf("recovery request fabricated a successful observation: %+v", poll)
+	}
+	if reason := s.quotaProbeReason("a", now); reason != "usage" {
+		t.Fatalf("probe reason = %q; want usage", reason)
+	}
+}
+
+func TestResetCPACredentialCooldownUsesHostRuntimeReset(t *testing.T) {
+	state := schedulerRuntimeState{
+		cfg: defaultPluginConfig(),
+		quotas: map[string]quotaSnapshot{
+			"acct": {AuthID: "acct", AuthIndex: "idx-acct"},
+		},
+	}
+	called := false
+	call := func(method string, payload any) (json.RawMessage, error) {
+		called = true
+		if method != pluginabi.MethodHostRoutingResetCooldown {
+			t.Fatalf("host method = %q", method)
+		}
+		req, ok := payload.(pluginapi.HostRoutingResetCooldownRequest)
+		if !ok || req.AuthIndex != "idx-acct" {
+			t.Fatalf("host request = %#v", payload)
+		}
+		return json.RawMessage(`{"auth_index":"idx-acct","models":["gpt-6.1-sol"]}`), nil
+	}
+	result, err := state.resetCPACredentialCooldown(context.Background(), "acct", call)
+	if err != nil || !called || result.AuthIndex != "idx-acct" || len(result.Models) != 1 || result.Models[0] != "gpt-6.1-sol" {
+		t.Fatalf("reset result=%#v called=%v err=%v", result, called, err)
 	}
 }

@@ -261,7 +261,7 @@ func (s *schedulerRuntimeState) planFiveHourWarmups(candidates []warmupCandidate
 	for _, index := range indices {
 		candidate := &candidates[index]
 		s.observeFiveHourPhaseLocked(candidate.Snapshot, now)
-		if normalizeWindowClass(candidate.Window.Class) != "5h" {
+		if normalizeWindowClass(candidate.Window.Class) != "5h" || candidate.EpochID != "" {
 			if phase, ok := s.fiveHourPhases[candidate.Snapshot.AuthID]; ok && !phase.PlannedResetAt.IsZero() {
 				phase.PlannedResetAt, phase.ActivateAt = time.Time{}, time.Time{}
 				s.fiveHourPhases[candidate.Snapshot.AuthID] = phase

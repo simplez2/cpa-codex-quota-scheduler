@@ -1,0 +1,1199 @@
+diff --git a/internal/pluginhost/continuity_rpc_test.go b/internal/pluginhost/continuity_rpc_test.go
+new file mode 100644
+index 0000000..e75ffc4
+--- /dev/null
++++ b/internal/pluginhost/continuity_rpc_test.go
+@@ -0,0 +1,40 @@
++package pluginhost
++
++import (
++	"context"
++	"encoding/json"
++	"testing"
++
++	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
++	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
++)
++
++type continuityCaptureClient struct {
++	method string
++	raw    []byte
++}
++
++func (c *continuityCaptureClient) Call(_ context.Context, method string, raw []byte) ([]byte, error) {
++	c.method, c.raw = method, append([]byte(nil), raw...)
++	return []byte(`{"ok":true,"result":{"action":"ready","reason":"weekly_only_available"}}`), nil
++}
++func (*continuityCaptureClient) Shutdown() {}
++
++func TestContinuityRPCRequestRetainsCandidateIdentity(t *testing.T) {
++	client := &continuityCaptureClient{}
++	adapter := &rpcPluginAdapter{client: client}
++	resp, err := adapter.Continuity(context.Background(), pluginapi.SchedulerContinuityRequest{RequestID: "request-1", PreviousAttemptRejected429: true, Pick: pluginapi.SchedulerPickRequest{Providers: []string{"codex"}, Candidates: []pluginapi.SchedulerAuthCandidate{{ID: "weekly", Provider: "codex", Metadata: map[string]any{"auth_index": "idx-weekly", "drop": make(chan struct{})}}}}})
++	if err != nil || resp.Action != "ready" || client.method != pluginabi.MethodSchedulerContinuity {
++		t.Fatalf("response=%#v method=%q err=%v", resp, client.method, err)
++	}
++	var decoded pluginapi.SchedulerContinuityRequest
++	if err := json.Unmarshal(client.raw, &decoded); err != nil {
++		t.Fatal(err)
++	}
++	if decoded.RequestID != "request-1" || !decoded.PreviousAttemptRejected429 || len(decoded.Pick.Candidates) != 1 || decoded.Pick.Candidates[0].Provider != "codex" || decoded.Pick.Candidates[0].Metadata["auth_index"] != "idx-weekly" {
++		t.Fatalf("request=%s", client.raw)
++	}
++	if _, ok := decoded.Pick.Candidates[0].Metadata["drop"]; ok {
++		t.Fatalf("unsafe metadata survived: %s", client.raw)
++	}
++}
+diff --git a/internal/pluginhost/rpc_client.go b/internal/pluginhost/rpc_client.go
+index 96e3785..298e68d 100644
+--- a/internal/pluginhost/rpc_client.go
++++ b/internal/pluginhost/rpc_client.go
+@@ -118,6 +118,9 @@ func registerRPCPlugin(ctx context.Context, host *Host, id string, client plugin
+ 		plugin.Capabilities.Scheduler = adapter
+ 		plugin.Capabilities.SchedulerAcrossPriorities = resp.Capabilities.SchedulerAcrossPriorities
+ 	}
++	if resp.Capabilities.Scheduler && resp.Capabilities.SchedulerContinuity {
++		plugin.Capabilities.SchedulerContinuity = adapter
++	}
+ 	if resp.Capabilities.ModelRouter {
+ 		plugin.Capabilities.ModelRouter = adapter
+ 	}
+@@ -220,6 +223,9 @@ func sanitizePluginRequest(request any) any {
+ 	case pluginapi.AuthModelRequest:
+ 		req.HTTPClient = nil
+ 		return req
++	case pluginapi.SchedulerContinuityRequest:
++		req.Pick = sanitizePluginRequest(req.Pick).(pluginapi.SchedulerPickRequest)
++		return req
+ 	case pluginapi.SchedulerPickRequest:
+ 		req.Options.Metadata = sanitizePluginMetadata(req.Options.Metadata)
+ 		for index := range req.Candidates {
+@@ -423,6 +429,10 @@ func (a *rpcPluginAdapter) Pick(ctx context.Context, req pluginapi.SchedulerPick
+ 	return callPlugin[pluginapi.SchedulerPickResponse](ctx, a.client, pluginabi.MethodSchedulerPick, req)
+ }
+ 
++func (a *rpcPluginAdapter) Continuity(ctx context.Context, req pluginapi.SchedulerContinuityRequest) (pluginapi.SchedulerContinuityResponse, error) {
++	return callPlugin[pluginapi.SchedulerContinuityResponse](ctx, a.client, pluginabi.MethodSchedulerContinuity, req)
++}
++
+ func (a *rpcPluginAdapter) RouteModel(ctx context.Context, req pluginapi.ModelRouteRequest) (pluginapi.ModelRouteResponse, error) {
+ 	callbackID, closeCallback := a.openHostCallbackContext(ctx)
+ 	defer closeCallback()
+diff --git a/internal/pluginhost/rpc_schema.go b/internal/pluginhost/rpc_schema.go
+index 188ed24..85242ba 100644
+--- a/internal/pluginhost/rpc_schema.go
++++ b/internal/pluginhost/rpc_schema.go
+@@ -25,6 +25,7 @@ type rpcCapabilities struct {
+ 	FrontendAuthProvider          bool                         `json:"frontend_auth_provider"`
+ 	FrontendAuthProviderExclusive bool                         `json:"frontend_auth_provider_exclusive"`
+ 	Scheduler                     bool                         `json:"scheduler"`
++	SchedulerContinuity           bool                         `json:"scheduler_continuity,omitempty"`
+ 	SchedulerAcrossPriorities     bool                         `json:"scheduler_across_priorities,omitempty"`
+ 	ModelRouter                   bool                         `json:"model_router"`
+ 	Executor                      bool                         `json:"executor"`
+@@ -167,6 +168,7 @@ func rpcCapabilitiesFromPlugin(plugin pluginapi.Plugin) rpcCapabilities {
+ 		FrontendAuthProvider:          caps.FrontendAuthProvider != nil,
+ 		FrontendAuthProviderExclusive: caps.FrontendAuthProvider != nil && caps.FrontendAuthProviderExclusive,
+ 		Scheduler:                     caps.Scheduler != nil,
++		SchedulerContinuity:           caps.SchedulerContinuity != nil,
+ 		SchedulerAcrossPriorities:     schedulerWantsAcrossPriorities(caps),
+ 		ModelRouter:                   caps.ModelRouter != nil,
+ 		Executor:                      caps.Executor != nil,
+diff --git a/internal/pluginhost/scheduler.go b/internal/pluginhost/scheduler.go
+index 2ed9d92..faa4d03 100644
+--- a/internal/pluginhost/scheduler.go
++++ b/internal/pluginhost/scheduler.go
+@@ -30,6 +30,29 @@ func (h *Host) PickAuth(ctx context.Context, req pluginapi.SchedulerPickRequest)
+ 	return resp, true, nil
+ }
+ 
++// HasSchedulerContinuity reports whether the active scheduler advertised the optional capability.
++func (h *Host) HasSchedulerContinuity() bool {
++	record := h.schedulerRecord()
++	return record != nil && record.plugin.Capabilities.SchedulerContinuity != nil && h.recordCurrent(*record)
++}
++
++// SchedulerContinuity queries the same active scheduler, if it opted into continuity.
++func (h *Host) SchedulerContinuity(ctx context.Context, req pluginapi.SchedulerContinuityRequest) (resp pluginapi.SchedulerContinuityResponse, handled bool, err error) {
++	record := h.schedulerRecord()
++	if record == nil || record.plugin.Capabilities.SchedulerContinuity == nil || !h.recordCurrent(*record) {
++		return pluginapi.SchedulerContinuityResponse{}, false, nil
++	}
++	defer func() {
++		if recovered := recover(); recovered != nil {
++			h.fusePlugin(record.id, "Scheduler.Continuity", recovered)
++			resp, handled, err = pluginapi.SchedulerContinuityResponse{}, false, nil
++		}
++	}()
++	req.Pick.Plugin = record.meta
++	resp, err = record.plugin.Capabilities.SchedulerContinuity.Continuity(ctx, req)
++	return resp, true, err
++}
++
+ func (h *Host) HasScheduler() bool {
+ 	return h.schedulerRecord() != nil
+ }
+diff --git a/sdk/api/handlers/handlers_execution.go b/sdk/api/handlers/handlers_execution.go
+index 225cbe6..415eb2a 100644
+--- a/sdk/api/handlers/handlers_execution.go
++++ b/sdk/api/handlers/handlers_execution.go
+@@ -74,6 +74,7 @@ func (h *BaseAPIHandler) executeWithAuthManagerFormats(ctx context.Context, entr
+ 	}
+ 	afterAuthCapture := &requestAfterAuthCapture{}
+ 	lifecycle := h.newRequestLifecycleTracker(ctx, entryProtocol, normalizedModel, originalRequestedModel, false, reqMeta, execOptions.SkipInterceptorPluginID)
++	reqMeta[coreexecutor.RequestLifecycleIDMetadataKey] = lifecycle.requestID()
+ 	opts := coreexecutor.Options{
+ 		Stream:                      false,
+ 		Alt:                         alt,
+@@ -145,6 +146,7 @@ func (h *BaseAPIHandler) executeCountWithAuthManager(ctx context.Context, handle
+ 	}
+ 	afterAuthCapture := &requestAfterAuthCapture{}
+ 	lifecycle := h.newRequestLifecycleTracker(ctx, handlerType, normalizedModel, originalRequestedModel, false, reqMeta, execOptions.SkipInterceptorPluginID)
++	reqMeta[coreexecutor.RequestLifecycleIDMetadataKey] = lifecycle.requestID()
+ 	opts := coreexecutor.Options{
+ 		Stream:                      false,
+ 		Alt:                         alt,
+diff --git a/sdk/api/handlers/handlers_routing.go b/sdk/api/handlers/handlers_routing.go
+index e729770..d52390f 100644
+--- a/sdk/api/handlers/handlers_routing.go
++++ b/sdk/api/handlers/handlers_routing.go
+@@ -97,6 +97,24 @@ func excludeExecutionProvider(providers []string, excluded string) []string {
+ 	return out
+ }
+ 
++// CanWaitForCodexContinuity leaves unrelated model routes on their existing
++// synchronous execution path. The manager still performs authoritative checks.
++func (h *BaseAPIHandler) CanWaitForCodexContinuity(modelName string) bool {
++	if h == nil || h.AuthManager == nil || h.AuthManager.HomeEnabled() || !h.AuthManager.HasSchedulerContinuity() {
++		return false
++	}
++	providers, _, err := h.getRequestDetails(modelName)
++	if err != nil || len(providers) == 0 {
++		return false
++	}
++	for _, provider := range providers {
++		if !strings.EqualFold(strings.TrimSpace(provider), "codex") {
++			return false
++		}
++	}
++	return true
++}
++
+ func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string, normalizedModel string, err *interfaces.ErrorMessage) {
+ 	return h.getRequestDetailsWithOptions(modelName, false)
+ }
+diff --git a/sdk/api/handlers/handlers_stream.go b/sdk/api/handlers/handlers_stream.go
+index 935b00c..8cb95f2 100644
+--- a/sdk/api/handlers/handlers_stream.go
++++ b/sdk/api/handlers/handlers_stream.go
+@@ -8,6 +8,7 @@ import (
+ 
+ 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
+ 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
++	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+ 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+ 	coreusage "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
+ 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
+@@ -335,6 +336,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
+ 	}
+ 	afterAuthCapture := &requestAfterAuthCapture{}
+ 	lifecycle := h.newRequestLifecycleTracker(ctx, entryProtocol, normalizedModel, originalRequestedModel, true, reqMeta, execOptions.SkipInterceptorPluginID)
++	reqMeta[coreexecutor.RequestLifecycleIDMetadataKey] = lifecycle.requestID()
+ 	opts := coreexecutor.Options{
+ 		Stream:                      true,
+ 		Alt:                         alt,
+@@ -359,6 +361,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
+ 		return nil, nil, errChan
+ 	}
+ 	ctx = enrichContextWithSessionHierarchy(ctx, opts.Headers, req.Payload, opts.Metadata)
++	ctx = coreauth.WithContinuityBudget(ctx)
+ 	streamResult, err := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
+ 	if err != nil {
+ 		err = enrichAuthSelectionError(err, providers, normalizedModel)
+@@ -561,7 +564,11 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
+ 			break
+ 		}
+ 		bootstrapRetries++
+-		retryResult, retryErr := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
++		retryCtx := ctx
++		if executionErrorMessage(bootstrapStreamErr).StatusCode == http.StatusTooManyRequests {
++			retryCtx = coreauth.WithContinuityRejected429(ctx)
++		}
++		retryResult, retryErr := h.AuthManager.ExecuteStream(retryCtx, providers, req, opts)
+ 		if retryErr != nil {
+ 			originalBootstrapErr := executionErrorMessage(bootstrapStreamErr)
+ 			if isAuthSelectionUnavailable(retryErr) && originalBootstrapErr.StatusCode >= http.StatusInternalServerError {
+diff --git a/sdk/api/handlers/openai/openai_responses_handlers.go b/sdk/api/handlers/openai/openai_responses_handlers.go
+index 9990207..bfb7bfe 100644
+--- a/sdk/api/handlers/openai/openai_responses_handlers.go
++++ b/sdk/api/handlers/openai/openai_responses_handlers.go
+@@ -16,6 +16,7 @@ import (
+ 	"regexp"
+ 	"sort"
+ 	"strings"
++	"time"
+ 
+ 	"github.com/gin-gonic/gin"
+ 	"github.com/router-for-me/CLIProxyAPI/v8/internal/client/codex/optimize-multi-agent-v2"
+@@ -23,6 +24,7 @@ import (
+ 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
+ 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+ 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
++	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+ 	"github.com/tidwall/gjson"
+ 	"github.com/tidwall/sjson"
+ )
+@@ -703,7 +705,8 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
+ 	// New core execution path
+ 	modelName := gjson.GetBytes(rawJSON, "model").String()
+ 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+-	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
++	waitSignal := make(chan struct{}, 1)
++	cliCtx = coreauth.WithContinuityWaitNotifier(cliCtx, waitSignal)
+ 
+ 	setSSEHeaders := func() {
+ 		c.Header("Content-Type", "text/event-stream")
+@@ -719,12 +722,88 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
+ 	framer := &responsesSSEFramer{failureEvent: failureEvent, isCodexClient: isCodexClient}
+ 	var initialOutput bytes.Buffer
+ 
++	// Keep the response uncommitted for normal requests. Only an actual
++	// continuity wait enables early SSE comments; after that errors are SSE.
++	type streamStart struct {
++		data    <-chan []byte
++		headers http.Header
++		errs    <-chan *interfaces.ErrorMessage
++	}
++	started := make(chan streamStart, 1)
++	var dataChan <-chan []byte
++	var upstreamHeaders http.Header
++	var errChan <-chan *interfaces.ErrorMessage
++	if !h.CanWaitForCodexContinuity(modelName) {
++		dataChan, upstreamHeaders, errChan = h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
++	} else {
++		go func() {
++			data, headers, errs := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
++			started <- streamStart{data: data, headers: headers, errs: errs}
++		}()
++	}
++	var keepalive *time.Ticker
++	var keepaliveC <-chan time.Time
++	defer func() {
++		if keepalive != nil {
++			keepalive.Stop()
++		}
++	}()
++	heartbeatSent := false
++	startKeepalive := func() {
++		if keepalive != nil {
++			return
++		}
++		interval := handlers.StreamingKeepAliveInterval(h.Cfg)
++		if interval <= 0 {
++			interval = 15 * time.Second
++		}
++		keepalive = time.NewTicker(interval)
++		keepaliveC = keepalive.C
++	}
++	writeKeepalive := func() bool {
++		setSSEHeaders()
++		if _, err := c.Writer.Write([]byte(": keep-alive\n\n")); err != nil {
++			cliCancel(err)
++			return false
++		}
++		flusher.Flush()
++		heartbeatSent = true
++		return true
++	}
++	for dataChan == nil && errChan == nil {
++		select {
++		case result := <-started:
++			dataChan, upstreamHeaders, errChan = result.data, result.headers, result.errs
++			if dataChan == nil && errChan == nil {
++				failed := make(chan *interfaces.ErrorMessage, 1)
++				failed <- &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("execution returned no stream")}
++				close(failed)
++				errChan = failed
++			}
++		case <-waitSignal:
++			startKeepalive()
++		case <-keepaliveC:
++			if !writeKeepalive() {
++				return
++			}
++		case <-c.Request.Context().Done():
++			cliCancel(c.Request.Context().Err())
++			return
++		}
++	}
++
+ 	// Peek at the first complete SSE data frame.
+ 	for {
+ 		select {
+ 		case <-c.Request.Context().Done():
+ 			cliCancel(c.Request.Context().Err())
+ 			return
++		case <-waitSignal:
++			startKeepalive()
++		case <-keepaliveC:
++			if !writeKeepalive() {
++				return
++			}
+ 		case errMsg, ok := <-errChan:
+ 			if !ok {
+ 				// Err channel closed cleanly; wait for data channel.
+@@ -736,7 +815,7 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
+ 			if framer.dataFrames == 0 {
+ 				safeErrMsg = sanitizeResponsesInitialErrorMessage(errMsg)
+ 			}
+-			if safeErrMsg != nil && framer.dataFrames > 0 {
++			if safeErrMsg != nil && (framer.dataFrames > 0 || heartbeatSent) {
+ 				setSSEHeaders()
+ 				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+ 				_, _ = c.Writer.Write(initialOutput.Bytes())
+@@ -773,7 +852,7 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
+ 					errMsg = sanitizeResponsesInitialErrorMessage(errMsg)
+ 				}
+ 
+-				if framer.dataFrames > 0 {
++				if framer.dataFrames > 0 || heartbeatSent {
+ 					setSSEHeaders()
+ 					handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+ 					_, _ = c.Writer.Write(initialOutput.Bytes())
+diff --git a/sdk/api/handlers/openai/openai_responses_websocket.go b/sdk/api/handlers/openai/openai_responses_websocket.go
+index 35bfc33..bd11509 100644
+--- a/sdk/api/handlers/openai/openai_responses_websocket.go
++++ b/sdk/api/handlers/openai/openai_responses_websocket.go
+@@ -730,7 +730,60 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
+ 		if executionAuthID != "" && !isPluginExecutorRoute {
+ 			cliCtx = handlers.WithPinnedAuthID(cliCtx, executionAuthID)
+ 		}
+-		dataChan, _, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, requestJSON, "")
++		var dataChan <-chan []byte
++		var errChan <-chan *interfaces.ErrorMessage
++		if !h.CanWaitForCodexContinuity(modelName) {
++			dataChan, _, errChan = h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, requestJSON, "")
++		} else {
++			// A continuity wait happens before ExecuteStreamWithAuthManager returns.
++			// Keep the websocket alive without writing application data or replaying a turn.
++			waitSignal := make(chan struct{}, 1)
++			cliCtx = coreauth.WithContinuityWaitNotifier(cliCtx, waitSignal)
++			type websocketStreamStart struct {
++				data <-chan []byte
++				errs <-chan *interfaces.ErrorMessage
++			}
++			started := make(chan websocketStreamStart, 1)
++			go func() {
++				data, _, errs := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, requestJSON, "")
++				started <- websocketStreamStart{data: data, errs: errs}
++			}()
++			var waitTicker *time.Ticker
++			var waitTick <-chan time.Time
++			waitingForStart := true
++			for waitingForStart {
++				select {
++				case result := <-started:
++					dataChan, errChan = result.data, result.errs
++					waitingForStart = false
++				case <-waitSignal:
++					if waitTicker == nil {
++						interval := handlers.StreamingKeepAliveInterval(h.Cfg)
++						if interval <= 0 {
++							interval = 15 * time.Second
++						}
++						waitTicker = time.NewTicker(interval)
++						waitTick = waitTicker.C
++					}
++				case <-waitTick:
++					if errPing := writer.writePing(); errPing != nil {
++						cliCancel(errPing)
++						waitTicker.Stop()
++						wsTerminateErr = errPing
++						return
++					}
++				case <-c.Request.Context().Done():
++					cliCancel(c.Request.Context().Err())
++					if waitTicker != nil {
++						waitTicker.Stop()
++					}
++					return
++				}
++			}
++			if waitTicker != nil {
++				waitTicker.Stop()
++			}
++		}
+ 		if !selectedAuthObserved {
+ 			// Plugin/alternate routes bypass auth selection. Keep canonical HTTP-mode
+ 			// state instead of inheriting the previous pinned websocket mode.
+diff --git a/sdk/cliproxy/auth/conductor_execution.go b/sdk/cliproxy/auth/conductor_execution.go
+index d84071d..7ddf0a1 100644
+--- a/sdk/cliproxy/auth/conductor_execution.go
++++ b/sdk/cliproxy/auth/conductor_execution.go
+@@ -130,6 +130,11 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
+ 		return resp, unwrapExecutionBoundaryError(errHome)
+ 	}
+ 
++	ctx = WithContinuityBudget(ctx)
++	if _, errWait := m.waitForSchedulerContinuity(ctx, normalized, authSelectionModelFromOptions(opts, req.Model), opts); errWait != nil {
++		return cliproxyexecutor.Response{}, errWait
++	}
++
+ 	defaultRequestRetry, maxRetryCredentials, maxWait := m.retrySettings()
+ 
+ 	var lastErr error
+@@ -244,6 +249,13 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
+ 		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
+ 	}
+ 
++	if !m.HomeEnabled() {
++		ctx = WithContinuityBudget(ctx)
++		if _, errWait := m.waitForSchedulerContinuity(ctx, normalized, authSelectionModelFromOptions(opts, req.Model), opts); errWait != nil {
++			return nil, errWait
++		}
++	}
++
+ 	defaultRequestRetry, maxRetryCredentials, maxWait := m.retrySettings()
+ 
+ 	var lastErr error
+@@ -489,8 +501,26 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req
+ 	attempted := make(map[string]struct{})
+ 	var lastErr error
+ 	var upstreamErr error
++	continuityReplaySafe := retryRound == 0
++	recoverConfirmedQuota := func() (bool, error) {
++		if homeMode || !continuityReplaySafe || lastErr == nil || statusCodeFromError(lastErr) != http.StatusTooManyRequests {
++			return false, nil
++		}
++		ready, err := m.waitAfterConfirmed429(ctx, providers, routeModel, opts)
++		if err != nil || !ready {
++			return false, err
++		}
++		tried, attempted = make(map[string]struct{}), make(map[string]struct{})
++		lastErr, upstreamErr = nil, nil
++		return true, nil
++	}
+ 	for {
+ 		if maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials {
++			if ready, errWait := recoverConfirmedQuota(); errWait != nil {
++				return cliproxyexecutor.Response{}, errWait
++			} else if ready {
++				continue
++			}
+ 			if lastErr != nil {
+ 				return cliproxyexecutor.Response{}, preferredExecutionAttemptError(lastErr, upstreamErr)
+ 			}
+@@ -504,6 +534,11 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req
+ 		}
+ 		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, pickOpts, tried)
+ 		if errPick != nil {
++			if ready, errWait := recoverConfirmedQuota(); errWait != nil {
++				return cliproxyexecutor.Response{}, errWait
++			} else if ready {
++				continue
++			}
+ 			if shouldReturnLastErrorOnPickFailure(homeMode, lastErr, errPick) {
+ 				return cliproxyexecutor.Response{}, preferredExecutionAttemptError(lastErr, upstreamErr)
+ 			}
+@@ -531,6 +566,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req
+ 		var errPrepare error
+ 		auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
+ 		if errPrepare != nil {
++			continuityReplaySafe = false
+ 			if errCancel := claudeOAuthRequestCancellation(execCtx, auth, errPrepare); errCancel != nil {
+ 				return cliproxyexecutor.Response{}, errCancel
+ 			}
+@@ -587,6 +623,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req
+ 			errExec = markUpstreamExecutionAttemptFromContext(execCtx, errExec)
+ 			durationExec := time.Since(startExec)
+ 			if errExec != nil {
++				if len(models) != 1 || statusCodeFromError(errExec) != http.StatusTooManyRequests {
++					continuityReplaySafe = false
++				}
+ 				if hasUpstreamExecutionAttempt(errExec) {
+ 					upstreamErr = errExec
+ 				}
+@@ -923,9 +962,30 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
+ 	var lastErr error
+ 	var upstreamErr error
+ 	var roundTiming homeRetryRoundTiming
++	continuityReplaySafe := retryRound == 0
++	recoverConfirmedQuota := func() (bool, error) {
++		if homeMode || !continuityReplaySafe || lastErr == nil || statusCodeFromError(lastErr) != http.StatusTooManyRequests {
++			return false, nil
++		}
++		ready, err := m.waitAfterConfirmed429(ctx, providers, routeModel, opts)
++		if err != nil || !ready {
++			return false, err
++		}
++		// The previous attempts were rejected before output. Rebuild the whole
++		// candidate set so a recovered credential can be selected again.
++		tried = make(map[string]struct{})
++		attempted = make(map[string]struct{})
++		lastErr, upstreamErr = nil, nil
++		return true, nil
++	}
+ 	for {
+ 		allowSameAuthRetry := homeMode && homeSameAuthRetryPending && lastHomeAuthID != "" && homeSameAuthRetries[lastHomeAuthID] == 0
+ 		if maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials && !allowSameAuthRetry {
++			if ready, errWait := recoverConfirmedQuota(); errWait != nil {
++				return nil, errWait
++			} else if ready {
++				continue
++			}
+ 			if lastErr != nil {
+ 				preferredErr := preferredExecutionAttemptError(lastErr, upstreamErr)
+ 				if homeMode {
+@@ -958,6 +1018,11 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
+ 			auth, executor, provider, errPick = m.pickNextMixed(ctx, providers, routeModel, pickOpts, tried)
+ 		}
+ 		if errPick != nil {
++			if ready, errWait := recoverConfirmedQuota(); errWait != nil {
++				return nil, errWait
++			} else if ready {
++				continue
++			}
+ 			preferredErr := preferredExecutionAttemptError(lastErr, upstreamErr)
+ 			var homeCooldown *homeDispatchRetryAfterError
+ 			if homeMode && lastErr != nil && errors.As(errPick, &homeCooldown) && homeCooldown != nil {
+@@ -1075,6 +1140,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
+ 			auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
+ 		}
+ 		if errPrepare != nil {
++			continuityReplaySafe = false
+ 			if selection != nil {
+ 				excludeAuth := shouldExcludeHomeAuthAfterStreamError(execCtx, auth, errPrepare)
+ 				if homeSameAuthRetries[auth.ID] > 0 {
+@@ -1164,6 +1230,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
+ 		}
+ 		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, execReq, execOpts, routeModel, streamExecutionModel, models, pooled, aliasResult, routing, !homeMode || selection != nil, selection != nil)
+ 		if errStream != nil {
++			if len(models) != 1 || statusCodeFromError(errStream) != http.StatusTooManyRequests {
++				continuityReplaySafe = false
++			}
+ 			if hasUpstreamExecutionAttempt(errStream) {
+ 				upstreamErr = errStream
+ 			}
+diff --git a/sdk/cliproxy/auth/scheduler_continuity.go b/sdk/cliproxy/auth/scheduler_continuity.go
+new file mode 100644
+index 0000000..6aaf544
+--- /dev/null
++++ b/sdk/cliproxy/auth/scheduler_continuity.go
+@@ -0,0 +1,299 @@
++package auth
++
++import (
++	"context"
++	"fmt"
++	"strings"
++	"time"
++
++	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
++	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
++	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
++	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
++)
++
++// HasSchedulerContinuity reports whether the active plugin advertises continuity.
++func (m *Manager) HasSchedulerContinuity() bool {
++	if m == nil {
++		return false
++	}
++	m.mu.RLock()
++	scheduler := m.pluginScheduler
++	m.mu.RUnlock()
++	if state, ok := scheduler.(interface{ HasSchedulerContinuity() bool }); ok {
++		return state.HasSchedulerContinuity()
++	}
++	return false
++}
++
++type schedulerContinuityProvider interface {
++	SchedulerContinuity(context.Context, pluginapi.SchedulerContinuityRequest) (pluginapi.SchedulerContinuityResponse, bool, error)
++}
++
++type continuityNotifierKey struct{}
++type continuityBudgetKey struct{}
++type continuityBudget struct{ started, deadline time.Time }
++
++// WithContinuityBudget retains a single wait deadline across bootstrap retries.
++func WithContinuityBudget(ctx context.Context) context.Context {
++	if ctx == nil {
++		ctx = context.Background()
++	}
++	if _, ok := ctx.Value(continuityBudgetKey{}).(*continuityBudget); ok {
++		return ctx
++	}
++	return context.WithValue(ctx, continuityBudgetKey{}, &continuityBudget{})
++}
++
++type continuityRejected429Key struct{}
++
++// WithContinuityRejected429 records a definite rejected attempt before output.
++func WithContinuityRejected429(ctx context.Context) context.Context {
++	return context.WithValue(ctx, continuityRejected429Key{}, true)
++}
++
++// WithContinuityWaitNotifier reports entry into an actual pre-admission wait.
++func WithContinuityWaitNotifier(ctx context.Context, notify chan<- struct{}) context.Context {
++	return context.WithValue(ctx, continuityNotifierKey{}, notify)
++}
++
++func notifyContinuityWait(ctx context.Context) {
++	if notify, ok := ctx.Value(continuityNotifierKey{}).(chan<- struct{}); ok && notify != nil {
++		select {
++		case notify <- struct{}{}:
++		default:
++		}
++	}
++}
++
++func waitContinuityTimer(ctx context.Context, delay time.Duration) error {
++	timer := time.NewTimer(delay)
++	defer timer.Stop()
++	select {
++	case <-ctx.Done():
++		return ctx.Err()
++	case <-timer.C:
++		return nil
++	}
++}
++
++// waitForSchedulerContinuity runs only before the first upstream attempt. The
++// decision is rebuilt from live candidates at every wakeup, never from a stale
++// snapshot. Unsupported plugins and Home retain their existing behavior.
++func (m *Manager) waitForSchedulerContinuity(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options) (bool, error) {
++	if ctx == nil {
++		ctx = context.Background()
++	}
++	budget, _ := ctx.Value(continuityBudgetKey{}).(*continuityBudget)
++	if budget == nil {
++		budget = &continuityBudget{}
++	}
++	previous, _ := ctx.Value(continuityRejected429Key{}).(bool)
++	if previous {
++		return m.waitAfterConfirmed429(ctx, providers, model, opts)
++	}
++	_, waited, err := runContinuityGate(ctx, budget, func() (pluginapi.SchedulerContinuityResponse, bool, error) {
++		return m.schedulerContinuityDecision(ctx, providers, model, opts, false)
++	}, time.Now, waitContinuityTimer)
++	return waited, err
++}
++
++func runContinuityGate(ctx context.Context, budget *continuityBudget, decide func() (pluginapi.SchedulerContinuityResponse, bool, error), now func() time.Time, wait func(context.Context, time.Duration) error) (string, bool, error) {
++	waited := false
++	for {
++		if err := ctx.Err(); err != nil {
++			return "", waited, err
++		}
++		if !budget.deadline.IsZero() && !now().Before(budget.deadline) {
++			return "", waited, &Error{Code: "scheduler_continuity_timeout", Message: "scheduler continuity wait expired", HTTPStatus: 503}
++		}
++		resp, handled, err := decide()
++		if err != nil {
++			return "", waited, fmt.Errorf("scheduler continuity: %w", err)
++		}
++		if err := ctx.Err(); err != nil {
++			return "", waited, err
++		}
++		if !budget.deadline.IsZero() && handled && resp.Action != "disabled" && resp.MaxWaitMS >= 1000 && resp.MaxWaitMS <= int64((24*time.Hour)/time.Millisecond) {
++			configuredDeadline := budget.started.Add(time.Duration(resp.MaxWaitMS) * time.Millisecond)
++			if configuredDeadline.Before(budget.deadline) {
++				budget.deadline = configuredDeadline
++			}
++		}
++		if !budget.deadline.IsZero() && !now().Before(budget.deadline) {
++			return "", waited, &Error{Code: "scheduler_continuity_timeout", Message: "scheduler continuity wait expired", HTTPStatus: 503}
++		}
++		if !handled || resp.Action != "wait" {
++			return resp.Action, waited, nil
++		}
++		if !budget.deadline.IsZero() && !now().Before(budget.deadline) {
++			return "", waited, &Error{Code: "scheduler_continuity_timeout", Message: "scheduler continuity wait expired", HTTPStatus: 503}
++		}
++		if resp.MaxWaitMS < 1000 || resp.MaxWaitMS > int64((24*time.Hour)/time.Millisecond) {
++			return "", waited, &Error{Code: "scheduler_continuity_invalid", Message: "invalid scheduler continuity wait budget", HTTPStatus: 503}
++		}
++		if budget.started.IsZero() {
++			budget.started = now()
++		}
++		newDeadline := budget.started.Add(time.Duration(resp.MaxWaitMS) * time.Millisecond)
++		if budget.deadline.IsZero() || newDeadline.Before(budget.deadline) {
++			budget.deadline = newDeadline
++		}
++		remaining := budget.deadline.Sub(now())
++		if remaining <= 0 {
++			return "", waited, &Error{Code: "scheduler_continuity_timeout", Message: "scheduler continuity wait expired", HTTPStatus: 503}
++		}
++		retryMS := resp.RetryAfterMS
++		if retryMS < 1000 {
++			retryMS = 1000
++		}
++		if retryMS > int64((5*time.Minute)/time.Millisecond) {
++			retryMS = int64((5 * time.Minute) / time.Millisecond)
++		}
++		delay := time.Duration(retryMS) * time.Millisecond
++		if delay > remaining {
++			delay = remaining
++		}
++		notifyContinuityWait(ctx)
++		waited = true
++		if err := wait(ctx, delay); err != nil {
++			return "", waited, err
++		}
++	}
++}
++
++func (m *Manager) schedulerContinuityDecision(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, previous429 bool) (pluginapi.SchedulerContinuityResponse, bool, error) {
++	providerSet := make(map[string]struct{}, len(providers))
++	for _, provider := range providers {
++		key := canonicalSchedulingProvider(provider)
++		if key != "codex" {
++			return pluginapi.SchedulerContinuityResponse{}, false, nil
++		}
++		providerSet[key] = struct{}{}
++	}
++	pinned := pinnedAuthIDFromMetadata(opts.Metadata)
++	eligibility := authSelectionEligibilityForRequest(ctx, opts)
++	modelKey := strings.TrimSpace(model)
++	if modelKey != "" {
++		parsed := thinking.ParseSuffix(modelKey)
++		if parsed.ModelName != "" {
++			modelKey = strings.TrimSpace(parsed.ModelName)
++		}
++	}
++	registryRef := registry.GetGlobalRegistry()
++	m.mu.RLock()
++	scheduler, ok := m.pluginScheduler.(schedulerContinuityProvider)
++	if !ok || scheduler == nil {
++		m.mu.RUnlock()
++		return pluginapi.SchedulerContinuityResponse{}, false, nil
++	}
++	candidates := make([]*Auth, 0, len(m.auths))
++	for _, candidate := range m.auths {
++		if candidate == nil || candidate.Disabled || candidate.Status == StatusDisabled {
++			continue
++		}
++		if pinned != "" && candidate.ID != pinned {
++			continue
++		}
++		if !eligibility.allows(candidate) {
++			continue
++		}
++		providerKey := canonicalSchedulingProvider(executorKeyFromAuth(candidate))
++		if _, ok := providerSet[providerKey]; !ok {
++			continue
++		}
++		if _, ok := m.executorLocked(providerKey); !ok {
++			continue
++		}
++		if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
++			continue
++		}
++		// Preserve only native quota cooldowns for reassessment. Disabled,
++		// unauthorized, expired, overload and other failures remain native errors.
++		selectionModel := m.selectionModelForAuth(candidate, model)
++		blocked, reason, _ := isAuthBlockedForModel(candidate, selectionModel, time.Now())
++		if blocked && reason != blockReasonCooldown {
++			continue
++		}
++		if blocked {
++			// Prefer the selected model's current error over a stale credential-level
++			// LastError. Never reinterpret a current non-quota failure as quota.
++			var relevantError *Error
++			matchedModel := false
++			for stateModel, state := range candidate.ModelStates {
++				if state != nil && canonicalModelKey(stateModel) == canonicalModelKey(selectionModel) {
++					matchedModel = true
++					relevantError = state.LastError
++					break
++				}
++			}
++			if !matchedModel {
++				relevantError = candidate.LastError
++			}
++			if relevantError != nil && relevantError.StatusCode() != 0 && relevantError.StatusCode() != 429 {
++				continue
++			}
++		}
++		candidates = append(candidates, candidate.Clone())
++	}
++	m.mu.RUnlock()
++	if len(candidates) == 0 && !previous429 {
++		return pluginapi.SchedulerContinuityResponse{}, false, nil
++	}
++	requestID, _ := opts.Metadata[cliproxyexecutor.RequestLifecycleIDMetadataKey].(string)
++	visibleCandidates := schedulerAuthCandidates(candidates)
++	for i, candidate := range candidates {
++		visibleCandidates[i].Metadata = map[string]any{"auth_index": candidate.EnsureIndex()}
++	}
++	req := pluginapi.SchedulerContinuityRequest{RequestID: requestID, PreviousAttemptRejected429: previous429, Pick: pluginapi.SchedulerPickRequest{
++		Providers: schedulerProviders("mixed", providers), Model: model, Stream: opts.Stream,
++		Options: schedulerOptions(opts), Candidates: visibleCandidates,
++	}}
++	return scheduler.SchedulerContinuity(ctx, req)
++}
++
++// waitAfterConfirmed429 reconciles asynchronous usage delivery for a bounded
++// interval. It permits redispatch only after the plugin positively identifies a
++// five-hour exhaustion and subsequently reports a ready account.
++func (m *Manager) waitAfterConfirmed429(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options) (bool, error) {
++	deadline := time.Now().Add(2 * time.Second)
++	previous := true
++	for {
++		if err := ctx.Err(); err != nil {
++			return false, err
++		}
++		resp, handled, err := m.schedulerContinuityDecision(ctx, providers, model, opts, previous)
++		previous = false
++		if err != nil {
++			return false, fmt.Errorf("scheduler continuity: %w", err)
++		}
++		if !handled || resp.Action == "disabled" {
++			return false, nil
++		}
++		if resp.Action == "wait" && (resp.Reason == "five_hour_exhausted" || resp.Reason == "five_hour_recheck") {
++			budget, _ := ctx.Value(continuityBudgetKey{}).(*continuityBudget)
++			if budget == nil {
++				budget = &continuityBudget{}
++			}
++			first := true
++			action, _, err := runContinuityGate(ctx, budget, func() (pluginapi.SchedulerContinuityResponse, bool, error) {
++				if first {
++					first = false
++					return resp, true, nil
++				}
++				return m.schedulerContinuityDecision(ctx, providers, model, opts, false)
++			}, time.Now, waitContinuityTimer)
++			return action == "ready", err
++		}
++		remaining := time.Until(deadline)
++		if remaining <= 0 {
++			return false, nil
++		}
++		if remaining > 100*time.Millisecond {
++			remaining = 100 * time.Millisecond
++		}
++		if err := waitContinuityTimer(ctx, remaining); err != nil {
++			return false, err
++		}
++	}
++}
+diff --git a/sdk/cliproxy/auth/scheduler_continuity_test.go b/sdk/cliproxy/auth/scheduler_continuity_test.go
+new file mode 100644
+index 0000000..aa263f5
+--- /dev/null
++++ b/sdk/cliproxy/auth/scheduler_continuity_test.go
+@@ -0,0 +1,244 @@
++package auth
++
++import (
++	"context"
++	"errors"
++	"net/http"
++	"sync"
++	"testing"
++	"time"
++
++	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
++	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
++)
++
++type continuityTestScheduler struct {
++	decide func(context.Context, pluginapi.SchedulerContinuityRequest) (pluginapi.SchedulerContinuityResponse, bool, error)
++}
++
++func (s *continuityTestScheduler) PickAuth(_ context.Context, req pluginapi.SchedulerPickRequest) (pluginapi.SchedulerPickResponse, bool, error) {
++	if len(req.Candidates) == 0 {
++		return pluginapi.SchedulerPickResponse{}, false, nil
++	}
++	return pluginapi.SchedulerPickResponse{Handled: true, AuthID: req.Candidates[0].ID}, true, nil
++}
++func (s *continuityTestScheduler) SchedulerContinuity(ctx context.Context, req pluginapi.SchedulerContinuityRequest) (pluginapi.SchedulerContinuityResponse, bool, error) {
++	return s.decide(ctx, req)
++}
++
++type continuity429Executor struct {
++	schedulerTestExecutor
++	mu     sync.Mutex
++	calls  int
++	status int
++}
++
++func (e *continuity429Executor) Identifier() string { return "codex" }
++func (e *continuity429Executor) Execute(_ context.Context, _ *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
++	e.mu.Lock()
++	defer e.mu.Unlock()
++	e.calls++
++	if e.calls == 1 {
++		return cliproxyexecutor.Response{}, &Error{HTTPStatus: e.status, Message: "fixture"}
++	}
++	return cliproxyexecutor.Response{Payload: []byte("recovered")}, nil
++}
++func (e *continuity429Executor) ExecuteStream(_ context.Context, _ *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
++	e.mu.Lock()
++	defer e.mu.Unlock()
++	e.calls++
++	if e.calls == 1 {
++		return nil, &Error{HTTPStatus: e.status, Message: "fixture"}
++	}
++	ch := make(chan cliproxyexecutor.StreamChunk, 1)
++	ch <- cliproxyexecutor.StreamChunk{Payload: []byte("data: recovered\n\n")}
++	close(ch)
++	return &cliproxyexecutor.StreamResult{Chunks: ch}, nil
++}
++
++func TestContinuityGateRechecksAndBoundsTotalWait(t *testing.T) {
++	now := time.Unix(1000, 0)
++	budget := &continuityBudget{}
++	calls := 0
++	decide := func() (pluginapi.SchedulerContinuityResponse, bool, error) {
++		calls++
++		if calls == 2 {
++			return pluginapi.SchedulerContinuityResponse{Action: "ready"}, true, nil
++		}
++		return pluginapi.SchedulerContinuityResponse{Action: "wait", RetryAfterMS: 1000, MaxWaitMS: 3000}, true, nil
++	}
++	action, waited, err := runContinuityGate(context.Background(), budget, decide, func() time.Time { return now }, func(_ context.Context, d time.Duration) error { now = now.Add(d); return nil })
++	if err != nil || !waited || action != "ready" || calls != 2 {
++		t.Fatalf("first gate: %q %v %v calls=%d", action, waited, err, calls)
++	}
++	deadline := budget.deadline
++	calls = 0
++	_, _, err = runContinuityGate(context.Background(), budget, func() (pluginapi.SchedulerContinuityResponse, bool, error) {
++		calls++
++		return pluginapi.SchedulerContinuityResponse{Action: "wait", RetryAfterMS: 1000, MaxWaitMS: 240000}, true, nil
++	}, func() time.Time { return now }, func(_ context.Context, d time.Duration) error { now = now.Add(d); return nil })
++	if err == nil || !budget.deadline.Equal(deadline) || calls != 2 {
++		t.Fatalf("shared deadline extended: %v %v calls=%d", budget.deadline, err, calls)
++	}
++	calls = 0
++	_, _, err = runContinuityGate(context.Background(), budget, func() (pluginapi.SchedulerContinuityResponse, bool, error) {
++		calls++
++		return pluginapi.SchedulerContinuityResponse{Action: "ready"}, true, nil
++	}, func() time.Time { return now }, func(context.Context, time.Duration) error { return nil })
++	if err == nil || calls != 0 {
++		t.Fatalf("ready after deadline accepted: %v calls=%d", err, calls)
++	}
++}
++
++func TestContinuityGateHonorsCancellationAfterDecision(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	_, _, err := runContinuityGate(ctx, &continuityBudget{}, func() (pluginapi.SchedulerContinuityResponse, bool, error) {
++		cancel()
++		return pluginapi.SchedulerContinuityResponse{Action: "ready"}, true, nil
++	}, time.Now, waitContinuityTimer)
++	if !errors.Is(err, context.Canceled) {
++		t.Fatalf("got %v", err)
++	}
++}
++
++func TestContinuityCandidatesPreserveQuotaAndFilterOtherNativeBlocks(t *testing.T) {
++	m := NewManager(nil, nil, nil)
++	m.RegisterExecutor(schedulerTestExecutor{provider: "codex"})
++	now := time.Now()
++	future := now.Add(time.Hour)
++	model := "continuity-model"
++	auths := []*Auth{
++		{ID: "quota", Index: "quota-index", Provider: "codex", ModelStates: map[string]*ModelState{model: {Status: StatusError, Unavailable: true, NextRetryAfter: future, Quota: QuotaState{Exceeded: true, NextRecoverAt: future}, LastError: &Error{HTTPStatus: 429}}}},
++		{ID: "overload", Provider: "codex", ModelStates: map[string]*ModelState{model: {Status: StatusError, Unavailable: true, NextRetryAfter: future, LastError: &Error{HTTPStatus: 503}}}},
++		{ID: "unauthorized", Provider: "codex", Status: StatusError, Unavailable: true, LastError: &Error{HTTPStatus: 401}},
++		{ID: "disabled", Provider: "codex", Disabled: true},
++	}
++	for _, a := range auths {
++		if _, err := m.Register(context.Background(), a); err != nil {
++			t.Fatal(err)
++		}
++	}
++	registerSchedulerModels(t, "codex", model, "quota", "overload", "unauthorized", "disabled")
++	var got pluginapi.SchedulerContinuityRequest
++	m.SetPluginScheduler(&continuityTestScheduler{decide: func(_ context.Context, req pluginapi.SchedulerContinuityRequest) (pluginapi.SchedulerContinuityResponse, bool, error) {
++		got = req
++		return pluginapi.SchedulerContinuityResponse{Action: "ready"}, true, nil
++	}})
++	opts := cliproxyexecutor.Options{Metadata: map[string]any{cliproxyexecutor.RequestLifecycleIDMetadataKey: "execution-123"}}
++	_, handled, err := m.schedulerContinuityDecision(context.Background(), []string{"codex"}, model, opts, false)
++	if err != nil || !handled || got.RequestID != "execution-123" || len(got.Pick.Candidates) != 1 || got.Pick.Candidates[0].ID != "quota" || got.Pick.Candidates[0].Metadata["auth_index"] != "quota-index" {
++		t.Fatalf("bad candidates: %#v %v", got, err)
++	}
++	opts.Metadata[cliproxyexecutor.PinnedAuthMetadataKey] = "overload"
++	_, handled, err = m.schedulerContinuityDecision(context.Background(), []string{"codex"}, model, opts, false)
++	if err != nil || handled {
++		t.Fatalf("blocked pinned account reached gate: %v %v", handled, err)
++	}
++}
++
++func TestContinuityConfirmed429WaitsThenRetriesOneRejectedAttempt(t *testing.T) {
++	m := NewManager(nil, nil, nil)
++	ex := &continuity429Executor{status: http.StatusTooManyRequests}
++	m.RegisterExecutor(ex)
++	if _, err := m.Register(context.Background(), &Auth{ID: "quota-auth", Provider: "codex"}); err != nil {
++		t.Fatal(err)
++	}
++	var rejected int
++	m.SetPluginScheduler(&continuityTestScheduler{decide: func(_ context.Context, req pluginapi.SchedulerContinuityRequest) (pluginapi.SchedulerContinuityResponse, bool, error) {
++		if req.PreviousAttemptRejected429 {
++			rejected++
++			return pluginapi.SchedulerContinuityResponse{Action: "wait", Reason: "five_hour_exhausted", RetryAfterMS: 1000, MaxWaitMS: 5000}, true, nil
++		}
++		if rejected > 0 {
++			m.mu.Lock()
++			a := m.auths["quota-auth"]
++			a.Unavailable = false
++			a.NextRetryAfter = time.Time{}
++			a.Quota = QuotaState{}
++			a.LastError = nil
++			a.ModelStates = nil
++			a.Status = StatusActive
++			m.mu.Unlock()
++		}
++		return pluginapi.SchedulerContinuityResponse{Action: "ready"}, true, nil
++	}})
++	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
++	defer cancel()
++	result, err := m.ExecuteStream(ctx, []string{"codex"}, cliproxyexecutor.Request{}, cliproxyexecutor.Options{Stream: true, Metadata: map[string]any{cliproxyexecutor.RequestLifecycleIDMetadataKey: "request-1"}})
++	if err != nil || result == nil || rejected != 1 || ex.calls != 2 {
++		t.Fatalf("err=%v result=%v rejected=%d calls=%d", err, result, rejected, ex.calls)
++	}
++	chunk := <-result.Chunks
++	if string(chunk.Payload) != "data: recovered\n\n" {
++		t.Fatalf("payload=%q", chunk.Payload)
++	}
++}
++
++func TestContinuityDoesNotReplayNon429(t *testing.T) {
++	m := NewManager(nil, nil, nil)
++	ex := &continuity429Executor{status: http.StatusInternalServerError}
++	m.RegisterExecutor(ex)
++	if _, err := m.Register(context.Background(), &Auth{ID: "error-auth", Provider: "codex"}); err != nil {
++		t.Fatal(err)
++	}
++	var rejected int
++	m.SetPluginScheduler(&continuityTestScheduler{decide: func(_ context.Context, req pluginapi.SchedulerContinuityRequest) (pluginapi.SchedulerContinuityResponse, bool, error) {
++		if req.PreviousAttemptRejected429 {
++			rejected++
++		}
++		return pluginapi.SchedulerContinuityResponse{Action: "ready"}, true, nil
++	}})
++	_, err := m.ExecuteStream(context.Background(), []string{"codex"}, cliproxyexecutor.Request{}, cliproxyexecutor.Options{Stream: true})
++	if err == nil || rejected != 0 || ex.calls != 1 {
++		t.Fatalf("err=%v rejected=%d calls=%d", err, rejected, ex.calls)
++	}
++}
++
++func TestContinuityNonStreamConfirmed429WaitsThenRetries(t *testing.T) {
++	m := NewManager(nil, nil, nil)
++	ex := &continuity429Executor{status: http.StatusTooManyRequests}
++	m.RegisterExecutor(ex)
++	if _, err := m.Register(context.Background(), &Auth{ID: "nonstream-auth", Provider: "codex"}); err != nil {
++		t.Fatal(err)
++	}
++	var rejected int
++	m.SetPluginScheduler(&continuityTestScheduler{decide: func(_ context.Context, req pluginapi.SchedulerContinuityRequest) (pluginapi.SchedulerContinuityResponse, bool, error) {
++		if req.PreviousAttemptRejected429 {
++			rejected++
++			return pluginapi.SchedulerContinuityResponse{Action: "wait", Reason: "five_hour_exhausted", RetryAfterMS: 1000, MaxWaitMS: 5000}, true, nil
++		}
++		if rejected > 0 {
++			m.mu.Lock()
++			a := m.auths["nonstream-auth"]
++			a.Unavailable = false
++			a.NextRetryAfter = time.Time{}
++			a.Quota = QuotaState{}
++			a.LastError = nil
++			a.ModelStates = nil
++			a.Status = StatusActive
++			m.mu.Unlock()
++		}
++		return pluginapi.SchedulerContinuityResponse{Action: "ready"}, true, nil
++	}})
++	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
++	defer cancel()
++	result, err := m.Execute(ctx, []string{"codex"}, cliproxyexecutor.Request{}, cliproxyexecutor.Options{Metadata: map[string]any{cliproxyexecutor.RequestLifecycleIDMetadataKey: "request-nonstream"}})
++	if err != nil || string(result.Payload) != "recovered" || rejected != 1 || ex.calls != 2 {
++		t.Fatalf("err=%v payload=%q rejected=%d calls=%d", err, result.Payload, rejected, ex.calls)
++	}
++}
++
++func TestContinuityGateObservesDisabledAfterReload(t *testing.T) {
++	now := time.Unix(2000, 0)
++	calls := 0
++	action, waited, err := runContinuityGate(context.Background(), &continuityBudget{}, func() (pluginapi.SchedulerContinuityResponse, bool, error) {
++		calls++
++		if calls == 1 {
++			return pluginapi.SchedulerContinuityResponse{Action: "wait", RetryAfterMS: 1000, MaxWaitMS: 6000}, true, nil
++		}
++		return pluginapi.SchedulerContinuityResponse{Action: "disabled"}, true, nil
++	}, func() time.Time { return now }, func(_ context.Context, d time.Duration) error { now = now.Add(d); return nil })
++	if err != nil || action != "disabled" || !waited || calls != 2 {
++		t.Fatalf("reload gate action=%q waited=%v calls=%d err=%v", action, waited, calls, err)
++	}
++}
+diff --git a/sdk/cliproxy/executor/types.go b/sdk/cliproxy/executor/types.go
+index 7a09117..a8612be 100644
+--- a/sdk/cliproxy/executor/types.go
++++ b/sdk/cliproxy/executor/types.go
+@@ -8,6 +8,9 @@ import (
+ 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
+ )
+ 
++// RequestLifecycleIDMetadataKey links pre-admission decisions to the terminal callback.
++const RequestLifecycleIDMetadataKey = "request_lifecycle_id"
++
+ // RequestedModelMetadataKey stores the client-requested model name in Options.Metadata.
+ const RequestedModelMetadataKey = "requested_model"
+ 
+diff --git a/sdk/pluginabi/types.go b/sdk/pluginabi/types.go
+index 31800cc..1241866 100644
+--- a/sdk/pluginabi/types.go
++++ b/sdk/pluginabi/types.go
+@@ -53,6 +53,8 @@ const (
+ 
+ 	// MethodSchedulerPick asks a scheduler plugin to select an auth candidate.
+ 	MethodSchedulerPick = "scheduler.pick"
++	// MethodSchedulerContinuity asks for an immediate pre-admission decision.
++	MethodSchedulerContinuity = "scheduler.continuity"
+ 	// MethodModelRoute asks a router plugin to select a plugin executor for a matching request.
+ 	MethodModelRoute = "model.route"
+ 
+diff --git a/sdk/pluginapi/types.go b/sdk/pluginapi/types.go
+index dbf3235..d1b3510 100644
+--- a/sdk/pluginapi/types.go
++++ b/sdk/pluginapi/types.go
+@@ -82,6 +82,8 @@ type Capabilities struct {
+ 	FrontendAuthProviderExclusive bool
+ 	// Scheduler chooses an auth candidate before the built-in scheduler runs.
+ 	Scheduler Scheduler
++	// SchedulerContinuity provides optional nonblocking pre-admission guidance.
++	SchedulerContinuity SchedulerContinuity
+ 	// SchedulerAcrossPriorities opts into receiving available candidates across all priority tiers
+ 	// in SchedulerPickRequest.Candidates. When false (default), Candidates only contains
+ 	// credentials from the highest available priority tier.
+@@ -482,6 +484,27 @@ type ModelRouter interface {
+ 	RouteModel(context.Context, ModelRouteRequest) (ModelRouteResponse, error)
+ }
+ 
++// SchedulerContinuity provides an immediate, side-effect-safe pre-admission decision.
++type SchedulerContinuity interface {
++	Continuity(context.Context, SchedulerContinuityRequest) (SchedulerContinuityResponse, error)
++}
++
++// SchedulerContinuityRequest carries the stable request lifecycle and current candidates.
++type SchedulerContinuityRequest struct {
++	RequestID                  string               `json:"request_id"`
++	Pick                       SchedulerPickRequest `json:"pick"`
++	PreviousAttemptRejected429 bool                 `json:"previous_attempt_rejected_429,omitempty"`
++}
++
++// SchedulerContinuityResponse asks the host to wait or proceed with normal admission.
++type SchedulerContinuityResponse struct {
++	Action       string `json:"action"`
++	Reason       string `json:"reason,omitempty"`
++	RetryAfterMS int64  `json:"retry_after_ms,omitempty"`
++	MaxWaitMS    int64  `json:"max_wait_ms,omitempty"`
++	ResetAt      string `json:"reset_at,omitempty"`
++}
++
+ // SchedulerPickRequest describes the routing context offered to a scheduler plugin.
+ type SchedulerPickRequest struct {
+ 	// Plugin is the metadata of the plugin being executed.

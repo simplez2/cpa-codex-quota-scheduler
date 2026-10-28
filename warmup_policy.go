@@ -171,6 +171,9 @@ func (s *schedulerRuntimeState) warmupCandidateStillEligible(candidate warmupCan
 	if _, banned := banStore.lookup(candidate.Snapshot.AuthID); banned {
 		return false
 	}
+	if s.recovery.hasAuth(candidate.Snapshot.AuthID, candidate.Snapshot.AuthIndex) {
+		return false
+	}
 	s.mu.RLock()
 	snapshot, ok := s.quotas[candidate.Snapshot.AuthID]
 	cfg, activeID, poll := s.cfg, s.serialActiveAuthID, s.quotaPolls[candidate.Snapshot.AuthID]

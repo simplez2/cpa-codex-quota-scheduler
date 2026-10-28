@@ -2,9 +2,58 @@
 
 Standalone CPA plugin for balanced concurrent or serial Codex account selection, native quota polling,
 5h/weekly/monthly windows, persistent 429 quarantine and optional warmup.
-Source version: **0.3.17**. Local builds are not a published release.
+Source version: **0.3.30**. Published platform builds and checksums are available
+from [GitHub Releases](https://github.com/simplez2/cpa-codex-quota-scheduler/releases).
+See [CPA permissions and compatibility](CPA_PERMISSIONS.md) before installation.
+
+The overview reports weekly and 5h pool balances separately in editable Team
+equivalents. Only credentials with an observed 5h limit enter the 5h denominator.
+`pool_5h_capacity_weights` is independent of `pool_weekly_capacity_weights`.
+`pool_5h_excluded_accounts` manually excludes credentials from 5h reporting only.
+A fresh full native response without a 5h window is labelled as not reporting a
+5h limit; failed queries and partial headers remain unclassified. Reset cycles
+need a new observation before being counted as refilled. These controls do not
+change routing, warmup, concurrency or upstream subscription limits.
 
 ## CPA dashboard
+
+The panel uses an editorial control-room layout, light/dark liquid-glass surfaces,
+and locally served motion assets. Animated navigation preserves the painted
+position on rapid reversals; progress updates, switches, expansion and dialogs
+respect `prefers-reduced-motion`. The header theme control stores a panel-only
+preference. Chromium gets shared SVG rim refraction; other engines keep the blur
+fallback. No external scripts, fonts or runtime UI libraries are loaded.
+Successful manual connections remember the current CPA key for 24 hours when
+the login checkbox is enabled. Only verified logins are stored, origin and proxy
+path remain isolated, and expired or rejected keys are cleared. Storage uses
+CPA's browser encoding and is not a cryptographic security boundary. HTTP 403
+access restrictions preserve the current session instead of reporting bad keys.
+Visual references: [Nick Ho](https://nickho-motorsports.nl/),
+[Appica UI](https://appica.dev/ui), and
+[CSS/SVG refraction](https://kube.io/blog/liquid-glass-css-svg/).
+
+The weekly pool progress uses editable `pool_weekly_capacity_weights`, independent
+of routing priors: Team Standard and Plus default to 1 Team;
+Team Premium and Pro 5x default to 5 and Pro 20x to 10. Remaining percentage is
+`sum(capacity * weekly remaining percent) / sum(capacity)`. Cached observations
+are disclosed; missing or expired weekly windows stay in the denominator and
+produce a range until observed. Edit these weights in the allocation panel or
+through the authenticated plugin settings/config API.
+
+When multiple quota windows are unstarted, activate the longest window first.
+New maximum-period epoch activation bypasses old idle 5h phase plans; bounded
+epoch follow-up observations bypass successful standby polling cooldowns while
+failed probes retain their backoff. Later idle 5h-only cycles remain staggered.
+Generation shutdown cancellations do not count as quota failures or introduce
+standby backoff. Previously persisted `context canceled` quota guards are retried;
+timeouts, authentication failures and Retry-After protections remain intact.
+
+A manual unban following an upstream reset-card action first clears CPA
+credential/model runtime cooldowns through the host routing callback, then
+requests an immediate on-demand quota probe. Warmup may reconsider CPA's
+historical `status=error` marker, but only after a fresh native snapshot proves
+headroom; local quarantine, hard limits and failed quota probes still block
+activation.
 
 After enabling the plugin, refresh CPA Management Center and open **插件 →
 Codex 额度调度**. The plugin management list uses the same display name and the
@@ -40,7 +89,8 @@ The standalone resource entry is `/v0/resource/plugins/codex-quota-scheduler/ope
 It serves static assets only; quota data remains behind CPA management
 authentication. The page reuses a remembered CPA login only when its API origin
 and path match this server. Otherwise it asks for a management key, held in
-page memory only. Keys never appear in links or public resources. Both current
+page memory, or remembered for 24 hours when the login checkbox is selected
+(selected by default). Keys never appear in links or public resources. Both current
 encrypted and scoped CPA storage formats are supported. No sidecar is needed.
 
 UI authentication and settings regressions: `node --test web/*.test.mjs`.
@@ -96,7 +146,13 @@ observations are reused; this calculation adds no upstream quota probes.
 Only CPA is required. The plugin reads CPA's authenticated auth-files inventory
 and queries upstream quota through CPA's authenticated api-call endpoint.
 CPA resolves the auth index, substitutes $TOKEN$, and applies its proxy policy.
-The plugin never reads or stores upstream OAuth/PAT credentials.
+Quota and warmup requests use CPA's `$TOKEN$` substitution rather than extracting
+an upstream token. The expiry diagnostic separately reads credential JSON through
+`host.auth.get`; when `auth_expiry_auto_repair` is enabled, a narrowly verified
+opaque PAT can have its stale top-level expiry removed through CPA's authenticated
+auth-file upload API. OAuth/JWT expiry is never rewritten. Credential documents
+stay on the diagnostic stack and are not persisted in plugin state or logs.
+See [the exact permission requirements](CPA_PERMISSIONS.md).
 
 The default endpoint is https://chatgpt.com/backend-api/wham/usage.
 The quota_url option can select a trusted alternative implementing the same
@@ -144,6 +200,67 @@ The former external pricing and window-cost calibration are no longer available;
 serial remains the default and pacing retains built-in cost estimates.
 
 ## Routing and recovery
+
+### Unattended 5h quota continuity
+
+Quota continuity is a pre-execution gate shared by this plugin and the compatible
+CPA host integration in [integration/](integration/README.md). Updating the plugin
+alone does not add long waits to an older CPA host. The dashboard distinguishes
+configured continuity from an actually observed host continuity check.
+
+The host offers current, model-compatible credentials before its cooldown filter.
+The plugin immediately advises whether to proceed, pace, or wait. The host owns
+the cancellable wait and rebuilds candidates on each check. A fresh complete native
+response confirming a weekly window without a 5h window allows that credential to
+continue when other credentials exhaust their 5h quota. Missing data, failed probes
+and manual reporting exclusions do not establish absence of a 5h limit. A newer
+complete response also removes older 5h restrictions; newer or simultaneous 5h
+response-header evidence remains authoritative.
+
+When all otherwise eligible credentials are blocked by a confirmed 5h window, the
+host can wait for recovery and reassess. A passed reset time triggers observation,
+not an invented refill. Weekly/monthly limits, auth failures, disabled credentials,
+model eligibility, explicit pins, quarantine and credential concurrency still apply.
+Pacing uses fresh observed consumption and recent completed requests to spread
+execution before the 5h pool runs out. Insufficient measurements leave pacing
+inactive; a usable weekly-only credential avoids 5h pacing.
+
+The allocation panel exposes `continuity_enabled` (default true),
+`continuity_pacing` (default true), `continuity_max_wait` (default `6h`, range
+`1s`–`24h`) and `continuity_poll_interval` (default `30s`, range `1s`–`5m`). The
+maximum wait is one total request budget including pacing; reassessment cannot
+extend it. Quota checks retain the existing polling and failure backoff policy.
+
+Compatible streaming handlers send SSE comments while actually waiting so an idle
+connection can remain open. Client cancellation and absolute deadlines still end
+the request; reverse proxies and clients must permit the intended total wait.
+This gate never replays an already emitted response or tool call. See the host
+integration notes for the exact supported CPA version, protocol coverage and tests.
+
+Recovery admission is serialized independently of the ordinary concurrency
+setting. The gate is per credential and auth index. A common upstream account
+ID can represent a shared workspace and does not establish a common user's
+quota, so it does not join independent credentials. A 5h exhaustion observation, including one learned from a
+quota query before any model 429, keeps a recovery requirement. A reset time or
+positive quota query does not release every waiting request: one request first
+tests recovery, and successful completion releases normal traffic. The final
+after-auth check also covers native scheduler fallback. When every candidate is
+already held by a confirmed recovery guard, an explicit scheduler rejection
+prevents native fallback from bypassing that guard; the compatible host retains
+its confirmed-429 wait path. A healthy weekly-only
+credential remains independently available.
+
+The 30-second continuity check evaluates shared state; it does not send a model
+request. Quota queries are coalesced and retain their per-credential backoff.
+Explicit upstream `Retry-After` is never shortened by a smaller reset time or
+`max_ban`; repeated failed recovery attempts extend local backoff. Cancellation
+does not count as a successful recovery. Requests already sent before a 429 is
+observed cannot be recalled, so this prevents new dispatch after that signal
+rather than promising that no concurrent in-flight request can also return 429.
+The v8.0.44 host imposes a ten-second minimum quota cooldown; recovery also
+honors that floor with a small safety margin. `fallback_ban` applies when no
+usable upstream reset or retry deadline exists, rather than adding fifteen
+minutes to a known short deadline.
 
 Select **均衡并发（会话粘性）** in the panel to distribute new conversations
 across accounts. Turns, tool calls, model changes and concurrent requests within
@@ -363,7 +480,8 @@ and warmup management operations remain. The older internal `/quota` handler is
 kept as a compatibility alias, but is no longer registered because CPA v7.3.0
 uses that path for its native per-auth quota endpoint.
 
-Go 1.21+ and a C compiler are required:
+Source syntax is Go 1.21-compatible. Use maintained Go 1.26.10+ and a C compiler
+for release builds:
 
 ~~~sh
 go test ./...

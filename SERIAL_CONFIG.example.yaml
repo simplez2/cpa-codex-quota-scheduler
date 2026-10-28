@@ -1,4 +1,4 @@
-# Standalone CPA quota scheduler v0.3.11.
+# Standalone CPA quota scheduler v0.3.30.
 plugins:
   enabled: true
   configs:
@@ -11,6 +11,12 @@ plugins:
       account_concurrency_enabled: true
       account_max_concurrency: 2
       account_concurrency_wait: 10s
+      # Requires the CPA continuity integration; older hosts do not wait.
+      # Only pre-execution requests wait; client absolute deadlines still apply.
+      continuity_enabled: true
+      continuity_pacing: true
+      continuity_max_wait: 6h
+      continuity_poll_interval: 30s
       # Set balanced for concurrent, quota-weighted distribution across accounts.
       # This can also be selected in the Codex 额度调度 panel without editing YAML.
       serial_allocation_policy: sustainable
@@ -43,6 +49,9 @@ plugins:
       refresh_interval: 30s
       quota_refresh_cooldown: 2m
       quota_refresh_batch: 8
+      # Expiry diagnostics read credential JSON through host.auth.get.
+      # false prevents repair uploads; diagnostics still read the document.
+      auth_expiry_auto_repair: true
       stale_after: 15m
       state_path: /var/lib/codex-quota-scheduler/state.json
       reserve_5h_percent: 0

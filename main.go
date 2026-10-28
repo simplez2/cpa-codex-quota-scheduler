@@ -88,6 +88,7 @@ static void free_host_buffer(void* ptr, size_t len) {
 import "C"
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -105,7 +106,7 @@ import (
 
 const (
 	pluginName    = "codex-quota-scheduler"
-	pluginVersion = "0.3.17"
+	pluginVersion = "0.3.30"
 
 	// providerCodex is the CPA provider key for OpenAI Codex (ChatGPT backend).
 	providerCodex = "codex"
@@ -175,9 +176,17 @@ type banEntry struct {
 	Phase string
 	// ProbeStartedAt and ProbeLeaseUntil serialize half-open attempts. The lease
 	// allows recovery after a crashed or lost request without admitting a burst.
-	ProbeStartedAt  time.Time
-	ProbeLeaseUntil time.Time
-	ProbeAttempts   int
+	ProbeStartedAt     time.Time
+	ProbeLeaseUntil    time.Time
+	ProbeAttempts      int
+	ProbeOwner         string
+	ProbeDispatched    bool
+	ProbeFailures      int
+	LocalBackoff       time.Duration
+	LocalBackoffMax    time.Duration
+	EvidenceGeneration uint64
+	ProbeGeneration    uint64
+	Provisional        bool
 }
 
 type banStateStats struct {
@@ -201,6 +210,8 @@ func normalizeBanEntry(entry banEntry) banEntry {
 		entry.Phase = banPhaseCooldown
 		entry.ProbeStartedAt = time.Time{}
 		entry.ProbeLeaseUntil = time.Time{}
+		entry.ProbeOwner = ""
+		entry.ProbeDispatched = false
 	} else if entry.ProbeStartedAt.IsZero() {
 		entry.Phase = banPhaseCooldown
 		entry.ProbeLeaseUntil = time.Time{}
@@ -210,7 +221,7 @@ func normalizeBanEntry(entry banEntry) banEntry {
 
 func banEntryDisposition(entry banEntry, now time.Time) banDisposition {
 	entry = normalizeBanEntry(entry)
-	if entry.Phase == banPhaseHalfOpen && !entry.ProbeLeaseUntil.IsZero() && now.Before(entry.ProbeLeaseUntil) {
+	if entry.Phase == banPhaseHalfOpen && (entry.ProbeOwner != "" || (!entry.ProbeLeaseUntil.IsZero() && now.Before(entry.ProbeLeaseUntil))) {
 		return banDispositionHalfOpen
 	}
 	if entry.ResetAt.IsZero() || now.Before(entry.ResetAt) {
@@ -242,6 +253,12 @@ func (s *banState) lookup(authID string) (banEntry, bool) {
 	return entry, ok
 }
 
+func (s *banState) count() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.bans)
+}
+
 func (s *banState) setCooldownLocked(authID string, entry banEntry) {
 	if s.bans == nil {
 		s.bans = make(map[string]banEntry)
@@ -253,8 +270,16 @@ func (s *banState) setCooldownLocked(authID string, entry banEntry) {
 	entry.ProbeLeaseUntil = time.Time{}
 	if previous, ok := s.bans[authID]; ok {
 		previous = normalizeBanEntry(previous)
+		// A 429 from any request can arrive while an owned probe is still in
+		// flight. Retain its lease until the exact lifecycle reports completion.
+		if previous.Phase == banPhaseHalfOpen && previous.ProbeOwner != "" {
+			entry.Phase, entry.ProbeOwner = previous.Phase, previous.ProbeOwner
+			entry.ProbeStartedAt, entry.ProbeLeaseUntil = previous.ProbeStartedAt, previous.ProbeLeaseUntil
+			entry.ProbeGeneration = previous.ProbeGeneration
+			entry.ProbeDispatched = previous.ProbeDispatched
+		}
 		// A repeated 429 must never shorten an already known cooldown.
-		if previous.ResetAt.After(entry.ResetAt) {
+		if !previous.Provisional && previous.ResetAt.After(entry.ResetAt) {
 			entry.ResetAt = previous.ResetAt
 			if previous.Kind == banKindQuota && entry.Kind == banKindProbation {
 				entry.Kind = previous.Kind
@@ -293,6 +318,21 @@ func (s *banState) set(authID string, entry banEntry) {
 	s.bans[authID] = entry
 }
 
+func (s *banState) setIfAbsent(authID string, entry banEntry) {
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.bans == nil {
+		s.bans = make(map[string]banEntry)
+	}
+	if _, exists := s.bans[authID]; !exists {
+		s.bans[authID] = normalizeBanEntry(entry)
+	}
+}
+
 // record429 applies a new cooldown and records whether it closed a half-open
 // attempt. Loading persisted state deliberately uses set instead.
 func (s *banState) record429(authID string, entry banEntry, requestedAt time.Time) {
@@ -307,8 +347,22 @@ func (s *banState) record429(authID string, entry banEntry, requestedAt time.Tim
 	if entry.Kind == banKindProbation {
 		s.probation429s++
 	}
-	if previous, ok := s.bans[authID]; ok && probeRequestMatches(normalizeBanEntry(previous), requestedAt) {
-		s.probeFailures++
+	if previous, ok := s.bans[authID]; ok {
+		previous = normalizeBanEntry(previous)
+		entry.ProbeFailures = previous.ProbeFailures
+		entry.EvidenceGeneration = previous.EvidenceGeneration + 1
+		if previous.Phase == banPhaseHalfOpen && previous.ProbeOwner == "" && probeRequestMatches(previous, requestedAt) {
+			s.probeFailures++
+			entry.ProbeFailures++
+		}
+		if entry.ProbeFailures > 0 {
+			delay := recoveryRetryDelay(entry.ProbeFailures, entry.LocalBackoff, entry.LocalBackoffMax)
+			if deadline := entry.BannedAt.Add(delay); deadline.After(entry.ResetAt) {
+				entry.ResetAt = deadline
+			}
+		}
+	} else {
+		entry.EvidenceGeneration = 1
 	}
 	s.setCooldownLocked(authID, entry)
 }
@@ -330,6 +384,10 @@ func (s *banState) schedulable(authID string, now time.Time) bool {
 // tryStartProbe validates the final scheduler choice and atomically reserves a
 // single half-open request. It returns allowed=true for a healthy credential.
 func (s *banState) tryStartProbe(authID string, now time.Time, lease time.Duration) (allowed, probeStarted bool) {
+	return s.tryStartProbeOwned(authID, "", now, lease)
+}
+
+func (s *banState) tryStartProbeOwned(authID, owner string, now time.Time, lease time.Duration) (allowed, probeStarted bool) {
 	authID = strings.TrimSpace(authID)
 	if authID == "" {
 		return false, false
@@ -344,6 +402,17 @@ func (s *banState) tryStartProbe(authID string, now time.Time, lease time.Durati
 		return true, false
 	}
 	entry = normalizeBanEntry(entry)
+	if owner != "" && entry.Phase == banPhaseHalfOpen && entry.ProbeOwner == owner {
+		return true, false
+	}
+	if owner != "" && entry.Phase == banPhaseHalfOpen && entry.ProbeOwner == "" &&
+		!entry.ProbeLeaseUntil.IsZero() && now.Before(entry.ProbeLeaseUntil) {
+		// A legacy scheduler pick lacked a lifecycle token. At the final
+		// after-auth gate, atomically bind its anonymous lease to one real ID.
+		entry.ProbeOwner, entry.ProbeGeneration = owner, entry.EvidenceGeneration
+		s.bans[authID] = entry
+		return true, false
+	}
 	if banEntryDisposition(entry, now) != banDispositionProbeReady {
 		return false, false
 	}
@@ -351,6 +420,9 @@ func (s *banState) tryStartProbe(authID string, now time.Time, lease time.Durati
 	entry.ProbeStartedAt = now
 	entry.ProbeLeaseUntil = now.Add(lease)
 	entry.ProbeAttempts++
+	entry.ProbeOwner = owner
+	entry.ProbeDispatched = false
+	entry.ProbeGeneration = entry.EvidenceGeneration
 	s.bans[authID] = entry
 	s.probeStarts++
 	return true, true
@@ -373,6 +445,11 @@ func (s *banState) completeProbe(authID string, requestedAt, now time.Time, succ
 		return banEntry{}, false, false
 	}
 	entry = normalizeBanEntry(entry)
+	if entry.ProbeOwner != "" {
+		// Usage records have no CPA lifecycle ID. Only the exact completion may
+		// clear an owned probe; another concurrent completion proves nothing.
+		return entry, false, false
+	}
 	if !probeRequestMatches(entry, requestedAt) {
 		return entry, false, false
 	}
@@ -388,6 +465,53 @@ func (s *banState) completeProbe(authID string, requestedAt, now time.Time, succ
 	s.bans[authID] = entry
 	s.probeFailures++
 	return entry, false, true
+}
+
+func (s *banState) markProbeDispatched(authID, owner string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if entry, ok := s.bans[authID]; ok && owner != "" && entry.ProbeOwner == owner && entry.Phase == banPhaseHalfOpen {
+		entry.ProbeDispatched = true
+		s.bans[authID] = entry
+	}
+}
+
+func (s *banState) completeOwnedProbe(owner string, success bool, now time.Time, retryAfter, maxBan time.Duration) bool {
+	return s.completeOwnedProbeExcept(owner, "", success, false, now, retryAfter, maxBan)
+}
+
+func (s *banState) completeOwnedProbeExcept(owner, exceptID string, success, preserveDispatched bool, now time.Time, retryAfter, maxBan time.Duration) bool {
+	if owner == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	changed := false
+	for id, entry := range s.bans {
+		if entry.Phase != banPhaseHalfOpen || entry.ProbeOwner != owner || id == exceptID {
+			continue
+		}
+		if preserveDispatched && entry.ProbeDispatched {
+			continue
+		}
+		changed = true
+		if success && entry.ProbeGeneration == entry.EvidenceGeneration {
+			delete(s.bans, id)
+			s.probeSuccesses++
+		} else {
+			entry.Phase, entry.ProbeOwner = banPhaseCooldown, ""
+			entry.ProbeDispatched = false
+			entry.ProbeStartedAt, entry.ProbeLeaseUntil = time.Time{}, time.Time{}
+			entry.ProbeFailures++
+			delay := recoveryRetryDelay(entry.ProbeFailures, retryAfter, maxBan)
+			if until := now.Add(delay); until.After(entry.ResetAt) {
+				entry.ResetAt = until
+			}
+			s.bans[id] = entry
+			s.probeFailures++
+		}
+	}
+	return changed
 }
 
 // clear removes the quarantine entry for authID, if present.
@@ -514,6 +638,8 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return handleUsage(request)
 	case pluginabi.MethodSchedulerPick:
 		return handleSchedulerPick(request)
+	case pluginabi.MethodSchedulerContinuity:
+		return handleSchedulerContinuity(request)
 	case pluginabi.MethodRequestInterceptBefore:
 		return handleConcurrencyBefore(request)
 	case pluginabi.MethodRequestInterceptAfter:
@@ -543,6 +669,10 @@ func pluginRegistration() registration {
 				{Name: "account_concurrency_enabled", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Enforce per-credential execution slots using CPA request IDs and terminal lifecycle events (default true)."},
 				{Name: "account_max_concurrency", Type: pluginapi.ConfigFieldTypeInteger, Description: "Maximum simultaneous executions per CPA Codex credential, including warmup (1-64, default 2)."},
 				{Name: "account_concurrency_wait", Type: pluginapi.ConfigFieldTypeString, Description: "Bounded wait for a busy sticky credential or a full pool (0s-30s, default 10s)."},
+				{Name: "continuity_enabled", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Enable pre-execution quota continuity with a compatible CPA host: wait for confirmed 5h recovery and automatically reconsider credentials."},
+				{Name: "continuity_max_wait", Type: pluginapi.ConfigFieldTypeString, Description: "Maximum total continuity wait per request, including pacing (1s-24h, default 6h). Client deadlines still apply."},
+				{Name: "continuity_poll_interval", Type: pluginapi.ConfigFieldTypeString, Description: "Host continuity reassessment interval (1s-5m, default 30s). Existing quota probe backoffs remain authoritative."},
+				{Name: "continuity_pacing", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Pace new execution before the confirmed 5h pool is exhausted; fresh weekly-only credentials can continue without 5h pacing. Requires compatible CPA host."},
 				{Name: "scheduler_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"balanced", "serial", "legacy", "shadow", "enforce"}, Description: "Balanced spreads concurrent work by 5h headroom, weekly daily budget and plan capacity. Serial retains one committed primary. Configure either directly in the quota panel."},
 				{Name: "serial_switch_percent", Type: pluginapi.ConfigFieldTypeNumber, Description: "Soft used-percent switch threshold. Drain mode may cross it; hard limits, disallowed windows, and 429 still force failover."},
 				{Name: "serial_handoff_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"threshold_only", "reserve_aware"}, Description: "Account handoff policy. threshold_only follows serial_switch_percent; reserve_aware also hands off before the configured reserve for the active 5h, weekly, or monthly window is consumed."},
@@ -553,6 +683,9 @@ func pluginRegistration() registration {
 				{Name: "serial_budget_rebalance_percent", Type: pluginapi.ConfigFieldTypeNumber, Description: "Relative weekly budget advantage before proactive sustainable handoff (default 20 percent, 0 disables); requires independent evidence and minimum hold."},
 				{Name: "serial_soft_continuation", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Legacy session continuation past a soft threshold; defaults false so subsequent session requests follow the replacement."},
 				{Name: "quota_default_plan", Type: pluginapi.ConfigFieldTypeString, Description: "Fallback capacity prior when native plan detection is unavailable: team_standard (default), plus, pro_5x, pro_20x or team_premium. Explicit quota_account_plans overrides take precedence over detection. Priors are not guaranteed weekly limits."},
+				{Name: "pool_weekly_capacity_weights", Type: pluginapi.ConfigFieldTypeObject, Description: "Editable Team-equivalent weekly reporting weights. Team Standard/Plus=1, Team Premium/Pro 5x=5, Pro 20x=10. Reporting only."},
+				{Name: "pool_5h_capacity_weights", Type: pluginapi.ConfigFieldTypeObject, Description: "Independent Team-equivalent 5h reporting weights. Team Standard/Plus=1, Team Premium/Pro 5x=5, Pro 20x=10. Reporting only."},
+				{Name: "pool_5h_excluded_accounts", Type: pluginapi.ConfigFieldTypeArray, Description: "Credential IDs manually excluded from 5h reporting, for accounts without a 5h limit. Does not change weekly reporting or scheduling."},
 				{Name: "serial_weekly_rebalance_percent", Type: pluginapi.ConfigFieldTypeNumber, Description: "Weekly remaining percentage-point advantage required for proactive serial balancing (default 10, 0 disables). Two distinct fresh observations of both accounts are required."},
 				{Name: "serial_weekly_rebalance_min_hold", Type: pluginapi.ConfigFieldTypeString, Description: "Minimum primary hold before proactive weekly balancing (1m-24h, default 5m). Hard limits, quarantine and other safety handoffs do not wait."},
 				{Name: "quota_refresh_cooldown", Type: pluginapi.ConfigFieldTypeString, Description: "Per-account cooldown for standby native quota queries. Defaults to 2m; the active account uses refresh_interval."},
@@ -576,7 +709,7 @@ func pluginRegistration() registration {
 				{Name: "reserve_monthly_percent", Type: pluginapi.ConfigFieldTypeNumber, Description: "Safety reserve retained in every monthly quota window."},
 				{Name: "low_quota_percent", Type: pluginapi.ConfigFieldTypeNumber, Description: "Remaining quota threshold that raises request-cost prediction from P75 to P90."},
 				{Name: "fallback_ban", Type: pluginapi.ConfigFieldTypeString, Description: "Temporary 429 ban when upstream reset headers are absent."},
-				{Name: "max_ban", Type: pluginapi.ConfigFieldTypeString, Description: "Upper bound for a temporary automatic ban."},
+				{Name: "max_ban", Type: pluginapi.ConfigFieldTypeString, Description: "Upper bound for locally calculated automatic cooldowns; upstream Retry-After is never shortened."},
 				{Name: "half_open_probe_timeout", Type: pluginapi.ConfigFieldTypeString, Description: "Lease for the single half-open probe after a cooldown expires."},
 				{Name: "half_open_retry_after", Type: pluginapi.ConfigFieldTypeString, Description: "Delay before retrying a half-open probe that failed without a 429."},
 				{Name: "sticky_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "Idle lifetime for hashed session-to-credential bindings; zero disables plugin stickiness."},
@@ -597,6 +730,7 @@ func pluginRegistration() registration {
 			RequestLifecyclePlugin: true,
 			UsagePlugin:            true,
 			Scheduler:              true,
+			SchedulerContinuity:    true,
 			ManagementAPI:          true,
 		},
 	}
@@ -664,11 +798,20 @@ func handleUsage(raw []byte) ([]byte, error) {
 	now := time.Now()
 	fallback, maxBan := schedulerRuntime.banDurations()
 	entry, authoritative := quarantineEntryFor429(record.ResponseHeaders, now, fallback, maxBan)
+	entry.LocalBackoff, entry.LocalBackoffMax = schedulerRuntime.halfOpenRetryAfter(), maxBan
 	if !authoritative {
 		slog.Warn("codex-quota-scheduler: quota headers missing on 429; credential entered probation", "auth_id", authID, "retry_at", entry.ResetAt.Format(time.RFC3339))
 	}
 
 	banStore.record429(authID, entry, record.RequestedAt)
+	schedulerRuntime.mu.RLock()
+	quota, found := schedulerRuntime.lookupQuotaLocked(authID, record.AuthIndex)
+	schedulerRuntime.mu.RUnlock()
+	index := record.AuthIndex
+	if found {
+		index = quota.AuthIndex
+	}
+	schedulerRuntime.recovery.require(authID, index, now, entry.ResetAt)
 	schedulerRuntime.markSerialUnavailable(authID, "429", now)
 	schedulerRuntime.persistAfterBanChange()
 	slog.Info("codex-quota-scheduler: credential quarantined after 429",
@@ -699,27 +842,43 @@ func usageRecordGenerateEnabled(raw []byte) bool {
 // probationary: its deadline only makes the credential probe-ready.
 func quarantineEntryFor429(headers http.Header, now time.Time, fallback, maxBan time.Duration) (banEntry, bool) {
 	entry, authoritative := classifyAndBuildBanAt(headers, now)
-	if authoritative {
-		entry.BannedAt = now
-		entry.Kind = banKindQuota
-		entry.Phase = banPhaseCooldown
-		return entry, true
-	}
 	if fallback <= 0 {
 		fallback = 15 * time.Minute
-	}
-	if retryAfter := retryAfterDuration(headers, now); retryAfter > fallback {
-		fallback = retryAfter
 	}
 	if maxBan > 0 && fallback > maxBan {
 		fallback = maxBan
 	}
+	// CPA v8.0.44 keeps 429 cooldowns for at least ten seconds. Include that
+	// known host floor so continuity does not release a request into its still
+	// cooling native selector; the separate two-second boundary is in the gate.
+	deadline := now.Add(10 * time.Second)
+	signal := false
+	if retryAfter := retryAfterDuration(headers, now); retryAfter > 0 {
+		signal = true
+		if until := now.Add(retryAfter); until.After(deadline) {
+			deadline = until
+		}
+	}
+	if authoritative && entry.ResetAt.After(now) {
+		signal = true
+		if entry.ResetAt.After(deadline) {
+			deadline = entry.ResetAt
+		}
+	}
+	if !signal {
+		deadline = now.Add(fallback)
+	}
+	if authoritative && entry.ResetAt.After(now) {
+		entry.BannedAt, entry.Kind, entry.Phase, entry.ResetAt, entry.LocalBackoff = now, banKindQuota, banPhaseCooldown, deadline, fallback
+		return entry, true
+	}
 	return banEntry{
-		ResetAt:  now.Add(fallback),
-		Window:   "probation (quota headers missing)",
-		BannedAt: now,
-		Kind:     banKindProbation,
-		Phase:    banPhaseCooldown,
+		ResetAt:      deadline,
+		Window:       "probation (quota headers missing)",
+		BannedAt:     now,
+		Kind:         banKindProbation,
+		Phase:        banPhaseCooldown,
+		LocalBackoff: fallback,
 	}, false
 }
 
@@ -1089,6 +1248,10 @@ func handleManagementWarmupRetry(req pluginapi.ManagementRequest) pluginapi.Mana
 	})
 }
 
+var managementResetCPACredentialCooldown = func(ctx context.Context, authID string) (pluginapi.HostRoutingResetCooldownResponse, error) {
+	return schedulerRuntime.resetCPACredentialCooldown(ctx, authID, callHost)
+}
+
 func handleManagementUnban(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
 	var body managementUnbanRequest
 	if len(req.Body) > 0 {
@@ -1114,25 +1277,43 @@ func handleManagementUnban(req pluginapi.ManagementRequest) pluginapi.Management
 		})
 	}
 
+	resetCtx, cancelReset := context.WithTimeout(context.Background(), 20*time.Second)
+	reset, resetErr := managementResetCPACredentialCooldown(resetCtx, authID)
+	cancelReset()
+	if resetErr != nil {
+		slog.Warn("codex-quota-scheduler: CPA cooldown reset failed", "auth_id", authID, "error", resetErr)
+		return jsonManagementResponse(http.StatusBadGateway, map[string]any{
+			"error":   "cpa_cooldown_reset_failed",
+			"message": "CPA runtime cooldown could not be cleared; local recovery state was not changed",
+		})
+	}
 	entry, removed := banStore.clear(authID)
-	if removed && !schedulerRuntime.persistBanState() {
+	schedulerRuntime.recovery.clear(authID)
+	// The reset card and CPA host reset make the credential routable. Queue one
+	// on-demand quota probe so fresh evidence immediately feeds recovery warmup.
+	schedulerRuntime.requestImmediateQuotaProbe(authID, time.Now())
+	if !schedulerRuntime.persistBanState() {
 		return managementRecoveryPersistenceError()
 	}
 	if removed {
 		slog.Info("codex-quota-scheduler: manually re-enabled credential",
-			"auth_id", authID, "window", entry.Window, "reset_at", entry.ResetAt.Format(time.RFC3339))
+			"auth_id", authID, "window", entry.Window, "reset_at", entry.ResetAt.Format(time.RFC3339), "cpa_auth_index", reset.AuthIndex, "cpa_models_reset", len(reset.Models))
 	}
 	return jsonManagementResponse(http.StatusOK, map[string]any{
-		"ok":      true,
-		"auth_id": authID,
-		"removed": removed,
-		"status":  currentBanStatus(),
+		"ok":                 true,
+		"auth_id":            authID,
+		"removed":            removed,
+		"cpa_auth_index":     reset.AuthIndex,
+		"cpa_models_reset":   reset.Models,
+		"cpa_cooldown_reset": true,
+		"status":             currentBanStatus(),
 	})
 }
 
 func handleManagementUnbanAll() pluginapi.ManagementResponse {
 	removed := banStore.clearAll()
-	if removed > 0 && !schedulerRuntime.persistBanState() {
+	schedulerRuntime.recovery.clearAll()
+	if !schedulerRuntime.persistBanState() {
 		return managementRecoveryPersistenceError()
 	}
 	if removed > 0 {
@@ -1271,6 +1452,7 @@ type registrationCapability struct {
 	RequestLifecyclePlugin bool `json:"request_lifecycle_plugin"`
 	UsagePlugin            bool `json:"usage_plugin"`
 	Scheduler              bool `json:"scheduler"`
+	SchedulerContinuity    bool `json:"scheduler_continuity"`
 	ManagementAPI          bool `json:"management_api"`
 }
 

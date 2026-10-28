@@ -1,5 +1,4 @@
-// Read CPA's existing browser login for this server only. Never persist keys or
-// send a key to the backend selected for another CPA panel / reverse-proxy path.
+// Both inherited and remembered logins are scoped to this CPA origin and path.
 export function normalizeBase(value) {
   if (typeof value !== 'string' || !value.trim()) return '';
   try {
@@ -32,6 +31,34 @@ export function decodeStored(raw, host, userAgent) {
 
 export function validKey(value) {
   return typeof value === 'string' && value.trim() && value.length <= 4096 && !/[\r\n]/.test(value) ? value.trim() : '';
+}
+
+export const panelSessionLifetime = 24 * 60 * 60 * 1000;
+export const panelSessionName = base => 'codex-quota-session:' + encodeURIComponent(normalizeBase(base));
+
+export function clearPanelSession(storage,base) {
+  try { storage.removeItem(panelSessionName(base)); } catch { /* Storage is optional. */ }
+}
+
+export function rememberPanelKey(storage,base,host,userAgent,key,now=Date.now()) {
+  const normalized=normalizeBase(base),candidate=validKey(key);
+  if(!normalized||!candidate||!Number.isFinite(now))return false;
+  // Match CPA's storage encoding; it is encoding, not an encryption boundary.
+  const bytes=new TextEncoder().encode(JSON.stringify({version:1,apiBase:normalized,managementKey:candidate,expiresAt:now+panelSessionLifetime}));
+  const salt=new TextEncoder().encode('cli-proxy-api-webui::secure-storage|' + host + '|' + userAgent);
+  const raw='enc::v1::'+btoa(Array.from(bytes,(byte,index)=>String.fromCharCode(byte^salt[index%salt.length])).join(''));
+  try { storage.setItem(panelSessionName(normalized),raw);return true; } catch {return false;}
+}
+
+export function readRememberedPanelKey(storage,base,host,userAgent,now=Date.now()) {
+  const normalized=normalizeBase(base);if(!normalized)return '';
+  let value;
+  try {value=decodeStored(storage.getItem(panelSessionName(normalized)),host,userAgent);}catch {return '';}
+  if(value===null)return '';
+  const valid=value?.version===1 && value.apiBase===normalized && validKey(value.managementKey) &&
+    Number.isFinite(value.expiresAt) && value.expiresAt>now && value.expiresAt<=now+panelSessionLifetime;
+  if(!valid){clearPanelSession(storage,normalized);return '';}
+  return validKey(value.managementKey);
 }
 
 export function readPanelKey(storage, base, host, userAgent) {

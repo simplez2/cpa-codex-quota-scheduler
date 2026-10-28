@@ -1,8 +1,13 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
 	"time"
 
+	"github.com/simplez2/cpa-codex-quota-scheduler/cpasdk/pluginabi"
 	"github.com/simplez2/cpa-codex-quota-scheduler/cpasdk/pluginapi"
 )
 
@@ -21,6 +26,81 @@ func (s *schedulerRuntimeState) recordQuotaDemand(record pluginapi.UsageRecord, 
 	s.quotaPolls[id] = p
 }
 
+// resetCPACredentialCooldown clears CPA's runtime credential/model cooldown
+// after an upstream reset-card action. The host callback deliberately leaves
+// the token document untouched; only runtime routing state is reset.
+func (s *schedulerRuntimeState) resetCPACredentialCooldown(ctx context.Context, authID string, call authExpiryHostCall) (pluginapi.HostRoutingResetCooldownResponse, error) {
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return pluginapi.HostRoutingResetCooldownResponse{}, fmt.Errorf("auth_id_required")
+	}
+	s.mu.RLock()
+	snapshot, found := s.lookupQuotaLocked(authID, "")
+	cfg := s.cfg
+	s.mu.RUnlock()
+	authIndex := ""
+	if found {
+		authIndex = strings.TrimSpace(snapshot.AuthIndex)
+	}
+	if authIndex == "" {
+		files, err := cpaManagementAuthFiles(ctx, cfg)
+		if err != nil {
+			return pluginapi.HostRoutingResetCooldownResponse{}, fmt.Errorf("auth_inventory_unavailable")
+		}
+		for _, file := range files {
+			provider := strings.TrimSpace(file.Provider)
+			if provider == "" {
+				provider = strings.TrimSpace(file.Type)
+			}
+			if !strings.EqualFold(provider, providerCodex) || file.Disabled {
+				continue
+			}
+			if strings.TrimSpace(file.ID) == authID || strings.TrimSpace(file.Name) == authID || strings.TrimSpace(file.AuthIndex) == authID {
+				authIndex = strings.TrimSpace(file.AuthIndex)
+				break
+			}
+		}
+	}
+	if authIndex == "" {
+		return pluginapi.HostRoutingResetCooldownResponse{}, fmt.Errorf("auth_index_unavailable")
+	}
+	if call == nil {
+		return pluginapi.HostRoutingResetCooldownResponse{}, fmt.Errorf("host_callback_unavailable")
+	}
+	raw, err := call(pluginabi.MethodHostRoutingResetCooldown, pluginapi.HostRoutingResetCooldownRequest{AuthIndex: authIndex})
+	if err != nil {
+		return pluginapi.HostRoutingResetCooldownResponse{}, fmt.Errorf("cpa_cooldown_reset_failed")
+	}
+	var result pluginapi.HostRoutingResetCooldownResponse
+	if json.Unmarshal(raw, &result) != nil || strings.TrimSpace(result.AuthIndex) != authIndex {
+		return pluginapi.HostRoutingResetCooldownResponse{}, fmt.Errorf("cpa_cooldown_reset_invalid_response")
+	}
+	return result, nil
+}
+
+// requestImmediateQuotaProbe turns an explicit recovery action, such as a
+// manual unban after an upstream reset card, into demand for the next quota
+// refresh tick. It does not claim fresh quota or clear a real query failure;
+// a successful probe must do both.
+func (s *schedulerRuntimeState) requestImmediateQuotaProbe(authID string, now time.Time) {
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if canonical := s.canonicalAuthIDLocked(authID, ""); canonical != "" {
+		authID = canonical
+	}
+	if s.quotaPolls == nil {
+		s.quotaPolls = make(map[string]quotaPollState)
+	}
+	p := s.quotaPolls[authID]
+	p.LastUsageAt = now
+	p.NextAt = time.Time{}
+	s.quotaPolls[authID] = p
+}
+
 // Background ticks may maintain local state, but cannot continually poll an
 // idle account. Each actual observation consumes the triggering event.
 func (s *schedulerRuntimeState) quotaProbeReason(id string, now time.Time) string {
@@ -30,16 +110,25 @@ func (s *schedulerRuntimeState) quotaProbeReason(id string, now time.Time) strin
 	q := s.quotas[id]
 	health := s.authExpiry[id]
 	phase := s.fiveHourPhases[id]
+	continuityUntil := s.continuityDemandUntil[id]
 	epochReason := s.quotaEpochProbeReasonLocked(id, now)
 	s.mu.RUnlock()
 	if !cfg.QuotaProbeOnDemand {
 		return "periodic"
 	}
-	if epochReason != "" && !now.Before(p.NextAt) {
+	// Epoch follow-ups are bounded by their own probe count and spacing. A
+	// successful standby poll's long cooldown must not stall new-week activation.
+	// Failed probes still retain their independent backoff.
+	if epochReason != "" && (p.Failures == 0 || !now.Before(p.NextAt)) {
 		return epochReason
 	}
 	if now.Before(p.NextAt) {
 		return ""
+	}
+	// A live host continuity assessment may ask for a post-reset observation.
+	// It never overrides per-credential backoff or authenticates a refill.
+	if cfg.ContinuityEnabled && now.Before(continuityUntil) {
+		return "continuity"
 	}
 	if p.LastUsageAt.After(p.AttemptedAt) {
 		return "usage"

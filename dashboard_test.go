@@ -2,6 +2,7 @@ package main
 
 import (
 	"net/http"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -37,7 +38,7 @@ func TestDashboardMenuAndAssets(t *testing.T) {
 			}
 		}
 	}
-	if menus != 1 || len(resources) != 7 {
+	if menus != 1 || len(resources) != 9 {
 		t.Fatalf("resources=%d menus=%d", len(resources), menus)
 	}
 	// JSON endpoints must remain behind management authentication, never menus.
@@ -55,6 +56,28 @@ func TestDashboardMenuAndAssets(t *testing.T) {
 	}
 	if !foundStatus {
 		t.Fatal("scheduler status route is not registered")
+	}
+}
+
+func TestDashboardImportedModulesArePublicResources(t *testing.T) {
+	resources := dashboardResources()
+	registered := make(map[string]bool)
+	for _, route := range resources {
+		registered[route.Path] = true
+	}
+	imports := regexp.MustCompile(`(?:from|import)\s*['"]\./([^'"]+\.mjs)['"]`)
+	for _, route := range resources {
+		if !strings.HasSuffix(route.Path, ".mjs") {
+			continue
+		}
+		response, _ := dashboardResource(http.MethodGet, dashboardResourcePrefix+route.Path)
+		for _, match := range imports.FindAllStringSubmatch(string(response.Body), -1) {
+			path := "/" + match[1]
+			module, ok := dashboardResource(http.MethodGet, dashboardResourcePrefix+path)
+			if !registered[path] || !ok || module.StatusCode != http.StatusOK || !strings.HasPrefix(module.Headers.Get("Content-Type"), "text/javascript") {
+				t.Fatalf("%s imports unavailable module %s", route.Path, path)
+			}
+		}
 	}
 }
 

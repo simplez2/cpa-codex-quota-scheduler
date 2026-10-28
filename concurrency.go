@@ -28,6 +28,7 @@ type concurrencyRequest struct {
 	Token           string
 	Key             string
 	AuthID          string
+	AuthIndex       string
 	At              time.Time
 	Warmup          bool
 	NativeSelection bool
@@ -117,6 +118,12 @@ func (g *accountConcurrencyGate) register(id string, now time.Time) string {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.registerLocked(id, now)
+}
+
+func (s *schedulerRuntimeState) concurrencyRequestID(token string) string {
+	s.concurrency.mu.Lock()
+	defer s.concurrency.mu.Unlock()
+	return s.concurrency.tokens[token]
 }
 
 func (g *accountConcurrencyGate) registerLocked(id string, now time.Time) string {
@@ -671,6 +678,29 @@ func (s *schedulerRuntimeState) concurrencyAfter(req pluginapi.RequestInterceptR
 		s.mu.RLock()
 		cfg = s.cfg
 		detached := s.detached
+		if selectedIndex == "" && selectedID != "" {
+			if quota, ok := s.lookupQuotaLocked(selectedID, ""); ok {
+				selectedIndex = quota.AuthIndex
+			}
+		}
+		if quota, ok := s.lookupQuotaLocked(selectedID, selectedIndex); ok {
+			// CPA's compact endpoint uses openai-response as ToFormat even when
+			// the selected credential is Codex. A matching native quota binding
+			// identifies that credential without affecting other providers.
+			if quota.AuthID == selectedID && quota.AuthIndex != "" &&
+				(selectedIndex == "" || selectedIndex == quota.AuthIndex) && s.identities[quota.AuthIndex] == selectedID {
+				isCodex = true
+			}
+		}
+		if !isCodex && s.recovery.knowsCredential(selectedID, selectedIndex) {
+			// A Codex usage 429 may precede the first inventory/quota probe.
+			isCodex = true
+		}
+		if !isCodex && selectedID != "" {
+			// The Codex usage callback may also lack an auth index. Quarantine
+			// entries are created only from Codex usage or Codex warmup results.
+			_, isCodex = banStore.lookup(selectedID)
+		}
 		s.mu.RUnlock()
 		if detached {
 			s.selectionMu.Unlock()
@@ -773,11 +803,58 @@ func (s *schedulerRuntimeState) concurrencyAfter(req pluginapi.RequestInterceptR
 			s.selectionMu.Unlock()
 			return concurrencyTermination("account_concurrency_unavailable", "CPA did not admit this Codex execution through the credential concurrency scheduler")
 		}
+		if cfg.Enabled {
+			if selectedID == "" && (s.recovery.hasAny() || banStore.count() > 0) {
+				g.mu.Unlock()
+				s.selectionMu.Unlock()
+				return concurrencyTermination("quota_recovery_wait", "CPA did not identify the selected credential for quota safety admission")
+			}
+			if selectedID != "" {
+				if s.recovery.hasAuth(selectedID, selectedIndex) {
+					for _, active := range g.requests {
+						if active.Warmup && active.AuthID == selectedID {
+							g.mu.Unlock()
+							s.selectionMu.Unlock()
+							return concurrencyTermination("quota_recovery_wait", "Credential has a warmup still in progress")
+						}
+					}
+				}
+				s.recovery.finishOther(req.RequestID, selectedID, time.Now(), cfg.HalfOpenRetryAfter, cfg.MaxBan)
+				banStore.completeOwnedProbeExcept(req.RequestID, selectedID, false, false, time.Now(), cfg.HalfOpenRetryAfter, cfg.MaxBan)
+				allowed, guarded := s.recovery.reserve(selectedID, selectedIndex, req.RequestID, time.Now())
+				if !allowed || (guarded && r == nil) {
+					g.mu.Unlock()
+					s.selectionMu.Unlock()
+					return concurrencyTermination("quota_recovery_wait", "Credential recovery is waiting for fresh quota or a single probe")
+				}
+				if _, banned := banStore.lookup(selectedID); banned && (r == nil || req.RequestID == "") {
+					g.mu.Unlock()
+					s.selectionMu.Unlock()
+					return concurrencyTermination("quota_recovery_wait", "A quarantined credential requires a tracked request lifecycle")
+				}
+				allowed, _ = banStore.tryStartProbeOwned(selectedID, req.RequestID, time.Now(), cfg.HalfOpenProbeTimeout)
+				if !allowed || (guarded && !s.recovery.dispatched(selectedID, req.RequestID)) {
+					g.mu.Unlock()
+					s.selectionMu.Unlock()
+					return concurrencyTermination("quota_recovery_wait", "Credential is quarantined or its recovery probe is already in flight")
+				}
+				banStore.markProbeDispatched(selectedID, req.RequestID)
+			}
+		}
+		dispatchedAuthID := ""
 		if r != nil {
+			r.AuthIndex = selectedIndex
 			r.Dispatched = true
+			dispatchedAuthID = r.AuthID
 		}
 		g.mu.Unlock()
 		s.selectionMu.Unlock()
+		if r != nil {
+			s.continuityDispatched(req.RequestID, dispatchedAuthID)
+		}
+		if cfg.Enabled && selectedID != "" && (s.recovery.hasAuth(selectedID, selectedIndex) || banStore.count() > 0) {
+			s.persistAfterBanChange()
+		}
 		return response
 	}
 }
@@ -807,6 +884,7 @@ func (s *schedulerRuntimeState) rollbackUndispatchedConcurrency(token string) {
 	}
 }
 func (s *schedulerRuntimeState) concurrencyComplete(id string) {
+	s.continuityComplete(id)
 	r := s.concurrency.release(id)
 	if r == nil {
 		return
@@ -823,6 +901,37 @@ func (s *schedulerRuntimeState) concurrencyComplete(id string) {
 			s.balancedSessions[r.SessionKey] = binding
 		}
 		s.mu.Unlock()
+	}
+}
+
+// CPA invokes this only after the same execution's upstream attempt returned a
+// definitive 429 before any output. Preserve its lifecycle registration and
+// release only that completed attempt's credential slot; later assessments are
+// idempotent and normal admission is still required for the replacement.
+func (s *schedulerRuntimeState) releaseRejectedContinuityAttempt(id string) {
+	s.mu.RLock()
+	cfg := s.cfg
+	s.mu.RUnlock()
+	now := time.Now()
+	g := &s.concurrency
+	g.mu.Lock()
+	changed := false
+	if r := g.requests[strings.TrimSpace(id)]; r != nil && r.Dispatched {
+		// Establish isolation before the asynchronous usage callback can arrive
+		// and before any competing after-auth admission can pass this gate.
+		if r.AuthID != "" {
+			s.recovery.require(r.AuthID, r.AuthIndex, now, now.Add(time.Second))
+			banStore.setIfAbsent(r.AuthID, banEntry{Kind: banKindProbation, Phase: banPhaseCooldown, BannedAt: now, ResetAt: now.Add(time.Second), Window: "probation (429 awaiting classification)", Provisional: true})
+		}
+		r.Key, r.AuthID, r.AuthIndex, r.Dispatched = "", "", "", false
+		g.notifyLocked()
+		changed = true
+	}
+	g.mu.Unlock()
+	changed = s.recovery.finish(id, false, now, cfg.HalfOpenRetryAfter, cfg.MaxBan) || changed
+	changed = banStore.completeOwnedProbe(id, false, now, cfg.HalfOpenRetryAfter, cfg.MaxBan) || changed
+	if changed {
+		s.persistAfterBanChange()
 	}
 }
 
@@ -845,6 +954,11 @@ func (s *schedulerRuntimeState) beginWarmupConcurrency(candidate warmupCandidate
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.initLocked()
+	if cfg.Enabled {
+		if _, banned := banStore.lookup(candidate.Snapshot.AuthID); banned || s.recovery.hasAuth(candidate.Snapshot.AuthID, candidate.Snapshot.AuthIndex) {
+			return "", false
+		}
+	}
 	key := g.keyLocked(aliases)
 	if cfg.Enabled && cfg.AccountConcurrencyEnabled && g.blockedLocked(key, nil, cfg.AccountMaxConcurrency, time.Now()) {
 		return "", false
@@ -919,6 +1033,16 @@ func handleConcurrencyComplete(raw []byte) ([]byte, error) {
 	if err := json.Unmarshal(raw, &completion); err != nil {
 		return nil, err
 	}
+	outcome := strings.TrimSpace(completion.Outcome)
+	success := strings.EqualFold(outcome, "succeeded") && (completion.StatusCode == 0 || (completion.StatusCode >= 200 && completion.StatusCode < 300))
+	schedulerRuntime.mu.RLock()
+	cfg := schedulerRuntime.cfg
+	schedulerRuntime.mu.RUnlock()
+	changed := schedulerRuntime.recovery.finish(completion.RequestID, success, time.Now(), cfg.HalfOpenRetryAfter, cfg.MaxBan)
+	changed = banStore.completeOwnedProbe(completion.RequestID, success, time.Now(), cfg.HalfOpenRetryAfter, cfg.MaxBan) || changed
 	schedulerRuntime.concurrencyComplete(completion.RequestID)
+	if changed {
+		schedulerRuntime.persistAfterBanChange()
+	}
 	return okEnvelope(map[string]any{})
 }

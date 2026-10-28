@@ -1,5 +1,18 @@
 # CPA host quota failover
 
+For official CPA v8.0.44, use the separately ported
+[v8.0.44 continuity integration](CONTINUITY-v8.0.44.md). Its base revision
+and patch digest are recorded in `continuity-host-patch-v8.0.44.json`.
+
+For v0.3.28 unattended 5h waiting, pacing and automatic recovery, use the
+[CPA v8.0.4 continuity integration](CONTINUITY.md) and
+`CLIProxyAPI-v8.0.4-continuity.patch`. Its exact base revision and digest are in
+`continuity-host-patch.json`. The native local acceptance harness is
+`continuity/acceptance.py`. Updating the plugin alone does not give an older host
+the new wait capability.
+
+The following section documents the historical v7.2.152 failover integration.
+
 The scheduler selects accounts and quarantines exhausted credentials. Retrying the
 same request before delivering output also requires the accompanying host patch,
 based on official CLIProxyAPI v7.2.152 (`c76dfd4`).

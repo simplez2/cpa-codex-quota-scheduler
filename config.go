@@ -27,12 +27,19 @@ type pluginConfig struct {
 	AccountConcurrencyEnabled    bool
 	AccountMaxConcurrency        int
 	AccountConcurrencyWait       time.Duration
+	ContinuityEnabled            bool
+	ContinuityMaxWait            time.Duration
+	ContinuityPollInterval       time.Duration
+	ContinuityPacing             bool
 	SerialSwitchPercent          float64
 	SerialSoftContinuation       bool
 	SerialAllocationPolicy       string
 	SerialBudgetRebalancePercent float64
 	QuotaDefaultPlan             string
 	QuotaAccountPlans            map[string]string
+	PoolWeeklyCapacityWeights    map[string]float64
+	PoolFiveHourCapacityWeights  map[string]float64
+	PoolFiveHourExcludedAccounts []string
 	SerialHandoffMode            string
 	Serial5hHandoffMode          string
 	Serial5hSwitchPercent        float64
@@ -74,60 +81,67 @@ type pluginConfig struct {
 }
 
 type yamlPluginConfig struct {
-	QuotaProbeOnDemand           *bool             `yaml:"quota_probe_on_demand"`
-	AuthExpiryAutoRepair         *bool             `yaml:"auth_expiry_auto_repair"`
-	QuotaURL                     string            `yaml:"quota_url"`
-	QuotaRefreshBatch            *int              `yaml:"quota_refresh_batch"`
-	Enabled                      *bool             `yaml:"enabled"`
-	Priority                     *int              `yaml:"priority"`
-	SchedulerMode                string            `yaml:"scheduler_mode"`
-	AccountConcurrencyEnabled    *bool             `yaml:"account_concurrency_enabled"`
-	AccountMaxConcurrency        *int              `yaml:"account_max_concurrency"`
-	AccountConcurrencyWait       string            `yaml:"account_concurrency_wait"`
-	SerialSwitchPercent          *float64          `yaml:"serial_switch_percent"`
-	SerialSoftContinuation       *bool             `yaml:"serial_soft_continuation"`
-	SerialAllocationPolicy       string            `yaml:"serial_allocation_policy"`
-	SerialBudgetRebalancePercent *float64          `yaml:"serial_budget_rebalance_percent"`
-	QuotaDefaultPlan             string            `yaml:"quota_default_plan"`
-	QuotaAccountPlans            map[string]string `yaml:"quota_account_plans"`
-	SerialHandoffMode            string            `yaml:"serial_handoff_mode"`
-	Serial5hHandoffMode          string            `yaml:"serial_5h_handoff_mode"`
-	Serial5hSwitchPercent        *float64          `yaml:"serial_5h_switch_percent"`
-	SerialPreferActiveCycle      *bool             `yaml:"serial_prefer_active_cycle"`
-	SerialWeeklyRebalancePercent *float64          `yaml:"serial_weekly_rebalance_percent"`
-	SerialWeeklyRebalanceMinHold string            `yaml:"serial_weekly_rebalance_min_hold"`
-	DrainWindowHours             *float64          `yaml:"drain_window_hours"`
-	CPAManagementURL             string            `yaml:"cpa_management_url"`
-	CPAManagementKeyFile         string            `yaml:"cpa_management_key_file"`
-	WarmupEnabled                *bool             `yaml:"warmup_enabled"`
-	WarmupModel                  string            `yaml:"warmup_model"`
-	WarmupRetryAfter             string            `yaml:"warmup_retry_after"`
-	WarmupMinInterval            string            `yaml:"warmup_min_interval"`
-	WarmupMaxPerDay              *int              `yaml:"warmup_max_per_day"`
-	QuotaRefreshCooldown         string            `yaml:"quota_refresh_cooldown"`
-	RefreshInterval              string            `yaml:"refresh_interval"`
-	StaleAfter                   string            `yaml:"stale_after"`
-	StatePath                    string            `yaml:"state_path"`
-	SoftLimitPercent             *float64          `yaml:"soft_limit_percent"`
-	Reserve5hPercent             *float64          `yaml:"reserve_5h_percent"`
-	ReserveWeeklyPercent         *float64          `yaml:"reserve_weekly_percent"`
-	ReserveMonthlyPercent        *float64          `yaml:"reserve_monthly_percent"`
-	LowQuotaPercent              *float64          `yaml:"low_quota_percent"`
-	FallbackBan                  string            `yaml:"fallback_ban"`
-	MaxBan                       string            `yaml:"max_ban"`
-	HalfOpenProbeTimeout         string            `yaml:"half_open_probe_timeout"`
-	HalfOpenRetryAfter           string            `yaml:"half_open_retry_after"`
-	StickySeconds                *int              `yaml:"sticky_seconds"`
-	SwitchHysteresisPercent      *float64          `yaml:"switch_hysteresis_percent"`
-	SwitchConfirmations          *int              `yaml:"switch_confirmations"`
-	CostSampleLimit              *int              `yaml:"cost_sample_limit"`
-	DecisionHistoryLimit         *int              `yaml:"decision_history_limit"`
-	NormalCostQuantile           *float64          `yaml:"normal_cost_quantile"`
-	GuardCostQuantile            *float64          `yaml:"guard_cost_quantile"`
-	HighCostQuantile             *float64          `yaml:"high_cost_quantile"`
-	ShadowLogInterval            string            `yaml:"shadow_log_interval"`
-	PreferResetCredits           *bool             `yaml:"prefer_reset_credits"`
-	WindowOrder                  []string          `yaml:"window_order"`
+	QuotaProbeOnDemand           *bool              `yaml:"quota_probe_on_demand"`
+	AuthExpiryAutoRepair         *bool              `yaml:"auth_expiry_auto_repair"`
+	QuotaURL                     string             `yaml:"quota_url"`
+	QuotaRefreshBatch            *int               `yaml:"quota_refresh_batch"`
+	Enabled                      *bool              `yaml:"enabled"`
+	Priority                     *int               `yaml:"priority"`
+	SchedulerMode                string             `yaml:"scheduler_mode"`
+	AccountConcurrencyEnabled    *bool              `yaml:"account_concurrency_enabled"`
+	AccountMaxConcurrency        *int               `yaml:"account_max_concurrency"`
+	AccountConcurrencyWait       string             `yaml:"account_concurrency_wait"`
+	ContinuityEnabled            *bool              `yaml:"continuity_enabled"`
+	ContinuityMaxWait            string             `yaml:"continuity_max_wait"`
+	ContinuityPollInterval       string             `yaml:"continuity_poll_interval"`
+	ContinuityPacing             *bool              `yaml:"continuity_pacing"`
+	SerialSwitchPercent          *float64           `yaml:"serial_switch_percent"`
+	SerialSoftContinuation       *bool              `yaml:"serial_soft_continuation"`
+	SerialAllocationPolicy       string             `yaml:"serial_allocation_policy"`
+	SerialBudgetRebalancePercent *float64           `yaml:"serial_budget_rebalance_percent"`
+	QuotaDefaultPlan             string             `yaml:"quota_default_plan"`
+	QuotaAccountPlans            map[string]string  `yaml:"quota_account_plans"`
+	PoolWeeklyCapacityWeights    map[string]float64 `yaml:"pool_weekly_capacity_weights"`
+	PoolFiveHourCapacityWeights  map[string]float64 `yaml:"pool_5h_capacity_weights"`
+	PoolFiveHourExcludedAccounts []string           `yaml:"pool_5h_excluded_accounts"`
+	SerialHandoffMode            string             `yaml:"serial_handoff_mode"`
+	Serial5hHandoffMode          string             `yaml:"serial_5h_handoff_mode"`
+	Serial5hSwitchPercent        *float64           `yaml:"serial_5h_switch_percent"`
+	SerialPreferActiveCycle      *bool              `yaml:"serial_prefer_active_cycle"`
+	SerialWeeklyRebalancePercent *float64           `yaml:"serial_weekly_rebalance_percent"`
+	SerialWeeklyRebalanceMinHold string             `yaml:"serial_weekly_rebalance_min_hold"`
+	DrainWindowHours             *float64           `yaml:"drain_window_hours"`
+	CPAManagementURL             string             `yaml:"cpa_management_url"`
+	CPAManagementKeyFile         string             `yaml:"cpa_management_key_file"`
+	WarmupEnabled                *bool              `yaml:"warmup_enabled"`
+	WarmupModel                  string             `yaml:"warmup_model"`
+	WarmupRetryAfter             string             `yaml:"warmup_retry_after"`
+	WarmupMinInterval            string             `yaml:"warmup_min_interval"`
+	WarmupMaxPerDay              *int               `yaml:"warmup_max_per_day"`
+	QuotaRefreshCooldown         string             `yaml:"quota_refresh_cooldown"`
+	RefreshInterval              string             `yaml:"refresh_interval"`
+	StaleAfter                   string             `yaml:"stale_after"`
+	StatePath                    string             `yaml:"state_path"`
+	SoftLimitPercent             *float64           `yaml:"soft_limit_percent"`
+	Reserve5hPercent             *float64           `yaml:"reserve_5h_percent"`
+	ReserveWeeklyPercent         *float64           `yaml:"reserve_weekly_percent"`
+	ReserveMonthlyPercent        *float64           `yaml:"reserve_monthly_percent"`
+	LowQuotaPercent              *float64           `yaml:"low_quota_percent"`
+	FallbackBan                  string             `yaml:"fallback_ban"`
+	MaxBan                       string             `yaml:"max_ban"`
+	HalfOpenProbeTimeout         string             `yaml:"half_open_probe_timeout"`
+	HalfOpenRetryAfter           string             `yaml:"half_open_retry_after"`
+	StickySeconds                *int               `yaml:"sticky_seconds"`
+	SwitchHysteresisPercent      *float64           `yaml:"switch_hysteresis_percent"`
+	SwitchConfirmations          *int               `yaml:"switch_confirmations"`
+	CostSampleLimit              *int               `yaml:"cost_sample_limit"`
+	DecisionHistoryLimit         *int               `yaml:"decision_history_limit"`
+	NormalCostQuantile           *float64           `yaml:"normal_cost_quantile"`
+	GuardCostQuantile            *float64           `yaml:"guard_cost_quantile"`
+	HighCostQuantile             *float64           `yaml:"high_cost_quantile"`
+	ShadowLogInterval            string             `yaml:"shadow_log_interval"`
+	PreferResetCredits           *bool              `yaml:"prefer_reset_credits"`
+	WindowOrder                  []string           `yaml:"window_order"`
 }
 
 func defaultPluginConfig() pluginConfig {
@@ -141,10 +155,17 @@ func defaultPluginConfig() pluginConfig {
 		AccountConcurrencyEnabled:    true,
 		AccountMaxConcurrency:        2,
 		AccountConcurrencyWait:       10 * time.Second,
+		ContinuityEnabled:            true,
+		ContinuityMaxWait:            6 * time.Hour,
+		ContinuityPollInterval:       30 * time.Second,
+		ContinuityPacing:             true,
 		SerialSwitchPercent:          98,
 		SerialAllocationPolicy:       "sustainable",
 		SerialBudgetRebalancePercent: 20,
 		QuotaDefaultPlan:             "team_standard",
+		PoolWeeklyCapacityWeights:    defaultPoolWeeklyCapacityWeights(),
+		PoolFiveHourCapacityWeights:  defaultPoolWeeklyCapacityWeights(),
+		PoolFiveHourExcludedAccounts: []string{},
 		SerialHandoffMode:            "threshold_only",
 		Serial5hHandoffMode:          "429_only",
 		Serial5hSwitchPercent:        98,
@@ -231,6 +252,26 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 		}
 		cfg.AccountConcurrencyWait = wait
 	}
+	if in.ContinuityEnabled != nil {
+		cfg.ContinuityEnabled = *in.ContinuityEnabled
+	}
+	if in.ContinuityPacing != nil {
+		cfg.ContinuityPacing = *in.ContinuityPacing
+	}
+	if in.ContinuityMaxWait != "" {
+		wait, err := time.ParseDuration(in.ContinuityMaxWait)
+		if err != nil || wait < time.Second || wait > 24*time.Hour {
+			return cfg, fmt.Errorf("continuity_max_wait must be between 1s and 24h")
+		}
+		cfg.ContinuityMaxWait = wait
+	}
+	if in.ContinuityPollInterval != "" {
+		interval, err := time.ParseDuration(in.ContinuityPollInterval)
+		if err != nil || interval < time.Second || interval > 5*time.Minute {
+			return cfg, fmt.Errorf("continuity_poll_interval must be between 1s and 5m")
+		}
+		cfg.ContinuityPollInterval = interval
+	}
 	if in.SerialSwitchPercent != nil {
 		cfg.SerialSwitchPercent = *in.SerialSwitchPercent
 	}
@@ -266,6 +307,37 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 				return cfg, fmt.Errorf("quota_account_plans requires nonempty auth IDs and supported plan names")
 			}
 			cfg.QuotaAccountPlans[id] = plan
+		}
+	}
+	for _, field := range []struct {
+		name   string
+		input  map[string]float64
+		target *map[string]float64
+	}{{"pool_weekly_capacity_weights", in.PoolWeeklyCapacityWeights, &cfg.PoolWeeklyCapacityWeights}, {"pool_5h_capacity_weights", in.PoolFiveHourCapacityWeights, &cfg.PoolFiveHourCapacityWeights}} {
+		if field.input == nil {
+			continue
+		}
+		*field.target = make(map[string]float64, len(field.input))
+		for rawPlan, weight := range field.input {
+			plan, ok := normalizeQuotaPlan(rawPlan)
+			if !ok || math.IsNaN(weight) || math.IsInf(weight, 0) || weight <= 0 || weight > 1000 {
+				return cfg, fmt.Errorf("%s requires supported plans and positive finite weights up to 1000", field.name)
+			}
+			(*field.target)[plan] = weight
+		}
+	}
+	if in.PoolFiveHourExcludedAccounts != nil {
+		cfg.PoolFiveHourExcludedAccounts = []string{}
+		seen := map[string]bool{}
+		for _, rawID := range in.PoolFiveHourExcludedAccounts {
+			id := strings.TrimSpace(rawID)
+			if id == "" || len(id) > 4096 {
+				return cfg, fmt.Errorf("pool_5h_excluded_accounts requires nonempty credential IDs up to 4096 bytes")
+			}
+			if !seen[id] {
+				cfg.PoolFiveHourExcludedAccounts = append(cfg.PoolFiveHourExcludedAccounts, id)
+				seen[id] = true
+			}
 		}
 	}
 	if strings.TrimSpace(in.SerialHandoffMode) != "" {

@@ -54,29 +54,34 @@ type quotaWindow struct {
 }
 
 type quotaSnapshot struct {
-	AuthID           string
-	AuthIndex        string
-	AccountID        string
-	Plan             quotaPlanObservation
-	Windows          []quotaWindow
-	ResetCredits     int
-	RefreshedAt      time.Time
-	HeaderObservedAt time.Time
+	FiveHourLimitStatus     string
+	FiveHourLimitObservedAt time.Time
+	AuthID                  string
+	AuthIndex               string
+	AccountID               string
+	Plan                    quotaPlanObservation
+	Windows                 []quotaWindow
+	ResetCredits            int
+	RefreshedAt             time.Time
+	HeaderObservedAt        time.Time
 }
 
 type schedulerRuntimeState struct {
-	authExpiry     map[string]authExpiryState
-	quotaRefreshMu sync.Mutex
-	quotaPolls     map[string]quotaPollState
-	quotaRunway    quotaRunwayTracker
-	quotaNative    map[string]quotaSnapshot
-	lifecycleMu    sync.Mutex
-	mu             sync.RWMutex
-	selectionMu    sync.Mutex
-	concurrency    accountConcurrencyGate
-	persistMu      sync.Mutex
-	generationMu   sync.Mutex
-	generation     schedulerGenerationOwnership
+	authExpiry            map[string]authExpiryState
+	quotaRefreshMu        sync.Mutex
+	quotaPolls            map[string]quotaPollState
+	quotaRunway           quotaRunwayTracker
+	quotaNative           map[string]quotaSnapshot
+	lifecycleMu           sync.Mutex
+	mu                    sync.RWMutex
+	selectionMu           sync.Mutex
+	concurrency           accountConcurrencyGate
+	continuity            continuityGate
+	recovery              recoveryGuard
+	continuityDemandUntil map[string]time.Time
+	persistMu             sync.Mutex
+	generationMu          sync.Mutex
+	generation            schedulerGenerationOwnership
 
 	cfg         pluginConfig
 	quotas      map[string]quotaSnapshot // indexed by AuthID and AuthIndex aliases
@@ -200,6 +205,8 @@ func configureSchedulerRuntime(raw []byte) {
 	schedulerRuntime.cfg = cfg
 	schedulerRuntime.quotaPolls = make(map[string]quotaPollState)
 	schedulerRuntime.quotaRunway = quotaRunwayTracker{}
+	schedulerRuntime.continuityDemandUntil = make(map[string]time.Time)
+	schedulerRuntime.continuity.clearPacing(time.Now())
 	schedulerRuntime.quotaNative = make(map[string]quotaSnapshot)
 	schedulerRuntime.balancedClock = time.Time{}
 	schedulerRuntime.balancedAccounts = make(map[string]*balancedAccount)
@@ -398,6 +405,10 @@ func (s *schedulerRuntimeState) recordRefreshError(err error) {
 }
 
 func mergePartialQuotaSnapshot(previous, current quotaSnapshot, now time.Time, staleAfter time.Duration) quotaSnapshot {
+	if previous.FiveHourLimitObservedAt.After(current.FiveHourLimitObservedAt) {
+		current.FiveHourLimitStatus = previous.FiveHourLimitStatus
+		current.FiveHourLimitObservedAt = previous.FiveHourLimitObservedAt
+	}
 	current.Plan = mergeQuotaPlanObservation(previous, current, now, staleAfter)
 	incomingSnapshotAt := current.RefreshedAt
 	previous.Windows = normalizeQuotaWindowSet(previous.Windows, previous.RefreshedAt, now, staleAfter)
@@ -422,6 +433,13 @@ func mergePartialQuotaSnapshot(previous, current quotaSnapshot, now time.Time, s
 			continue
 		}
 		class := normalizeWindowClass(window.Class)
+		// A full native response which positively reports no 5h window replaces
+		// older 5h observations. Equal/newer headers remain conservative: a
+		// concurrent completion cannot be ordered against an equal timestamp.
+		if class == "5h" && current.FiveHourLimitStatus == "not_reported" &&
+			!current.FiveHourLimitObservedAt.IsZero() && window.ObservedAt.Before(current.FiveHourLimitObservedAt) {
+			continue
+		}
 		if i, ok := present[class]; ok {
 			incoming := current.Windows[i].ObservedAt
 			if incoming.IsZero() {
@@ -520,6 +538,9 @@ func (s *schedulerRuntimeState) observeUsage(record pluginapi.UsageRecord) {
 	}
 	now := time.Now()
 	s.recordQuotaDemand(record, now)
+	if !record.Failed {
+		s.noteContinuityUsage(record.AuthID, record.AuthIndex, now)
+	}
 	if !record.Failed && !record.RequestedAt.IsZero() {
 		s.mu.Lock()
 		s.noteFiveHourActivationLocked(s.canonicalAuthIDLocked(record.AuthID, record.AuthIndex), record.AuthIndex, record.RequestedAt)
@@ -814,6 +835,9 @@ func (s *schedulerRuntimeState) schedulerPickUncapped(req pluginapi.SchedulerPic
 		}
 		lastLegacy, lastDynamic, lastCandidates = legacy, dynamic, candidates
 		if !returned.Handled {
+			if s.allContinuityCandidatesBlocked(attempt, now) {
+				returned = pluginapi.SchedulerPickResponse{Handled: true, Reject: true, RejectCode: "quota_recovery_wait", RejectReason: "All selected Codex credentials are waiting for quota recovery"}
+			}
 			s.recordDecisionAudit(attempt, mode, legacy, dynamic, returned, candidates, now)
 			return returned, nil
 		}
@@ -826,7 +850,8 @@ func (s *schedulerRuntimeState) schedulerPickUncapped(req pluginapi.SchedulerPic
 			continue
 		}
 
-		allowed, probeStarted := banStore.tryStartProbe(returned.AuthID, now, probeLease)
+		owner := s.concurrencyRequestID(schedulerHeader(req.Options, concurrencyHeader))
+		allowed, probeStarted := banStore.tryStartProbeOwned(returned.AuthID, owner, now, probeLease)
 		if !allowed {
 			// Another concurrent pick won the half-open lease after this decision
 			// was ranked. Retry with that credential removed instead of issuing a
@@ -857,6 +882,44 @@ func (s *schedulerRuntimeState) schedulerPickUncapped(req pluginapi.SchedulerPic
 	returned := pluginapi.SchedulerPickResponse{Handled: false}
 	s.recordDecisionAudit(req, mode, lastLegacy, lastDynamic, returned, lastCandidates, now)
 	return returned, nil
+}
+
+func (s *schedulerRuntimeState) allContinuityCandidatesBlocked(req pluginapi.SchedulerPickRequest, now time.Time) bool {
+	if len(req.Candidates) == 0 || !codexOnlySchedulerRequest(req) || schedulerRequestGenerationDisabled(req) {
+		return false
+	}
+	s.mu.RLock()
+	enabled := s.cfg.Enabled && s.cfg.ContinuityEnabled && !s.detached
+	s.mu.RUnlock()
+	if !enabled {
+		return false
+	}
+	owner := s.concurrencyRequestID(schedulerHeader(req.Options, concurrencyHeader))
+	for _, candidate := range req.Candidates {
+		id, index := strings.TrimSpace(candidate.ID), candidateAuthIndex(candidate)
+		if id == "" {
+			return false
+		}
+		if index == "" {
+			// Regular CPA scheduler candidates omit auth_index; use only an
+			// inventory-backed quota binding for this exact auth ID.
+			s.mu.RLock()
+			q, ok := s.lookupQuotaLocked(id, "")
+			if ok && q.AuthID == id && q.AuthIndex != "" && s.identities[q.AuthIndex] == id {
+				index = q.AuthIndex
+			}
+			s.mu.RUnlock()
+		}
+		if s.recovery.blockedForPick(id, index, owner, now) {
+			continue
+		}
+		entry, banned := banStore.lookup(id)
+		if banned && banEntryDisposition(entry, now) != banDispositionProbeReady && (owner == "" || entry.ProbeOwner != owner) {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func schedulerRequestGenerationDisabled(req pluginapi.SchedulerPickRequest) bool {
@@ -1132,6 +1195,8 @@ func (s *schedulerRuntimeState) nextPick(n int) int {
 }
 
 type persistedBanState struct {
+	HostMarker             string                            `json:"host_marker,omitempty"`
+	Recovery               map[string]recoveryEntry          `json:"recovery_guard,omitempty"`
 	AuthExpiry             map[string]authExpiryState        `json:"auth_expiry,omitempty"`
 	BalancedSessions       map[string]balancedSessionBinding `json:"balanced_sessions,omitempty"`
 	QuotaPolls             map[string]quotaPollState         `json:"quota_polls,omitempty"`
@@ -1199,6 +1264,42 @@ func (s *schedulerRuntimeState) loadBanStateWithConfirmationMode(path string, re
 			s.replaceBanResetConfirmations(nil)
 		}
 		return
+	}
+	s.mu.RLock()
+	recoveryCfg := s.cfg
+	s.mu.RUnlock()
+	hostMarker := currentRecoveryHostMarker()
+	hostChanged := hostMarker != "" && state.HostMarker != "" && hostMarker != state.HostMarker
+	if hostChanged {
+		now := time.Now()
+		for id, entry := range state.Recovery {
+			if entry.Dispatched {
+				entry.Failures++
+				until := now.Add(recoveryRetryDelay(entry.Failures, recoveryCfg.HalfOpenRetryAfter, recoveryCfg.MaxBan))
+				if until.After(entry.RetryAt) {
+					entry.RetryAt = until
+				}
+				entry.ObservedAt = now
+			}
+			entry.Owner, entry.ReservedAt, entry.Dispatched, entry.Ready = "", time.Time{}, false, false
+			state.Recovery[id] = entry
+		}
+		for id, entry := range state.Bans {
+			if entry.Phase == banPhaseHalfOpen && entry.ProbeOwner != "" {
+				entry.Phase, entry.ProbeOwner, entry.ProbeDispatched = banPhaseCooldown, "", false
+				entry.ProbeStartedAt, entry.ProbeLeaseUntil = time.Time{}, time.Time{}
+				entry.ProbeFailures++
+				until := now.Add(recoveryRetryDelay(entry.ProbeFailures, recoveryCfg.HalfOpenRetryAfter, recoveryCfg.MaxBan))
+				if until.After(entry.ResetAt) {
+					entry.ResetAt = until
+				}
+				state.Bans[id] = entry
+			}
+		}
+	}
+	s.recovery.restore(state.Recovery)
+	for _, q := range state.Quotas {
+		s.recovery.observe(q, time.Now(), s.cfg.StaleAfter)
 	}
 	for authID, entry := range state.Bans {
 		if strings.TrimSpace(authID) == "" || entry.ResetAt.IsZero() {
@@ -1405,6 +1506,8 @@ func (s *schedulerRuntimeState) persistBanState() bool {
 	}
 	s.banResetMu.Unlock()
 	state := persistedBanState{
+		HostMarker: currentRecoveryHostMarker(),
+		Recovery:   s.recovery.snapshot(),
 		QuotaPolls: polls, Quotas: quotas, BalancedSessions: balancedSessions, AuthExpiry: authExpiry,
 		Version:                8,
 		FiveHourPhases:         fiveHourPhases,
@@ -1504,6 +1607,7 @@ type runtimeADQStatus struct {
 
 type runtimeStatus struct {
 	Concurrency                   accountConcurrencyStatus         `json:"concurrency"`
+	Continuity                    runtimeContinuityStatus          `json:"continuity"`
 	QuotaProbeOnDemand            bool                             `json:"quota_probe_on_demand"`
 	AuthExpiryAutoRepair          bool                             `json:"auth_expiry_auto_repair"`
 	BalancedStickyBindings        int                              `json:"balanced_sticky_bindings"`
@@ -1543,6 +1647,8 @@ type runtimeStatus struct {
 	SerialBudgetRebalancePercent  float64                          `json:"serial_budget_rebalance_percent"`
 	SerialSoftContinuation        bool                             `json:"serial_soft_continuation"`
 	QuotaDefaultPlan              string                           `json:"quota_default_plan"`
+	PoolWeekly                    runtimePoolWeeklyStatus          `json:"pool_weekly"`
+	PoolFiveHour                  runtimePoolFiveHourStatus        `json:"pool_5h"`
 	ConfigGeneration              uint64                           `json:"config_generation"`
 	RuntimeGeneration             uint64                           `json:"runtime_generation"`
 	GenerationManaged             bool                             `json:"generation_managed"`
@@ -1609,6 +1715,7 @@ func (s runtimeStatus) MarshalJSON() ([]byte, error) {
 
 var timeTypeForJSON = reflect.TypeOf(time.Time{})
 var runtimeADQAccountStatusType = reflect.TypeOf(runtimeADQAccountStatus{})
+var runtimePoolFiveHourStatusType = reflect.TypeOf(runtimePoolFiveHourStatus{})
 
 func sanitizeNonFiniteJSON(value reflect.Value) any {
 	if !value.IsValid() {
@@ -1671,6 +1778,12 @@ func sanitizeNonFiniteJSON(value reflect.Value) any {
 			return items
 		}
 		items := make(map[string]any)
+		if value.Type() == runtimePoolFiveHourStatusType {
+			// Preserve the promoted balance fields, just as the standard JSON
+			// encoder does for this embedded reporting type.
+			status := value.Interface().(runtimePoolFiveHourStatus)
+			items, _ = sanitizeNonFiniteJSON(reflect.ValueOf(status.runtimePoolWeeklyStatus)).(map[string]any)
+		}
 		typeOfValue := value.Type()
 		for index := 0; index < value.NumField(); index++ {
 			fieldInfo := typeOfValue.Field(index)
@@ -1728,6 +1841,7 @@ func isJSONEmptyValue(value reflect.Value) bool {
 }
 
 type runtimeQuotaStatus struct {
+	FiveHourLimitStatus   string                        `json:"five_hour_limit_status,omitempty"`
 	FiveHourPhase         *runtimeFiveHourPhaseStatus   `json:"five_hour_phase,omitempty"`
 	AuthHealth            *authExpiryStatus             `json:"auth_health,omitempty"`
 	Runway                []quotaRunwayWindowAssessment `json:"runway,omitempty"`
@@ -1936,8 +2050,10 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 	authExpiry := cloneAuthExpiryStates(s.authExpiry)
 	cfg := s.cfg
 	quotas := make(map[string]quotaSnapshot, len(s.quotas))
+	fiveHourLimits := make(map[string]string, len(s.quotas))
 	for key, snapshot := range s.quotas {
 		quotas[key] = s.serialConservativeQuotaLocked(snapshot, now)
+		fiveHourLimits[snapshot.AuthID] = poolFiveHourLimitStatus(s.quotaNative[snapshot.AuthID], snapshot, now, cfg.StaleAfter)
 	}
 	costSamples := make(map[string][]float64, len(s.costSamples))
 	for key, samples := range s.costSamples {
@@ -1985,6 +2101,10 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 	adqReservations := s.adqReservations
 	adqLastDecision := s.adqLastDecision
 	quotaEpoch := cloneQuotaEpochState(s.quotaEpoch)
+	poolIdentities := make(map[string]string, len(s.identities))
+	for index, id := range s.identities {
+		poolIdentities[index] = id
+	}
 	fiveHourPhases := cloneFiveHourPhases(s.fiveHourPhases)
 	adqCircuits := make(map[string]adqProviderCircuit, len(s.adqProviderCircuits))
 	for authID, circuit := range s.adqProviderCircuits {
@@ -2116,13 +2236,14 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 		}
 		evaluation := quotaEvaluationWithOrder(snapshot, now, cfg.WindowOrder)
 		item := runtimeQuotaStatus{
-			AuthID:        canonical,
-			AuthIndex:     snapshot.AuthIndex,
-			Fresh:         fresh,
-			ResetCredits:  snapshot.ResetCredits,
-			Eligible:      evaluation.Known && evaluation.Eligible,
-			ActiveWindows: evaluation.ActiveWindows,
-			Reason:        evaluation.Reason,
+			FiveHourLimitStatus: fiveHourLimits[canonical],
+			AuthID:              canonical,
+			AuthIndex:           snapshot.AuthIndex,
+			Fresh:               fresh,
+			ResetCredits:        snapshot.ResetCredits,
+			Eligible:            evaluation.Known && evaluation.Eligible,
+			ActiveWindows:       evaluation.ActiveWindows,
+			Reason:              evaluation.Reason,
 		}
 		if phase, exists := fiveHourPhases[canonical]; exists && phase.AuthIndex == snapshot.AuthIndex {
 			status := fiveHourPhaseStatus(phase, now)
@@ -2172,6 +2293,11 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 		}
 		item.Runway = runwayByAuth[canonical]
 		budgetChoice := inspectSerialCandidate(pluginapi.SchedulerAuthCandidate{ID: canonical}, snapshot, true, cfg, now)
+		if item.Eligible && (cfg.SchedulerMode == "serial" || cfg.SchedulerMode == "balanced") &&
+			!cfg.SerialSoftContinuation && budgetChoice.Reason == "serial_threshold" {
+			item.Eligible = false
+			item.Reason = "serial_threshold"
+		}
 		item.WeeklyBudgetPerMinute, item.WeeklyBudgetKnown = serialWeeklyBudgetPerMinute(budgetChoice, cfg, now)
 		item.WeeklyBudgetPerDay = item.WeeklyBudgetPerMinute * weeklyBudgetMinutesPerDay
 		if window.Class != "" {
@@ -2347,8 +2473,10 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 		}
 	}
 
+	poolAccounts := poolWeeklyAccounts(snapshots, poolIdentities, cfg, now)
 	out := runtimeStatus{
 		Concurrency:                   s.concurrencyStatus(cfg, quotas),
+		Continuity:                    s.continuityStatus(cfg),
 		QuotaProbeOnDemand:            cfg.QuotaProbeOnDemand,
 		AuthExpiryAutoRepair:          cfg.AuthExpiryAutoRepair,
 		BalancedAccounts:              balancedAccounts,
@@ -2379,6 +2507,8 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 		SerialBudgetRebalancePercent:  cfg.SerialBudgetRebalancePercent,
 		SerialSoftContinuation:        cfg.SerialSoftContinuation,
 		QuotaDefaultPlan:              cfg.QuotaDefaultPlan,
+		PoolWeekly:                    poolWeeklyStatus(poolAccounts, cfg, now),
+		PoolFiveHour:                  poolFiveHourStatus(poolAccounts, cfg, now),
 		ConfigGeneration:              configGeneration,
 		RuntimeGeneration:             generation.Ticket,
 		GenerationManaged:             generation.Managed,

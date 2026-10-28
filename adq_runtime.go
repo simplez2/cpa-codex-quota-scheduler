@@ -339,7 +339,12 @@ func (s *schedulerRuntimeState) adqInputForChoiceLocked(choice serialCandidate, 
 	if circuit.State == "" && rawID != id {
 		circuit = s.adqCircuitLocked(rawID, now)
 	}
-	healthy := choice.Candidate.Status == "" || strings.EqualFold(strings.TrimSpace(choice.Candidate.Status), "active")
+	// CPA has already filtered these candidates for this model's availability.
+	// Its historical error status can survive cooldown recovery or an error on
+	// another model. Treating it as an active outage makes every ADQ choice fail
+	// and silently delegates threshold/weight decisions back to native routing.
+	status := strings.ToLower(strings.TrimSpace(choice.Candidate.Status))
+	healthy := status == "" || status == "active" || status == "error"
 	if choice.Reason == "not_allowed" || choice.Reason == "limit_reached" {
 		healthy = false
 	}

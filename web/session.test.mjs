@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {normalizeBase,resourceBase,decodeStored,readPanelKey,validKey} from './session.mjs';
+import {normalizeBase,resourceBase,decodeStored,readPanelKey,validKey,rememberPanelKey,readRememberedPanelKey,clearPanelSession,panelSessionName,panelSessionLifetime} from './session.mjs';
 
 const base = 'https://cpa.example/a';
 const host = 'cpa.example';
@@ -56,4 +56,34 @@ test('unavailable storage and malformed or unsafe keys return no credential',()=
   assert.equal(readPanelKey({getItem(){throw new Error('disabled');}},base,host,agent),'');
   assert.equal(decodeStored('enc::v1::%%%%',host,agent),null);
   for (const value of ['one\r\ntwo','x'.repeat(4097),null,{},'  ']) assert.equal(validKey(value),'');
+});
+
+test('remembered login survives a new panel and expires after 24 hours',()=>{
+  const values={};const storage={getItem:key=>values[key]??null,setItem:(key,value)=>values[key]=value,removeItem:key=>delete values[key]};
+  const now=1000000;
+  assert.equal(rememberPanelKey(storage,base,host,agent,'remembered-fixture',now),true);
+  assert.equal(readRememberedPanelKey(storage,base,host,agent,now+23*3600000),'remembered-fixture');
+  assert.equal(values[panelSessionName(base)].includes('remembered-fixture'),false);
+  assert.equal(readRememberedPanelKey(storage,base,host,agent,now+panelSessionLifetime),'');
+  assert.equal(values[panelSessionName(base)],undefined);
+});
+
+test('remembered logins remain scoped and never delete CPA login entries',()=>{
+  const values={'cli-proxy-auth':state(base,'parent-key')};const storage={getItem:key=>values[key]??null,setItem:(key,value)=>values[key]=value,removeItem:key=>delete values[key]};
+  rememberPanelKey(storage,base,host,agent,'fixture',1000);
+  assert.equal(readRememberedPanelKey(storage,'https://cpa.example/b',host,agent,1001),'');
+  assert.equal(readRememberedPanelKey(storage,'http://cpa.example/a',host,agent,1001),'');
+  clearPanelSession(storage,base);assert.equal(readPanelKey(storage,base,host,agent),'parent-key');
+});
+
+test('malformed, future, wrong-browser and unsafe remembered entries fail closed',()=>{
+  const values={};const storage={getItem:key=>values[key]??null,setItem:(key,value)=>values[key]=value,removeItem:key=>delete values[key]};
+  for(const value of [{version:1,apiBase:base,managementKey:'x',expiresAt:1000+panelSessionLifetime+1},{version:1,apiBase:'https://other.example',managementKey:'x',expiresAt:2000},{version:1,apiBase:base,managementKey:'x\ny',expiresAt:2000}]) {
+    values[panelSessionName(base)]=JSON.stringify(value);assert.equal(readRememberedPanelKey(storage,base,host,agent,1000),'');
+  }
+  rememberPanelKey(storage,base,host,agent,'fixture',1000);
+  assert.equal(readRememberedPanelKey(storage,base,host,'different-browser',1001),'');
+  const unavailable={getItem(){throw new Error('blocked');},setItem(){throw new Error('blocked');}};
+  assert.equal(rememberPanelKey(unavailable,base,host,agent,'fixture',1000),false);
+  assert.equal(readRememberedPanelKey(unavailable,base,host,agent,1001),'');
 });
