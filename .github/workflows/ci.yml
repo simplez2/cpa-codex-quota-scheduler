@@ -29,6 +29,8 @@ jobs:
             library: codex-quota-scheduler.so
           - os: windows-latest
             library: codex-quota-scheduler.dll
+          - os: macos-latest
+            library: codex-quota-scheduler.dylib
     defaults:
       run:
         shell: bash
