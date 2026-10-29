@@ -2,7 +2,7 @@
 
 Standalone CPA plugin for balanced concurrent or serial Codex account selection, native quota polling,
 5h/weekly/monthly windows, persistent 429 quarantine and optional warmup.
-Source version: **0.3.30**. Published platform builds and checksums are available
+Source version: **0.3.31**. Published platform builds and checksums are available
 from [GitHub Releases](https://github.com/simplez2/cpa-codex-quota-scheduler/releases).
 See [CPA permissions and compatibility](CPA_PERMISSIONS.md) before installation.
 
@@ -286,16 +286,26 @@ credential or incompatible model allows failover and rebind the conversation to 
 pins remain isolated from ordinary conversation bindings. An already emitted
 stream cannot be transparently replayed by this selection change.
 
-Balanced mode first excludes hard-limited/quarantined accounts and prefers
-fresh usable accounts outside the weekly reserve. It then uses smooth weighted
-work accounting, with weight approximately
+All selectors first exclude hard-limited/quarantined accounts. With the default
+`window_order: [5h, weekly, monthly]`, new sessions and eligible handoffs consume
+usable 5h quota before weekly-only backup credentials. Within each pool,
+confirmed active windows with the earliest reset come first, followed by dormant
+placeholders and unknown reset times. Weekly budgets, plan weights and soft
+weekly reserves cannot invert that pool/deadline order. Explicit soft handoff
+thresholds and hard limits remain authoritative. Existing conversations retain
+their eligible credential; this is a placement priority, not stream migration.
+
+Balanced mode uses smooth weighted work accounting within an equal-priority
+group, with weight approximately
 `plan multiplier × 5h remaining fraction × 5h deadline factor × weekly factor`.
 The confirmed active 5h deadline factor is `300 / max(1, minutes until reset)`;
 dormant placeholders use 1. The weekly factor is the remaining fraction for
 `weekly_remaining`, or the minute budget normalized to a full-week rate for
 `sustainable`. Remaining fractions have a 0.01 scheduling floor; this changes
-relative share without reserving 5h capacity. The weekly reserve becomes spendable when the entire eligible
-pool is inside it. Account-specific pins remain respected.
+relative share without reserving 5h capacity. The weekly reserve is a preference
+within equal deadlines; it cannot spend weekly-only backups before usable 5h
+quota. Failed atomic admission tries the next priority group without bypassing
+reservations for the rejected group. Account-specific pins remain respected.
 
 Every pick immediately debits estimated work under one lock so concurrent
 requests cannot all choose a stale best score. Completion token costs correct
@@ -319,8 +329,8 @@ panel and retain the existing `serial_allocation_policy` configuration key:
 - `weekly_remaining`: weekly remaining fraction, without reset-time weighting.
 
 Balanced routing combines this weekly weight with plan capacity and the remaining
-5h fraction, distributing estimated work fairly across new sessions. For otherwise
-equal credentials, 40% weekly remaining with one day until reset versus 80% with
+5h fraction, distributing estimated work within the same quota pool and reset
+priority group. For equal confirmed 5h deadlines, 40% weekly remaining with one day until reset versus 80% with
 seven days until reset gives weights of 7:2 in sustainable mode and 1:2 in
 weekly-remaining mode. Live reservations and settling debt refine the ADQ weights.
 Credits commit only after a successful reservation; failed admission never
@@ -333,8 +343,9 @@ actual unavailability allows that session to hand off. Changing quota priorities
 or another session's primary does not migrate an existing binding. Requests
 without a session identifier retain the global serial primary.
 
-Default `serial_allocation_policy: sustainable` respects hard limits and quarantine, then
-ranks same-class peers by `(weekly remaining - weekly reserve) / minutes to reset`.
+Default `serial_allocation_policy: sustainable` respects hard limits and quarantine,
+quota pool and reset-deadline priority, then ranks equal-priority peers by
+`(weekly remaining - weekly reserve) / minutes to reset`.
 The exact time remaining is recomputed on each decision, so unchanged cached
 quota earns higher priority as its confirmed reset approaches. The denominator
 is bounded below by one minute; unused placeholders use a full week.
@@ -355,9 +366,8 @@ The quota endpoint exposes `serial_weekly_rebalance` and the committed reason
 Default `serial_5h_handoff_mode: 429_only` and `reserve_5h_percent: 0` use the
 observed 5h capacity without an early reserve handoff. Reaching 98% or 99% used
 alone keeps the current account; a confirmed hard limit, disallowed state or
-upstream 429 still triggers server-side handoff. Weekly policy ranks new sessions and eligible handoffs. Within the same weekly
-priority tier, serial routing prefers the earliest confirmed active 5h reset;
-balanced routing raises its allocation weight by the remaining 5h horizon.
+upstream 429 still triggers server-side handoff. All selectors prefer usable 5h
+quota and earlier confirmed resets before comparing weekly allocation weights.
 Unused moving reset placeholders do not earn deadline priority.
 In this mode, 5h availability uses observed remaining capacity times the plan prior;
 it deducts neither a configured static reserve nor forecast/cache-age estimates.
@@ -377,6 +387,20 @@ generation, optional idle warmup is placed into persistent 15-minute phase slots
 across the 300-minute window, preserving one immediately activatable credential
 when every confirmed window has ended. Foreground requests always bypass that
 local warmup delay.
+
+The account table exposes the actual placement priority and sorts quota groups
+by the same pool/deadline rules. `selection_priority.rank` describes a group,
+not a promise that a busy, pinned, or already-bound request will use that account.
+`rate_limit_reset_credits_available_count` from native quota responses is shown
+as official available reset credits, with separate known/fresh flags and an
+observation timestamp. Missing counts are unknown, not zero. The local
+`observed_reset_count` is `cycle_generation - 1`: observed 5h transitions in the
+current weekly epoch, excluding missed cycles and the first observation. It is
+not official remaining reset credits and never raises selection priority.
+Reset credits are not consumed automatically. A complete, fresh response with
+explicitly absent 5h windows identifies weekly-only backup quota; missing or
+stale evidence remains unconfirmed. Announced provider-wide resets cannot be
+predicted from a local clock; fresh native observations confirm their effect.
 
 A delayed successful activation with a fresh dormant quota observation can
 identify `FIRST_USE_AFTER_RESET` or `FIXED_PROVIDER_WINDOW`; until then capability
@@ -405,11 +429,11 @@ Polling adds no model requests. An entire refresh, including inventory, has a
 1–30s budget bounded by `refresh_interval`; each upstream call has at most 10s.
 Timeouts retain cache/backoff and stop further dispatch until another tick.
 
-Automatic preemptions move subsequent session requests to the replacement;
-already-running streams finish on their original account. Manual selection
-disables proactive weekly balancing and 5h cycle rotation. Hard limits still
-force failover immediately. A cycle reset cannot rotate a healthy 80% weekly
-account onto a lower-budget peer just to alternate IDs.
+Automatic preemptions update the primary for unkeyed requests and newly placed
+sessions. Existing eligible conversations and already-running streams retain
+their credential. Manual selection disables proactive balancing and reset-based
+rotation. Hard limits still force failover immediately. A local generation count
+cannot manufacture a deadline or quota refill.
 
 Percentages balance reported capacity for comparable accounts. They do not
 predict demand or establish equal absolute capacity across different plans.

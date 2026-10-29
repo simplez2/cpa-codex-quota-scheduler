@@ -54,6 +54,7 @@ type serialCandidate struct {
 	CapacityHeadroom    float64
 	LastSelectedAt      time.Time
 	ResetCredits        int
+	Priority            quotaSelectionPriority
 }
 
 // serialWindowDrains reports whether the window is close enough to its reset
@@ -163,16 +164,25 @@ func inspectSerialCandidate(candidate pluginapi.SchedulerAuthCandidate, snapshot
 			}
 		}
 		if !choice.Eligible {
+			choice.Priority = quotaPriorityFor(choice, cfg, now)
 			return choice
 		}
 	}
 	if !found || !quotaSchedulingUsable(snapshot, now, cfg) {
+		choice.Priority = quotaPriorityFor(choice, cfg, now)
 		return choice
 	}
 
 	choice.QuotaKnown = true
 	choice.Reason = "eligible"
-	choice.WindowClass = serialWindowClass(snapshot, cfg.WindowOrder)
+	activeSnapshot := snapshot
+	activeSnapshot.Windows = nil
+	for _, window := range snapshot.Windows {
+		if window.ResetAt.IsZero() || now.Before(window.ResetAt) {
+			activeSnapshot.Windows = append(activeSnapshot.Windows, window)
+		}
+	}
+	choice.WindowClass = serialWindowClass(activeSnapshot, cfg.WindowOrder)
 	choice.ResetCredits = snapshot.ResetCredits
 	for _, window := range snapshot.Windows {
 		if !window.ResetAt.IsZero() && !now.Before(window.ResetAt) {
@@ -242,6 +252,7 @@ func inspectSerialCandidate(candidate pluginapi.SchedulerAuthCandidate, snapshot
 	}
 	choice.Reason = reason
 	choice.Eligible = reason == "eligible"
+	choice.Priority = quotaPriorityFor(choice, cfg, now)
 	return choice
 }
 
@@ -296,9 +307,11 @@ func serialWeeklyBalanceTier(choice serialCandidate, ctx serialSortContext) int 
 }
 
 func serialCandidateLess(a, b serialCandidate, cfg pluginConfig, ctx serialSortContext) bool {
-	// Weekly reserve is a hard pool partition. Reset credits, priority, drain,
-	// or a fresh 5h window cannot spend a protected weekly account while an
-	// unprotected choice exists.
+	if priority := compareQuotaPriority(a.Priority, b.Priority); priority != 0 {
+		return priority < 0
+	}
+	// Weekly allocation and reserve preferences apply after quota pool and
+	// confirmed reset deadline. Hard weekly limits were already excluded.
 	if a.WeeklyProtected != b.WeeklyProtected {
 		return !a.WeeklyProtected
 	}
@@ -344,8 +357,8 @@ func serialCandidateLess(a, b serialCandidate, cfg pluginConfig, ctx serialSortC
 	if a.DrainActive != b.DrainActive {
 		return a.DrainActive
 	}
-	if cfg.PreferResetCredits && (a.ResetCredits > 0) != (b.ResetCredits > 0) {
-		return a.ResetCredits > 0
+	if cfg.PreferResetCredits && a.ResetCredits != b.ResetCredits {
+		return a.ResetCredits > b.ResetCredits
 	}
 	if a.WeeklyKnown && b.WeeklyKnown && a.WeeklyRemaining != b.WeeklyRemaining {
 		return a.WeeklyRemaining > b.WeeklyRemaining
@@ -413,6 +426,7 @@ func (s *schedulerRuntimeState) annotateSerialCandidateLocked(choice *serialCand
 			}
 		}
 	}
+	choice.Priority = quotaPriorityFor(*choice, s.cfg, now)
 }
 
 func (s *schedulerRuntimeState) markSerialSelectedLocked(authID string, resetAt, now time.Time) {
@@ -764,10 +778,9 @@ func (s *schedulerRuntimeState) serialPoolPickLocked(req pluginapi.SchedulerPick
 			windowRankInOrder(choices[0].WindowClass, cfg.WindowOrder) <= currentRank &&
 			(!choices[0].WeeklyProtected || currentChoice.WeeklyProtected) &&
 			serialCyclePreservesWeekly(currentChoice, choices[0], cfg)
-		preempt := currentChoice.QuotaKnown && len(choices) > 0 && choices[0].QuotaKnown &&
-			(!choices[0].WeeklyProtected || currentChoice.WeeklyProtected) &&
-			((windowRankInOrder(choices[0].WindowClass, cfg.WindowOrder) < currentRank) ||
-				(currentChoice.WeeklyProtected && !choices[0].WeeklyProtected) || cycleRotationEligible)
+		preempt := normalizeSerialSelectionSource(s.serialSelectionSource) != "manual" &&
+			currentChoice.QuotaKnown && len(choices) > 0 && choices[0].QuotaKnown &&
+			(compareQuotaPriority(choices[0].Priority, currentChoice.Priority) < 0 || cycleRotationEligible)
 		if cycleObservedAdvanced {
 			s.serialWeeklyRebalance = serialWeeklyRebalanceState{}
 		}
@@ -805,6 +818,9 @@ func (s *schedulerRuntimeState) serialPoolPickLocked(req pluginapi.SchedulerPick
 			}
 			if newSessionPriority {
 				reason = "new_session_priority"
+			} else if preempt && currentChoice.WindowClass == "5h" && selectedChoice.WindowClass == "5h" &&
+				compareQuotaPriority(selectedChoice.Priority, currentChoice.Priority) < 0 {
+				reason = "five_hour_reset_priority"
 			}
 			s.serialLastSwitchReason = reason
 			return pluginapi.SchedulerPickResponse{AuthID: selected, Handled: true}

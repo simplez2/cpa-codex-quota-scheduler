@@ -12,11 +12,14 @@ func TestSerialLiveSessionOutranksChangingGlobalBudget(t *testing.T) {
 	now := time.Now()
 	s := newSerialTestState(now)
 	s.cfg.StickySeconds = 21600
+	q := s.quotas["backup"]
+	q.Windows[0].ResetAt = s.quotas["primary"].Windows[0].ResetAt
+	s.quotas["backup"] = q
 	first := withBalancedSession(serialTestRequest(), "cached-session")
 	if got := s.serialPick(first, now); got.AuthID != "primary" {
 		t.Fatalf("initial=%+v", got)
 	}
-	q := s.quotas["backup"]
+	q = s.quotas["backup"]
 	q.Windows[0].UsedPercent = 0
 	s.quotas["backup"] = q
 	second := withBalancedSession(serialTestRequest(), "new-session")
@@ -95,7 +98,7 @@ func TestBalancedConfiguredThresholdEndsStickyWithoutHardLimit(t *testing.T) {
 	}
 }
 
-func TestFiveHourDeadlinePriorityDoesNotOverrideWeeklyTier(t *testing.T) {
+func TestFiveHourDeadlinePriorityPrecedesWeeklyTierButNotHardLimits(t *testing.T) {
 	now := time.Now()
 	s, req := balancedFixture(now)
 	for _, policy := range []string{"sustainable", "weekly_remaining"} {
@@ -128,8 +131,14 @@ func TestFiveHourDeadlinePriorityDoesNotOverrideWeeklyTier(t *testing.T) {
 		choices = append(choices, choice)
 	}
 	sortSerialCandidates(choices, s.cfg)
-	if choices[0].Candidate.ID != "a" {
-		t.Fatal("5h expiry overrode material weekly imbalance")
+	if choices[0].Candidate.ID != "b" {
+		t.Fatal("weekly imbalance overrode expiring 5h quota")
+	}
+	b := s.quotas["b"]
+	b.Windows[1].UsedPercent = 100
+	s.quotas["b"] = b
+	if got := s.balancedPick(req, now); got.AuthID != "a" {
+		t.Fatalf("5h priority bypassed hard weekly exhaustion: %+v", got)
 	}
 }
 

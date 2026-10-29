@@ -1,4 +1,4 @@
-# Standalone CPA quota scheduler v0.3.30.
+# Standalone CPA quota scheduler v0.3.31.
 plugins:
   enabled: true
   configs:
@@ -17,7 +17,8 @@ plugins:
       continuity_pacing: true
       continuity_max_wait: 6h
       continuity_poll_interval: 30s
-      # Set balanced for concurrent, quota-weighted distribution across accounts.
+      # New sessions use usable 5h quota before weekly-only backups, earlier resets first.
+      # Set balanced for weighted distribution within the same pool/deadline group.
       # This can also be selected in the Codex 额度调度 panel without editing YAML.
       serial_allocation_policy: sustainable
       # Relative improvement in weekly budget per day; two fresh observations and hold still apply.

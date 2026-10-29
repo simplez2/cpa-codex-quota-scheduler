@@ -51,6 +51,7 @@ type accountPacingState struct {
 }
 
 type pacingCandidate struct {
+	Priority          quotaSelectionPriority
 	Candidate         pluginapi.SchedulerAuthCandidate
 	Snapshot          quotaSnapshot
 	Bottleneck        quotaWindow
@@ -623,6 +624,11 @@ func (s *schedulerRuntimeState) pacingPick(req pluginapi.SchedulerPickRequest, n
 			score += 0.5
 		}
 		choices = append(choices, pacingCandidate{
+			Priority: func() quotaSelectionPriority {
+				choice := inspectSerialCandidate(candidate, snapshot, true, s.cfg, now)
+				choice.Eligible = true // Pacing feasibility above owns its reserve.
+				return quotaPriorityFor(choice, s.cfg, now)
+			}(),
 			Candidate:         candidate,
 			Snapshot:          snapshot,
 			Bottleneck:        evaluation.Bottleneck,
@@ -641,6 +647,9 @@ func (s *schedulerRuntimeState) pacingPick(req pluginapi.SchedulerPickRequest, n
 		return pluginapi.SchedulerPickResponse{Handled: false}, choices
 	}
 	sort.SliceStable(choices, func(i, j int) bool {
+		if priority := compareQuotaPriority(choices[i].Priority, choices[j].Priority); priority != 0 {
+			return priority < 0
+		}
 		if choices[i].ScorePercent != choices[j].ScorePercent {
 			return choices[i].ScorePercent > choices[j].ScorePercent
 		}

@@ -110,6 +110,8 @@ func parseNativeQuota(raw []byte, authID, index string, observedAt time.Time) (q
 	}
 	if response.ResetCredits != nil && *response.ResetCredits >= 0 {
 		out.ResetCredits = *response.ResetCredits
+		out.ResetCreditsKnown = true
+		out.ResetCreditsObservedAt = observedAt
 	}
 	// Additional limits can be feature/model scoped. Do not treat those as
 	// account-wide limits until CPA supplies a matching scope in scheduling.

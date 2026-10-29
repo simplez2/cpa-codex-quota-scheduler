@@ -15,7 +15,7 @@ export function continuitySummary(status) {
   return action+(reason?' · '+reason:'');
 }
 export const fields = [
-  ['scheduler_mode','调度模式','allocation','select','已有会话优先保留原凭据，续聊、工具调用与并发请求保持绑定；达到设定阈值或凭据不可用时才换号。新会话按周额度策略和5h重置时间重新选择。串行选优先凭据，均衡并发按权重分配新会话。', [['balanced','均衡并发（会话粘性）'],['serial','串行调配'],['legacy','传统调度'],['shadow','观察对比'],['enforce','动态节奏控制']]],
+  ['scheduler_mode','调度模式','allocation','select','新会话先用有5h额度的凭据，已启动且越早重置越优先；仅周限凭据作为后备。同一优先组内，串行选优先凭据，均衡并发按权重分配。已有会话保持绑定，达到设定阈值或凭据不可用时才换号。观察对比仅记录另一种算法的选择，实际仍走传统调度。', [['balanced','均衡并发（会话粘性）'],['serial','串行调配'],['legacy','传统调度'],['shadow','观察对比'],['enforce','动态节奏控制']]],
   ['account_concurrency_enabled','限制每凭据并发','allocation','boolean','默认开启。真实请求、重试和预热共用每个 CPA 凭据的槽位；长请求保留槽位直到 CPA 确认结束。保存后立即生效。'],
   ['account_max_concurrency','每凭据最大并发','allocation','number','1 至 64，默认 2。不同 CPA 凭据独立计数，即使属于同一个账号；调低上限不会中断已开始的请求。',1,64,1],
   ['account_concurrency_wait','并发满时最长等待','allocation','duration','0 至 30 秒，默认 10 秒。两种模式的已绑定会话均等待原凭据；新会话可使用符合额度条件的空闲凭据。超时返回 503；不会突破上限。'],
@@ -23,7 +23,7 @@ export const fields = [
   ['continuity_pacing','5h 额度将尽时提前放缓','allocation','boolean','按已确认的 5h 余量与消耗速度推算，在用尽前分散请求。仅周限账号可用时继续执行。未知额度不会视为无限，手动排除统计不会解除账号限制。'],
   ['continuity_max_wait','额度恢复最长等待','allocation','duration','1 秒至 24 小时，默认 6 小时，包含放缓等待。客户端、反向代理的连接与总时长限制也必须允许该等待。'],
   ['continuity_poll_interval','等待期间重新检查间隔','allocation','duration','1 秒至 5 分钟，默认 30 秒。重新检查缓存与当前候选；额度查询仍遵守已有刷新、失败退避和 Retry-After。'],
-  ['serial_allocation_policy','周额度分配方式','allocation','select','串行和均衡并发均生效。日均预算按各凭据周余量 ÷ 距重置分钟数 × 1440 计算，显示单位为 % / 天；调度保持分钟精度，不足一分钟按一分钟计算；剩余比例只按周余量分配。动态排名只影响新会话或达到切换条件的会话；串行和均衡的已有会话保持绑定优先。5h 在同一周优先级内优先临近重置。', [['sustainable','按距重置时间的日均预算'],['weekly_remaining','按周剩余比例']]],
+  ['serial_allocation_policy','周额度分配方式','allocation','select','串行和均衡并发均生效，但只在相同额度池及重置优先组内分配，不能让仅周限凭据抢占可用5h额度。日均预算按各凭据周余量 ÷ 距重置分钟数 × 1440 计算，显示单位为 % / 天；调度保持分钟精度，不足一分钟按一分钟计算；剩余比例只按周余量分配。已有会话保持绑定，排名变化只影响新会话或达到切换条件的会话。', [['sustainable','按距重置时间的日均预算'],['weekly_remaining','按周剩余比例']]],
   ['quota_default_plan','无法识别时的默认套餐','allocation','select','优先自动识别 CPA 返回的套餐；只有标签缺失、未知或缓存过期时使用此默认值。倍率是容量参考。',plans],
   ['serial_budget_rebalance_percent','无会话请求的预算再平衡阈值','allocation','number','仅影响未携带会话标识的串行请求；已有会话不会因为预算排名变化而换号。0 关闭主动再平衡，其他值仍需两次独立额度确认。',0,100,1],
   ['serial_weekly_rebalance_min_hold','无会话请求再平衡前至少持有','allocation','duration','1 分钟至 24 小时。额度耗尽或 429 不受此等待限制。'],
@@ -62,7 +62,7 @@ export const fields = [
   ['serial_weekly_rebalance_percent','按周剩余比例换号的优势','expert','number','百分点；仅按周剩余比例的分配方式使用。0 关闭。',0,100,1],
   ['drain_window_hours','临近重置的消耗窗口','expert','number','小时；更倾向在重置前使用剩余额度。',.1,168,.1],
   ['switch_hysteresis_percent','切换比较的余量带宽','expert','number','百分点；避免余量相近时频繁切换。',0,100,.1],
-  ['prefer_reset_credits','同类候选优先有重置次数的账号','expert','boolean','仅在其他额度条件允许时比较。'],
+  ['prefer_reset_credits','同组优先有官方重置次数的凭据','expert','boolean','官方可用重置次数作为同组候选的辅助排序，不会压过5h和临近重置优先级；本地周期计数不参与此比较，也不会自动消耗重置卡。'],
   ['window_order','额度窗口比较顺序','expert','select','同类额度窗口的优先顺序。', [['5h,weekly,monthly','5h → 周 → 月'],['5h,monthly,weekly','5h → 月 → 周'],['weekly,5h,monthly','周 → 5h → 月'],['weekly,monthly,5h','周 → 月 → 5h'],['monthly,5h,weekly','月 → 5h → 周'],['monthly,weekly,5h','月 → 周 → 5h']]],
   ['reserve_monthly_percent','月额度保留比例','expert','number','存在月额度窗口时使用。',0,99.9,.1],
   ['soft_limit_percent','动态调度软阈值','expert','number','已用百分比；主要用于非串行模式。',.1,100,.1],
