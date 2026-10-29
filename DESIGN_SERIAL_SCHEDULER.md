@@ -2,7 +2,7 @@
 
 ## Goal
 
-Keep one globally committed Codex credential for new normal requests; already-running work may finish on the prior credential. Preserve weekly capacity until reset, use available 5h quota without a default reserve, and bound switch/query overhead. The default allocation policy is `sustainable`; default 5h handoff is `429_only`. `weekly_remaining` retains the previous raw-percentage algorithm. See `research/ALLOCATION_RESEARCH.zh-CN.md` for official plan estimates, assumptions and historical reserve-policy simulations.
+Keep a committed primary for unkeyed requests and independent bindings for identified conversations. Spend usable 5h quota before weekly-only backups, and earlier confirmed reset deadlines before later ones. Weekly allocation weights apply within equal-priority groups. Preserve eligible conversations and in-flight streams, and bound switch/query overhead. The default allocation policy is `sustainable`; default 5h handoff is `429_only`. `weekly_remaining` retains raw-percentage tie-breaking within the same priority group.
 
 ## Persisted state
 
@@ -22,8 +22,8 @@ The state contains operational auth identifiers and hashed session identifiers, 
 For a pure Codex candidate set:
 
 1. Read the committed primary and any existing hashed-session binding.
-2. Existing sessions follow the primary by default. Only explicit `serial_soft_continuation=true` permits continuation on a soft-threshold previous auth, provided it is still present, not hard-limited and not quarantined.
-3. A new session is bound only after the current primary is confirmed eligible; it cannot acquire a new binding to an already exhausted auth.
+2. Existing sessions retain their eligible binding independently of the primary. Explicit `serial_soft_continuation=true` additionally permits continuation across a soft threshold, never a hard limit or quarantine.
+3. A new session ranks eligible candidates by pool and confirmed reset deadline, followed by within-group weekly allocation. It cannot acquire a new binding to an already exhausted auth.
 4. Keep an eligible primary unless a defined preemption boundary is reached.
 5. On a required switch, rank eligible candidates deterministically and commit exactly one replacement.
 6. If the primary is hard-limited and every backup has crossed only the soft threshold, select the best soft-threshold backup.
@@ -51,18 +51,18 @@ Explicit `reserve_aware` with a positive reserve (15% reproduces the previous se
 
 Candidate ordering is a strict, deterministic total ordering:
 
-1. unprotected weekly capacity before accounts at or below `reserve_weekly_percent`;
-2. configured `window_order`;
-3. known weekly capacity, then sustainable weekly budget per day in pool-relative 5% bands, grouped independently by window class and weekly protection;
+1. known eligible candidates before quota-unknown or soft-threshold fallbacks;
+2. configured `window_order` (default 5h before weekly/monthly), then earlier confirmed active resets before dormant placeholders or unknown reset times;
+3. within that pool/deadline group, unprotected weekly capacity, known weekly capacity, then sustainable weekly budget per day in pool-relative 5% bands;
 4. observed 5h remaining quota times the configured plan prior within that budget band under default `429_only`; optional reserve policies instead use their configured headroom, followed by raw-weekly/5h tie-breakers;
 5. drain state and reset-credit availability when enabled;
 6. remaining weekly capacity, active-cycle preference, and lower maximum use as tie-breakers;
 7. the longest-idle `serial_last_selected` timestamp;
 8. CPA priority and stable auth ID.
 
-Tiers are computed before sorting, not with non-transitive pairwise bands. The legacy `weekly_remaining` mode uses raw weekly tiers from `switch_hysteresis_percent` (default 2 percentage points), followed by lower 5h use, without deadline or plan weighting.
+Tiers are computed before sorting, not with non-transitive pairwise bands. `weekly_remaining` uses raw weekly tiers from `switch_hysteresis_percent` (default 2 percentage points) only after the shared pool/deadline priority.
 
-The same ordering applies to cold starts and replacements. With equal deadlines, 80% weekly beats 40%. With different deadlines, `(remaining-reserve)/days-until-reset` prioritizes spendable daily budget. The time denominator has a six-hour floor; zero-use placeholders and missing reset times use a whole week. Plan multipliers never multiply the weekly score, which would prematurely exhaust large accounts. Any fresh hard-exhausted window excludes an account before ranking, including stricter native evidence obscured by late completion headers.
+The same ordering applies to cold starts and replacements. Earlier confirmed 5h resets outrank a larger weekly budget. With equal deadlines, weekly budget and then 5h capacity break ties. The budget denominator has a one-minute floor; zero-use placeholders and missing reset times use a whole week. Plan multipliers never multiply the weekly percentage score. Any fresh hard-exhausted window excludes an account before ranking, including stricter native evidence obscured by late completion headers.
 
 ## Committed switch triggers
 

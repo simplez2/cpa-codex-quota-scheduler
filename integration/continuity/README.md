@@ -26,6 +26,14 @@ python integration\continuity\acceptance.py `
 ```
 
 The script writes binary and harness SHA-256 values with per-case results.
+
+`priority.py` adds four native routing cases (serial/balanced × expiry/weekly
+fallback). Three synthetic credentials have unequal 5h deadlines and weekly
+budgets. The earlier 5h reset must win even though a later 5h credential and a
+weekly-only backup have larger weekly budgets. When both 5h windows are hard
+exhausted, the original request must complete through the weekly-only backup.
+The same native status response must distinguish official available reset counts
+of 2, 0, and unknown. Run with the same `--cpa`, `--plugin` and `--output` options.
 `--case` selects one case, and `--keep` retains the otherwise temporary CPA
 configuration and logs for investigation. A skipped or failed case gives a
 nonzero exit status. The seven cases are:

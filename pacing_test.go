@@ -126,13 +126,19 @@ func TestShadowAuditsDynamicChoiceWithoutTakingOver(t *testing.T) {
 			"five": {
 				AuthID:      "five",
 				RefreshedAt: now,
-				Windows:     []quotaWindow{{Class: "5h", WindowSeconds: int64((5 * time.Hour).Seconds()), UsedPercent: 80, Allowed: true, ResetAt: now.Add(150 * time.Minute)}},
+				Windows:     []quotaWindow{{Class: "weekly", WindowSeconds: int64((7 * 24 * time.Hour).Seconds()), UsedPercent: 10, Allowed: true, ResetAt: now.Add(84 * time.Hour)}},
 			},
 			"weekly": {
 				AuthID:      "weekly",
 				RefreshedAt: now,
-				Windows:     []quotaWindow{{Class: "weekly", WindowSeconds: int64((7 * 24 * time.Hour).Seconds()), UsedPercent: 10, Allowed: true, ResetAt: now.Add(84 * time.Hour)}},
+				Windows:     []quotaWindow{{Class: "weekly", WindowSeconds: int64((7 * 24 * time.Hour).Seconds()), UsedPercent: 20, Allowed: true, ResetAt: now.Add(84 * time.Hour)}},
 			},
+		},
+		// Both candidates share the same pool/deadline. Dynamic cost feedback
+		// can disagree within that group, never by spending a weekly backup first.
+		pacingAccounts: map[string]*accountPacingState{
+			"five":   {Capacities: map[string]capacityEstimate{"weekly": {Credits: 1000}}, LastQuota: map[string]quotaCalibrationPoint{}},
+			"weekly": {Capacities: map[string]capacityEstimate{"weekly": {Credits: 1000}}, LastQuota: map[string]quotaCalibrationPoint{}, DeficitCredits: 250},
 		},
 	}
 	banStore = banState{bans: make(map[string]banEntry)}

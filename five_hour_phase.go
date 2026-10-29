@@ -34,6 +34,7 @@ type fiveHourPhaseState struct {
 
 type runtimeFiveHourPhaseStatus struct {
 	Cycle           uint64    `json:"cycle_generation"`
+	ObservedResets  uint64    `json:"observed_reset_count"`
 	AnchorMode      string    `json:"anchor_mode"`
 	State           string    `json:"state"`
 	ActivateAt      time.Time `json:"activate_not_before,omitempty"`
@@ -290,6 +291,9 @@ func (s *schedulerRuntimeState) planFiveHourWarmups(candidates []warmupCandidate
 
 func fiveHourPhaseStatus(state fiveHourPhaseState, now time.Time) runtimeFiveHourPhaseStatus {
 	status := runtimeFiveHourPhaseStatus{Cycle: state.Cycle, AnchorMode: state.AnchorMode, OfficialResetAt: state.ActiveResetAt, Bucket: phaseBucket(state.ActiveResetAt), State: "observing"}
+	if state.Cycle > 0 {
+		status.ObservedResets = state.Cycle - 1
+	}
 	if status.AnchorMode == "" {
 		status.AnchorMode = fiveHourPhaseUnknown
 	}

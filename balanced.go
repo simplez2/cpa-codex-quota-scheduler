@@ -157,7 +157,6 @@ func (s *schedulerRuntimeState) balancedPick(req pluginapi.SchedulerPickRequest,
 	}
 	var sticky *serialCandidate
 	choices := []serialCandidate{}
-	bestTier := 10
 	seen := map[string]bool{}
 	for _, candidate := range req.Candidates {
 		candidate.ID = strings.TrimSpace(candidate.ID)
@@ -179,44 +178,15 @@ func (s *schedulerRuntimeState) balancedPick(req pluginapi.SchedulerPickRequest,
 			copy := choice
 			sticky = &copy
 		}
-		tier := 0
-		if choice.WeeklyProtected {
-			tier = 1
-		}
-		if !choice.QuotaKnown {
-			tier = 2
-		}
-		if !choice.Eligible {
-			tier = 3
-		}
-		if tier < bestTier {
-			choices = nil
-			bestTier = tier
-		}
-		if tier == bestTier {
-			choices = append(choices, choice)
-		}
+		choices = append(choices, choice)
 	}
 	if len(choices) == 0 {
 		return pluginapi.SchedulerPickResponse{}
-	}
-	if sticky != nil {
-		present := false
-		for _, choice := range choices {
-			if choice.Candidate.ID == sticky.Candidate.ID {
-				present = true
-				break
-			}
-		}
-		if !present {
-			choices = append(choices, *sticky)
-		}
 	}
 	// Sorting makes simultaneous equal-share starts independent of host order.
 	sort.Slice(choices, func(i, j int) bool { return choices[i].Candidate.ID < choices[j].Candidate.ID })
 	cost := math.Max(.001, s.predictCostLocked(req, false))
 	limit := cost * math.Max(8, float64(len(choices))*2)
-	total := 0.0
 	for _, choice := range choices {
 		id := choice.Candidate.ID
 		account := s.balancedAccounts[id]
@@ -229,47 +199,61 @@ func (s *schedulerRuntimeState) balancedPick(req pluginapi.SchedulerPickRequest,
 		}
 		account.LastSeen = now
 		account.Weight = balancedWeight(choice, s.cfg, now)
-		total += account.Weight
 		account.prune(now)
 	}
 	selected := ""
 	reservation := adqReservation{}
-	adqSelected, adqReservation, adqOK, adqHandled := s.adqRouteChoicesWithAllocationLocked(req, choices, cost, now, session, func() string {
-		if sticky == nil {
-			return ""
-		}
-		return sticky.Candidate.ID
-	}(), true)
-	if adqOK {
-		// ADQ commits the policy's fair-share round only after reservation;
-		// the fallback cannot overwrite this decision or double-credit it.
-		selected = adqSelected
-		reservation = adqReservation
-		if sticky != nil && selected == sticky.Candidate.ID {
-			s.balancedSessionHits++
-		}
-	} else if adqHandled {
-		// Complete telemetry with a hard gate/collision is an admission failure,
-		// not permission to bypass reservations through the legacy fallback.
-		return pluginapi.SchedulerPickResponse{}
-	} else {
-		bestScore := math.Inf(-1)
-		for _, choice := range choices {
-			id := choice.Candidate.ID
-			account := s.balancedAccounts[id]
-			account.Credit = math.Max(-limit, math.Min(limit, account.Credit+cost*account.Weight/total))
-			// Capped credits can tie after many cheap sticky continuations. Prefer
-			// the least recently selected account instead of permanently favoring
-			// the lexicographically first credential at that ceiling.
-			if account.Credit > bestScore || (account.Credit == bestScore && selected != "" && account.LastPicked.Before(s.balancedAccounts[selected].LastPicked)) {
-				selected = id
-				bestScore = account.Credit
+	remaining := choices
+	for len(remaining) > 0 {
+		group, rest := nextQuotaPriorityGroup(remaining, s.cfg, now)
+		if sticky != nil {
+			if _, present := serialChoiceByID(group, sticky.Candidate.ID); !present {
+				group = append(group, *sticky)
 			}
 		}
-		if sticky != nil {
-			selected = sticky.Candidate.ID
-			s.balancedSessionHits++
+		adqSelected, reserved, adqOK, adqHandled := s.adqRouteChoicesWithAllocationLocked(req, group, cost, now, session, func() string {
+			if sticky == nil {
+				return ""
+			}
+			return sticky.Candidate.ID
+		}(), true)
+		if adqOK {
+			// ADQ commits the policy's fair-share round only after reservation;
+			// the fallback cannot overwrite this decision or double-credit it.
+			selected = adqSelected
+			reservation = reserved
+			if sticky != nil && selected == sticky.Candidate.ID {
+				s.balancedSessionHits++
+			}
+		} else if adqHandled {
+			// Complete telemetry with a hard gate/collision is an admission failure,
+			// not permission to bypass reservations through the legacy fallback.
+			remaining, sticky = rest, nil
+			continue
+		} else {
+			total := 0.0
+			for _, choice := range group {
+				total += s.balancedAccounts[choice.Candidate.ID].Weight
+			}
+			bestScore := math.Inf(-1)
+			for _, choice := range group {
+				id := choice.Candidate.ID
+				account := s.balancedAccounts[id]
+				account.Credit = math.Max(-limit, math.Min(limit, account.Credit+cost*account.Weight/total))
+				// Capped credits can tie after many cheap sticky continuations. Prefer
+				// the least recently selected account instead of permanently favoring
+				// the lexicographically first credential at that ceiling.
+				if account.Credit > bestScore || (account.Credit == bestScore && selected != "" && account.LastPicked.Before(s.balancedAccounts[selected].LastPicked)) {
+					selected = id
+					bestScore = account.Credit
+				}
+			}
+			if sticky != nil {
+				selected = sticky.Candidate.ID
+				s.balancedSessionHits++
+			}
 		}
+		break
 	}
 	if selected == "" {
 		return pluginapi.SchedulerPickResponse{}

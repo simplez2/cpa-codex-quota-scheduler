@@ -62,6 +62,8 @@ type quotaSnapshot struct {
 	Plan                    quotaPlanObservation
 	Windows                 []quotaWindow
 	ResetCredits            int
+	ResetCreditsKnown       bool
+	ResetCreditsObservedAt  time.Time
 	RefreshedAt             time.Time
 	HeaderObservedAt        time.Time
 }
@@ -405,6 +407,12 @@ func (s *schedulerRuntimeState) recordRefreshError(err error) {
 }
 
 func mergePartialQuotaSnapshot(previous, current quotaSnapshot, now time.Time, staleAfter time.Duration) quotaSnapshot {
+	if previous.AuthID == current.AuthID && previous.AuthIndex == current.AuthIndex &&
+		previous.ResetCreditsObservedAt.After(current.RefreshedAt) && !previous.ResetCreditsObservedAt.After(now) {
+		current.ResetCredits = previous.ResetCredits
+		current.ResetCreditsKnown = previous.ResetCreditsKnown
+		current.ResetCreditsObservedAt = previous.ResetCreditsObservedAt
+	}
 	if previous.FiveHourLimitObservedAt.After(current.FiveHourLimitObservedAt) {
 		current.FiveHourLimitStatus = previous.FiveHourLimitStatus
 		current.FiveHourLimitObservedAt = previous.FiveHourLimitObservedAt
@@ -415,7 +423,6 @@ func mergePartialQuotaSnapshot(previous, current quotaSnapshot, now time.Time, s
 	current.Windows = normalizeQuotaWindowSet(current.Windows, current.RefreshedAt, now, staleAfter)
 	if previous.RefreshedAt.After(current.RefreshedAt) && !now.Before(previous.RefreshedAt) {
 		current.RefreshedAt = previous.RefreshedAt
-		current.ResetCredits = previous.ResetCredits
 	}
 	if previous.HeaderObservedAt.After(current.HeaderObservedAt) {
 		current.HeaderObservedAt = previous.HeaderObservedAt
@@ -763,6 +770,7 @@ type schedulerChoice struct {
 	rank      int
 	near      bool
 	unknown   bool
+	priority  quotaSelectionPriority
 }
 
 func codexOnlySchedulerRequest(req pluginapi.SchedulerPickRequest) bool {
@@ -960,6 +968,9 @@ func schedulerCandidatesWithout(candidates []pluginapi.SchedulerAuthCandidate, a
 }
 
 func (s *schedulerRuntimeState) legacySchedulerPick(req pluginapi.SchedulerPickRequest, now time.Time) (pluginapi.SchedulerPickResponse, error) {
+	s.mu.RLock()
+	cfg := s.cfg
+	s.mu.RUnlock()
 	if len(req.Candidates) == 0 {
 		return pluginapi.SchedulerPickResponse{Handled: false}, nil
 	}
@@ -970,7 +981,7 @@ func (s *schedulerRuntimeState) legacySchedulerPick(req pluginapi.SchedulerPickR
 			continue
 		}
 		snapshot, found := s.lookupQuota(candidate.ID)
-		if !found || !s.snapshotFresh(snapshot, now) {
+		if !found || !quotaSchedulingUsable(snapshot, now, cfg) {
 			unknown = append(unknown, candidate)
 			continue
 		}
@@ -984,12 +995,15 @@ func (s *schedulerRuntimeState) legacySchedulerPick(req pluginapi.SchedulerPickR
 			continue
 		}
 		window := evaluation.Bottleneck
+		priorityChoice := inspectSerialCandidate(candidate, snapshot, true, cfg, now)
+		priorityChoice.Eligible = true // Legacy retains its own soft-limit policy.
 		known = append(known, schedulerChoice{
 			candidate: candidate,
 			snapshot:  snapshot,
 			window:    window,
 			rank:      s.windowRank(window.Class),
 			near:      window.UsedPercent >= s.softLimit(),
+			priority:  quotaPriorityFor(priorityChoice, cfg, now),
 		})
 	}
 	if len(known) == 0 {
@@ -1142,6 +1156,9 @@ func (s *schedulerRuntimeState) bestWindow(snapshot quotaSnapshot, now time.Time
 }
 
 func (s *schedulerRuntimeState) choiceLess(a, b schedulerChoice) bool {
+	if priority := compareQuotaPriority(a.priority, b.priority); priority != 0 {
+		return priority < 0
+	}
 	if a.rank != b.rank {
 		return a.rank < b.rank
 	}
@@ -1177,7 +1194,7 @@ func (s *schedulerRuntimeState) choiceEquivalent(a, b schedulerChoice) bool {
 	preferCredits := s.cfg.PreferResetCredits
 	s.mu.RUnlock()
 	creditsEquivalent := !preferCredits || !(a.near && b.near) || a.snapshot.ResetCredits == b.snapshot.ResetCredits
-	return a.rank == b.rank && a.near == b.near &&
+	return compareQuotaPriority(a.priority, b.priority) == 0 && a.rank == b.rank && a.near == b.near &&
 		creditsEquivalent &&
 		a.window.UsedPercent == b.window.UsedPercent &&
 		a.candidate.Priority == b.candidate.Priority
@@ -1841,34 +1858,38 @@ func isJSONEmptyValue(value reflect.Value) bool {
 }
 
 type runtimeQuotaStatus struct {
-	FiveHourLimitStatus   string                        `json:"five_hour_limit_status,omitempty"`
-	FiveHourPhase         *runtimeFiveHourPhaseStatus   `json:"five_hour_phase,omitempty"`
-	AuthHealth            *authExpiryStatus             `json:"auth_health,omitempty"`
-	Runway                []quotaRunwayWindowAssessment `json:"runway,omitempty"`
-	Plan                  string                        `json:"plan_prior"`
-	PlanWeight            float64                       `json:"five_hour_capacity_weight_prior"`
-	PlanSource            string                        `json:"plan_source"`
-	UpstreamPlanType      string                        `json:"upstream_plan_type,omitempty"`
-	UpstreamPlanSource    string                        `json:"upstream_plan_source,omitempty"`
-	UpstreamPlanAt        string                        `json:"upstream_plan_observed_at,omitempty"`
-	UpstreamPlanFresh     bool                          `json:"upstream_plan_fresh"`
-	WeeklyBudgetPerDay    float64                       `json:"weekly_budget_percent_per_day"`
-	WeeklyBudgetPerMinute float64                       `json:"weekly_budget_percent_per_minute"`
-	WeeklyBudgetKnown     bool                          `json:"weekly_budget_known"`
-	AuthID                string                        `json:"auth_id"`
-	AuthIndex             string                        `json:"auth_index,omitempty"`
-	Window                string                        `json:"window"`
-	UsedPercent           float64                       `json:"used_percent"`
-	ResetCredits          int                           `json:"reset_credits"`
-	ResetAt               string                        `json:"reset_at,omitempty"`
-	Fresh                 bool                          `json:"fresh"`
-	Eligible              bool                          `json:"eligible"`
-	ActiveWindows         int                           `json:"active_windows"`
-	Reason                string                        `json:"reason,omitempty"`
-	Source                string                        `json:"source,omitempty"`
-	HeaderObservedAt      string                        `json:"header_observed_at,omitempty"`
-	Windows               []runtimeQuotaWindowStatus    `json:"windows,omitempty"`
-	ADQ                   *runtimeADQAccountStatus      `json:"adq,omitempty"`
+	SelectionPriority      runtimeQuotaPriorityStatus    `json:"selection_priority"`
+	FiveHourLimitStatus    string                        `json:"five_hour_limit_status,omitempty"`
+	FiveHourPhase          *runtimeFiveHourPhaseStatus   `json:"five_hour_phase,omitempty"`
+	AuthHealth             *authExpiryStatus             `json:"auth_health,omitempty"`
+	Runway                 []quotaRunwayWindowAssessment `json:"runway,omitempty"`
+	Plan                   string                        `json:"plan_prior"`
+	PlanWeight             float64                       `json:"five_hour_capacity_weight_prior"`
+	PlanSource             string                        `json:"plan_source"`
+	UpstreamPlanType       string                        `json:"upstream_plan_type,omitempty"`
+	UpstreamPlanSource     string                        `json:"upstream_plan_source,omitempty"`
+	UpstreamPlanAt         string                        `json:"upstream_plan_observed_at,omitempty"`
+	UpstreamPlanFresh      bool                          `json:"upstream_plan_fresh"`
+	WeeklyBudgetPerDay     float64                       `json:"weekly_budget_percent_per_day"`
+	WeeklyBudgetPerMinute  float64                       `json:"weekly_budget_percent_per_minute"`
+	WeeklyBudgetKnown      bool                          `json:"weekly_budget_known"`
+	AuthID                 string                        `json:"auth_id"`
+	AuthIndex              string                        `json:"auth_index,omitempty"`
+	Window                 string                        `json:"window"`
+	UsedPercent            float64                       `json:"used_percent"`
+	ResetCredits           int                           `json:"reset_credits"`
+	ResetCreditsKnown      bool                          `json:"reset_credits_known"`
+	ResetCreditsFresh      bool                          `json:"reset_credits_fresh"`
+	ResetCreditsObservedAt string                        `json:"reset_credits_observed_at,omitempty"`
+	ResetAt                string                        `json:"reset_at,omitempty"`
+	Fresh                  bool                          `json:"fresh"`
+	Eligible               bool                          `json:"eligible"`
+	ActiveWindows          int                           `json:"active_windows"`
+	Reason                 string                        `json:"reason,omitempty"`
+	Source                 string                        `json:"source,omitempty"`
+	HeaderObservedAt       string                        `json:"header_observed_at,omitempty"`
+	Windows                []runtimeQuotaWindowStatus    `json:"windows,omitempty"`
+	ADQ                    *runtimeADQAccountStatus      `json:"adq,omitempty"`
 }
 
 type runtimeQuotaWindowStatus struct {
@@ -2214,6 +2235,7 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 	count := 0
 	seen := make(map[string]struct{})
 	snapshots := make([]runtimeQuotaStatus, 0)
+	selectionPriorities := make(map[string]quotaSelectionPriority)
 	pacing := make([]runtimePacingStatus, 0)
 	adqMetrics := make([]adqAccountMetrics, 0)
 	adqCalibratedAccounts := 0
@@ -2241,9 +2263,14 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 			AuthIndex:           snapshot.AuthIndex,
 			Fresh:               fresh,
 			ResetCredits:        snapshot.ResetCredits,
+			ResetCreditsKnown:   snapshot.ResetCreditsKnown,
+			ResetCreditsFresh:   snapshot.ResetCreditsKnown && !snapshot.ResetCreditsObservedAt.IsZero() && !now.Before(snapshot.ResetCreditsObservedAt) && now.Sub(snapshot.ResetCreditsObservedAt) <= cfg.StaleAfter,
 			Eligible:            evaluation.Known && evaluation.Eligible,
 			ActiveWindows:       evaluation.ActiveWindows,
 			Reason:              evaluation.Reason,
+		}
+		if !snapshot.ResetCreditsObservedAt.IsZero() {
+			item.ResetCreditsObservedAt = snapshot.ResetCreditsObservedAt.Format(time.RFC3339)
 		}
 		if phase, exists := fiveHourPhases[canonical]; exists && phase.AuthIndex == snapshot.AuthIndex {
 			status := fiveHourPhaseStatus(phase, now)
@@ -2293,6 +2320,8 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 		}
 		item.Runway = runwayByAuth[canonical]
 		budgetChoice := inspectSerialCandidate(pluginapi.SchedulerAuthCandidate{ID: canonical}, snapshot, true, cfg, now)
+		item.SelectionPriority = quotaPriorityStatus(budgetChoice, cfg, now)
+		selectionPriorities[canonical] = budgetChoice.Priority
 		if item.Eligible && (cfg.SchedulerMode == "serial" || cfg.SchedulerMode == "balanced") &&
 			!cfg.SerialSoftContinuation && budgetChoice.Reason == "serial_threshold" {
 			item.Eligible = false
@@ -2407,6 +2436,20 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 		pacing = append(pacing, pacingItem)
 	}
 	sort.Slice(snapshots, func(i, j int) bool { return snapshots[i].AuthID < snapshots[j].AuthID })
+	priorityOrder := make([]int, len(snapshots))
+	for i := range priorityOrder {
+		priorityOrder[i] = i
+	}
+	sort.SliceStable(priorityOrder, func(i, j int) bool {
+		return compareQuotaPriority(selectionPriorities[snapshots[priorityOrder[i]].AuthID], selectionPriorities[snapshots[priorityOrder[j]].AuthID]) < 0
+	})
+	rank := 1
+	for i, index := range priorityOrder {
+		if i > 0 && compareQuotaPriority(selectionPriorities[snapshots[index].AuthID], selectionPriorities[snapshots[priorityOrder[i-1]].AuthID]) != 0 {
+			rank++
+		}
+		snapshots[index].SelectionPriority.Rank = rank
+	}
 	sort.Slice(pacing, func(i, j int) bool { return pacing[i].AuthID < pacing[j].AuthID })
 
 	adqStatus := runtimeADQStatus{Enabled: adqEnabled, Decisions: adqDecisions, ReservationCollisions: adqReservationCollisions,

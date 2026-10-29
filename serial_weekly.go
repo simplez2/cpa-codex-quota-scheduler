@@ -104,6 +104,9 @@ func (s *schedulerRuntimeState) serialWeeklyRebalancePickLocked(current serialCa
 		if choice.WindowClass != current.WindowClass {
 			continue
 		}
+		if compareQuotaPriority(choice.Priority, current.Priority) > 0 {
+			continue
+		}
 		if _, better := serialRebalanceAdvantage(current, choice, cfg); !better {
 			continue
 		}

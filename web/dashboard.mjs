@@ -2,6 +2,7 @@ import { resourceBase, readPanelKey, validKey, decodeStored, rememberPanelKey, r
 import { createSettingsEditor, weeklyAllocationLabel, continuitySummary } from './settings.mjs';
 import { concurrencyView, waitReasons, availableQuota } from './concurrency.mjs';
 import { weeklyBudgetPercentPerMinute, formatWeeklyBudgetRate } from './budget.mjs';
+import { quotaPriorityText, resetCreditsText, observedResetsText, compareAccountPriorities } from './priority.mjs';
 import { poolWindowView } from './pool.mjs';
 import { createPanelMotion } from './motion.mjs';
 
@@ -12,7 +13,7 @@ const endpoint = base + '/v0/management/plugins/codex-quota-scheduler/scheduler-
 const bansEndpoint = base + '/v0/management/plugins/codex-quota-scheduler/bans';
 const plans = {team_standard:'Team Standard',team_premium:'Team Premium',plus:'Plus',pro_5x:'Pro 5x',pro_20x:'Pro 20x'};
 const upstreamPlans = {team:'Team Standard',self_serve_business_prolite:'Team Premium',plus:'Plus'};
-const reasons = {weekly_budget_rebalance:'按周日均预算重新平衡',weekly_remaining_rebalance:'按周余量重新平衡',manual:'手动选择',manual_selection:'手动选择',manual_cleared:'恢复自动调配',initial:'首次选择',active_missing:'当前账号已不可用',quota_exhausted:'额度已用尽',new_session_priority:'新会话按周预算与5h重置优先级选择'};
+const reasons = {weekly_budget_rebalance:'按周日均预算重新平衡',weekly_remaining_rebalance:'按周余量重新平衡',manual:'手动选择',manual_selection:'手动选择',manual_cleared:'恢复自动调配',initial:'首次选择',active_missing:'当前账号已不可用',quota_exhausted:'额度已用尽',new_session_priority:'新会话按额度池和重置时间选择',five_hour_reset_priority:'优先消耗更早重置的5h额度'};
 const warmupStates = {confirmed:'已确认激活',pending_confirmation:'等待额度确认',attempted:'已尝试',blocked:'已停止重试',failed:'等待重试'};
 const epochAccountStates = {pending:'等待预热',natural:'真实调用已激活',warmed:'自动预热已完成',blocked:'需处理后重试'};
 let state = null, key = '', manual = false, busy = false, timer = null, failures = 0, authEpoch = 0, operating = false;
@@ -65,10 +66,12 @@ function updateCountdown(node) {
 function warmupWait(account, cell) {
  const five=(account.windows||[]).find(w=>w.window==='5h');
  const phase=account.five_hour_phase;
+ if(!five)return;
  if(phase?.cycle_generation){
   const mode=phase.anchor_mode==='FIRST_USE_AFTER_RESET'?'首次使用重新锚定已确认':phase.anchor_mode==='FIXED_PROVIDER_WINDOW'?'官方固定周期':'官方锚定方式待确认';
-  const generation=phase.state==='idle_activation_deferred'?'5h 下一周期第 '+(phase.cycle_generation+1)+' 代':'5h 第 '+phase.cycle_generation+' 代';
-  cell.append(element('span','subtext',generation+' · '+mode));
+  const observed=element('span','subtext',observedResetsText(phase)+' · '+mode);
+  observed.title='根据已观察到的官方窗口变化记录；当前周内可能漏记，周重置或状态丢失后重新计数。它不是官方可用重置卡次数，也不决定调度优先级。';
+  cell.append(observed);
  }
  if(state.warmup_enabled && phase?.state==='idle_activation_deferred' && timestamp(phase.activate_not_before)>new Date()){
   cell.append(element('span','subtext','闲置凭据等待错峰预热；真实请求立即使用'),countdown(phase.activate_not_before,'错峰预热倒计时 '));return;
@@ -247,7 +250,7 @@ function renderAccounts() {
   const previous=new Map([...body.children].map(row=>[row.dataset.authId,[...row.querySelectorAll('.bar-fill')].map(bar=>bar.style.width)]));
   body.replaceChildren();
   const search = $('search').value.toLowerCase().trim();
-  const accounts = [...(state.snapshots || [])].sort((a,b) => Number(b.auth_id === state.serial_active_auth_id) - Number(a.auth_id === state.serial_active_auth_id) || a.auth_id.localeCompare(b.auth_id));
+  const accounts = [...(state.snapshots || [])].sort(compareAccountPriorities);
   const visible = accounts.filter(a => [a.auth_id,plans[a.plan_prior]||a.plan_prior,a.upstream_plan_type].some(value=>String(value||'').toLowerCase().includes(search)));
   for (const account of visible) {
     const active = state.scheduler_mode==='serial' && account.auth_id === state.serial_active_auth_id;
@@ -270,6 +273,12 @@ function renderAccounts() {
     const capacity = (account.five_hour_capacity_weight_prior || 1)+'×';
     const planStatus = automatic ? '自动识别 · 容量参考 '+capacity : account.plan_source==='account_override' ? '手动覆盖 · 容量参考 '+capacity : '默认档位 '+configuredPlan+' · 容量参考 '+capacity;
     info.append(element('span','subtext',planStatus+(automatic&&!account.upstream_plan_fresh?' · 缓存识别':'')));
+    const priority=element('span','subtext',quotaPriorityText(account));
+    priority.title='新会话和换号按额度池、已确认重置时间排序；同一优先组内再按周预算分配。已有会话优先保留绑定，忙碌、认证和硬额度限制仍会影响实际选择。';
+    info.append(priority);
+    const resetCredits=element('span','subtext',resetCreditsText(account));
+    resetCredits.title='来自官方额度查询返回的可用重置次数；未返回不等于 0，不会自动消耗重置卡。'+(account.reset_credits_observed_at?' 观测时间：'+dateText(account.reset_credits_observed_at):'');
+    info.append(resetCredits);
     if (upstreamPlan && !automatic) info.append(element('span','subtext','上游：'+upstreamPlan+(account.upstream_plan_fresh?'':'（缓存已过期）')));
     if (ban) info.append(element('span','subtext','冷却到期 ' + dateText(ban.reset_at)));
     const pollError=state.quota_polls?.[account.auth_id]?.Error || '';
@@ -284,7 +293,12 @@ function renderAccounts() {
       const labels={not_allowed:'上游暂不可用',limit_reached:'额度已耗尽',serial_threshold:'达到设定阈值',quota_unknown:'等待额度确认'};
       info.append(element('span','subtext',labels[account.reason]||account.reason));
     }
-    const fiveCell=quotaCell(account.windows?.find(w => w.window === '5h'),false); warmupWait(account,fiveCell);
+    const fiveWindow=account.windows?.find(w => w.window === '5h');
+    const fiveCell=quotaCell(fiveWindow,false);
+    if(!fiveWindow){
+      fiveCell.replaceChildren(element('span','subtext',account.five_hour_limit_status==='not_reported'?'仅周限 · 官方当前未报告 5h 限额':'5h 状态待确认'),element('span','subtext',account.five_hour_limit_status==='not_reported'?'保留为后备额度':'缺少完整有效观测，不能推断无限额度'));
+    }
+    warmupWait(account,fiveCell);
     row.append(info,fiveCell,quotaCell(account.windows?.find(w => w.window === 'weekly'),true));
     const budget = element('td');
     const minuteRate = weeklyBudgetPercentPerMinute(account);
@@ -371,11 +385,12 @@ function renderPolicy() {
   const hold = String(state.serial_weekly_rebalance_min_hold || '').replace(/([hm])0s$/,'$1').replace(/(\d+)h/g,'$1 小时 ').replace(/(\d+)m/g,'$1 分钟 ').replace(/(\d+)s/g,'$1 秒').trim();
   const pairs = [
     ['调度模式',modes[state.scheduler_mode] || state.scheduler_mode],
+    ['新会话优先级',(state.window_order||['5h','weekly','monthly']).join(' → ')+'；同池越早重置越优先'],
     ['额度自动续行',continuitySummary(state.continuity)],
     ...(state.continuity?.last_checked_at ? [['续行检查时间',dateText(state.continuity.last_checked_at)]] : []),
     ...(state.continuity?.last_action==='wait' ? [['最近建议等待',Math.ceil(Number(state.continuity.last_wait_ms || 0)/1000)+' 秒 · 实际排队由 CPA 管理']] : []),
     ['每凭据并发',state.concurrency?.enabled ? '上限 '+(state.concurrency.max_per_credential ?? state.concurrency.max_per_account)+' · 全池在途 '+state.concurrency.active+' · 等待 '+state.concurrency.waiting+(state.concurrency.lifecycle_observed ? '' : ' · 等待 CPA 生命周期信号') : '已关闭'],
-    ['分配策略',state.scheduler_mode==='balanced'?`新会话${weeklyAllocationLabel(state.serial_allocation_policy)}分配，保留会话粘性`:weeklyAllocationLabel(state.serial_allocation_policy)],
+    ['同组分配策略',state.scheduler_mode==='balanced'?`${weeklyAllocationLabel(state.serial_allocation_policy)}分配，保留会话粘性`:weeklyAllocationLabel(state.serial_allocation_policy)],
     ['5h 切换',noReserve ? '额度用尽 / 上游限额时切换' : state.serial_5h_handoff_mode==='custom_threshold' ? '已用达到 '+pct(state.serial_5h_switch_percent)+' 时换号' : state.serial_5h_handoff_mode==='reserve_aware' ? '按设定预留余量换号' : '沿用通用阈值'],
     ['5h 预留',noReserve ? '0%（不提前预留）' : pct(state.reserve_5h_percent)],
     [state.scheduler_mode==='balanced'?'并发分配':'主动再平衡最短持有',state.scheduler_mode==='balanced'?'同一会话保持账号，各会话可并发':hold],

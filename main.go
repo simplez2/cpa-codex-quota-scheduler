@@ -106,7 +106,7 @@ import (
 
 const (
 	pluginName    = "codex-quota-scheduler"
-	pluginVersion = "0.3.30"
+	pluginVersion = "0.3.31"
 
 	// providerCodex is the CPA provider key for OpenAI Codex (ChatGPT backend).
 	providerCodex = "codex"
@@ -673,7 +673,7 @@ func pluginRegistration() registration {
 				{Name: "continuity_max_wait", Type: pluginapi.ConfigFieldTypeString, Description: "Maximum total continuity wait per request, including pacing (1s-24h, default 6h). Client deadlines still apply."},
 				{Name: "continuity_poll_interval", Type: pluginapi.ConfigFieldTypeString, Description: "Host continuity reassessment interval (1s-5m, default 30s). Existing quota probe backoffs remain authoritative."},
 				{Name: "continuity_pacing", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Pace new execution before the confirmed 5h pool is exhausted; fresh weekly-only credentials can continue without 5h pacing. Requires compatible CPA host."},
-				{Name: "scheduler_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"balanced", "serial", "legacy", "shadow", "enforce"}, Description: "Balanced spreads concurrent work by 5h headroom, weekly daily budget and plan capacity. Serial retains one committed primary. Configure either directly in the quota panel."},
+				{Name: "scheduler_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"balanced", "serial", "legacy", "shadow", "enforce"}, Description: "Prefer usable 5h quota and earlier confirmed resets before weekly-only backups. Balanced allocates weighted work within each priority group; serial ranks that group. Existing eligible conversations retain their credential."},
 				{Name: "serial_switch_percent", Type: pluginapi.ConfigFieldTypeNumber, Description: "Soft used-percent switch threshold. Drain mode may cross it; hard limits, disallowed windows, and 429 still force failover."},
 				{Name: "serial_handoff_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"threshold_only", "reserve_aware"}, Description: "Account handoff policy. threshold_only follows serial_switch_percent; reserve_aware also hands off before the configured reserve for the active 5h, weekly, or monthly window is consumed."},
 				{Name: "serial_5h_handoff_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"inherit_global", "custom_threshold", "reserve_aware", "429_only"}, Description: "5h-specific handoff policy. Defaults to 429_only: no static, forecast, or cache-age reserve; hard limits, disallowed state, and 429 still trigger handoff. inherit_global uses the global threshold; custom_threshold uses serial_5h_switch_percent; reserve_aware enables the configured reserve and forecast guard."},
