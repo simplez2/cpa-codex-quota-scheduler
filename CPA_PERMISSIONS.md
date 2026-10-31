@@ -34,7 +34,7 @@ scope for this key.
 | Interface | Access and purpose |
 | --- | --- |
 | `GET /v0/management/auth-files` | Read credential inventory and eligibility. |
-| `POST /v0/management/api-call` | Query native quotas; optionally perform explicitly enabled, budgeted warmup using CPA's `$TOKEN$` substitution. |
+| `POST /v0/management/api-call` | Query native quotas and reset-credit lists; optionally perform explicitly enabled, budgeted warmup or pre-expiry credit redemption using CPA's `$TOKEN$` substitution. |
 | `host.auth.list` | Read native credential eligibility for dispatch checks. |
 | `host.auth.get` | Read a physical credential JSON document for expiry diagnosis. This can include OAuth/PAT material. |
 | `host.auth.get_runtime` | Recheck the exact credential before expiry repair. |
@@ -55,6 +55,18 @@ inside the CPA container. Authenticated plugin HTTP calls do not follow
 redirects. Use HTTPS when management traffic crosses an untrusted network.
 `quota_url` also receives a substituted upstream bearer token through CPA;
 change it only to an endpoint trusted to receive that credential.
+
+Reset-credit lists use `GET https://chatgpt.com/backend-api/wham/rate-limit-reset-credits`.
+`reset_credits_auto_use` defaults to **false**. Enabling it permits a real
+`POST .../rate-limit-reset-credits/consume` with a unique `redeem_request_id`
+shortly before expiry (default `10m`), after fresh eligibility/identity checks.
+The server chooses the consumed card; the plugin cannot specify a card ID.
+This is an opt-in upstream mutation, separate from model warmup. A generation-
+fenced journal at `state_path + ".reset-credits.json"` prevents write replay;
+uncertain outcomes require review and are not automatically retried. The journal
+contains hashed identifiers and operation UUIDs, no bearer tokens or raw credit
+IDs. Preserve it across upgrades, rollback and state migration. Only verified
+quota recovery can trigger the matching native credential cooldown reset.
 
 ## Public resources and browser storage
 
@@ -81,7 +93,7 @@ The CPA process needs:
   permission. The plugin directory must not be writable by untrusted users.
 - Read access to the management key, normally owner-only `0400` or `0600`.
 - Read/write/search access to the private state directory, normally `0700`.
-  State, generation ownership, lock and warmup journal files are created with
+  State, generation ownership, lock, reset-credit and warmup journal files are created with
   owner-only permissions. Preserve these together across plugin updates.
 - Existing CPA access to its auth directory. Expiry reads and repair writes use
   CPA's native callbacks/API rather than a separate auth-directory mount.

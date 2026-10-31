@@ -48,7 +48,7 @@ plugins/windows/amd64/codex-quota-scheduler.dll
 
 - `cpa_management_url`：可信 CPA 管理地址，优先使用同容器或受保护网络的回环地址。
 - `cpa_management_key_file`：CPA 管理密钥的只读文件挂载，不是普通客户端 API Key。
-- `state_path`：CPA 进程可写的私有持久化目录；升级时保留状态及相邻的锁、代次和预热文件。
+- `state_path`：CPA 进程可写的私有持久化目录；升级时保留状态及相邻的锁、代次、预热和 `.reset-credits.json` 防重复文件。
 - `scheduler_mode`：默认 `serial`；多个会话同时分配可选择 `balanced`。
 
 Linux 动态库通常使用 `0644`，密钥 `0400` 或 `0600`，私有状态目录 `0700`。
@@ -57,6 +57,8 @@ Windows 使用对应服务身份的 NTFS ACL。无需给插件 root、管理员�
 
 默认开启到期诊断及严格的 PAT 元数据自动修复；不希望写回认证文件时设置
 `auth_expiry_auto_repair: false`。诊断仍读取凭据文档。预热默认关闭。
+重置卡到期自动使用也默认关闭；可在“调配设置”单独开启，默认到期前 10 分钟检查。
+该开关会消耗真实官方重置卡，详见 [用卡条件和限制](README.zh-CN.md#官方重置卡与到期自动使用)。
 
 ## 宿主与升级
 

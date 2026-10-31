@@ -39,6 +39,8 @@ export const fields = [
   ['pool_5h_excluded_accounts','不参与 5h 统计的账号','allocation','excluded','仅勾选你已确认没有 5h 限制的账号。自动识别会跳过当前完整额度响应中未返回 5h 限制的账号；查询失败仍显示待确认。此处不改变周额度、切号或预热。'],
   ['quota_probe_on_demand','按需探测额度','allocation','boolean','默认开启。空闲时停止周期探测；新调用产生后按冷却间隔合并查询。初始化、已知周期重置和预热前校验只按事件触发。'],
   ['auth_expiry_auto_repair','自动恢复失效的认证过期标记','allocation','boolean','仅处理明确标记的长期令牌：连续两次原生额度认证成功且凭据未变化后恢复。保留 OAuth/JWT 过期限制；不增加生成或预热请求。'],
+  ['reset_credits_auto_use','重置卡到期前自动使用','allocation','boolean','默认关闭。开启后，在到期前检查并消耗一张真实官方重置卡；需官方确认当前允许使用且额度已有消耗。后台空闲时也检查，结果不明时停止自动消耗并提示核查。上游决定具体消耗哪张卡。'],
+  ['reset_credits_auto_use_before','提前多久检查重置卡','allocation','duration','默认到期前 10 分钟；可设 1 分钟至 24 小时。按最早到期时间检查，已过期的卡不使用；服务停止或官方限制时无法保证兑换。'],
   ['warmup_enabled','自动预热','warmup','boolean','开启后产生少量真实模型请求；已确认周期不重复预热。周周期先启动；第二代起闲置5h预热按15分钟槽错开，真实请求无需等待。官方固定周期只错开消耗。均衡模式在真实请求进行中及结束后的短暂间隔内暂缓预热。'],
   ['warmup_model','预热模型','warmup','text','填写当前 CPA 支持的模型名称；不会更改客户端的默认模型。'],
   ['warmup_min_interval','两次预热至少间隔','warmup','duration','全局仅控制发送间隔，默认 1 分钟；预算与失败退避按账号独立。'],
@@ -103,6 +105,8 @@ export function createSettingsEditor({api,notify,onSaved,onView}) {
       const control=controls.get(name);
       if(control)for(const input of control.closest('.setting-field').querySelectorAll('input,select'))input.disabled=!draft.account_concurrency_enabled;
     }
+    const resetBefore=controls.get('reset_credits_auto_use_before');
+    if(resetBefore)for(const input of resetBefore.closest('.setting-field').querySelectorAll('input,select'))input.disabled=!draft.reset_credits_auto_use;
     for (const name of ['continuity_pacing','continuity_max_wait','continuity_poll_interval']) {
       const control=controls.get(name);
       if(control)for(const input of control.closest('.setting-field').querySelectorAll('input,select'))input.disabled=!draft.continuity_enabled;

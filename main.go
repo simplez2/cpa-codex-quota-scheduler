@@ -106,7 +106,7 @@ import (
 
 const (
 	pluginName    = "codex-quota-scheduler"
-	pluginVersion = "0.3.32"
+	pluginVersion = "0.3.33"
 
 	// providerCodex is the CPA provider key for OpenAI Codex (ChatGPT backend).
 	providerCodex = "codex"
@@ -695,6 +695,8 @@ func pluginRegistration() registration {
 				{Name: "cpa_management_key_file", Type: pluginapi.ConfigFieldTypeString, Description: "Mounted owner-readable CPA management key file; the key is never placed in YAML or logs."},
 				{Name: "quota_probe_on_demand", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Suspend idle quota polling; query after new usage or bounded initialization/reset/warmup events."},
 				{Name: "auth_expiry_auto_repair", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Repair stale top-level expiry on explicit opaque personal access tokens only after two unchanged native quota authentications. OAuth and JWT expiry remain authoritative."},
+				{Name: "reset_credits_auto_use", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Opt in to consuming an official reset credit shortly before expiry; disabled by default. Requires fresh eligibility and durable duplicate protection."},
+				{Name: "reset_credits_auto_use_before", Type: pluginapi.ConfigFieldTypeString, Description: "How early to check for expiring reset credits (default 10m; 1m to 24h)."},
 				{Name: "warmup_enabled", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Optional budgeted activation of idle Codex quota windows. Requires a writable state file and fresh eligible quota; defaults to false."},
 				{Name: "warmup_model", Type: pluginapi.ConfigFieldTypeString, Description: "Model used for the minimal pinned activation request; this does not change any route default."},
 				{Name: "warmup_retry_after", Type: pluginapi.ConfigFieldTypeString, Description: "Base delay for exponential warmup failure backoff. Three failures require explicit repair/retry; uncertain outcomes wait at least 5h."},

@@ -24,6 +24,15 @@ test('every control has a distinct key and a Chinese label',()=>{
   for(const spec of fields)assert.match(spec[1],/[\u4e00-\u9fff]/);
 });
 
+test('automatic reset credit consumption is an independent opt-in control',()=>{
+  const toggle=fields.find(f=>f[0]==='reset_credits_auto_use');
+  const before=fields.find(f=>f[0]==='reset_credits_auto_use_before');
+  assert.equal(toggle[3],'boolean');assert.equal(toggle[2],'allocation');
+  assert.match(toggle[4],/默认关闭/);assert.match(toggle[4],/真实官方重置卡/);
+  assert.equal(before[3],'duration');assert.match(before[4],/10 分钟/);
+  assert.deepEqual(changesBetween({reset_credits_auto_use:false,warmup_enabled:false},{reset_credits_auto_use:true,warmup_enabled:false}),{reset_credits_auto_use:true});
+});
+
 test('continuity reports observed host advice without claiming an active queue',()=>{
   assert.match(continuitySummary(),/未提供/);
   assert.equal(continuitySummary({enabled:false}),'已关闭');

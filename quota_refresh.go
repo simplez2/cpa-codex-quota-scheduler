@@ -86,7 +86,9 @@ func parseNativeQuota(raw []byte, authID, index string, observedAt time.Time) (q
 		Additional []struct {
 			RateLimit *nativeRateLimit `json:"rate_limit"`
 		} `json:"additional_rate_limits"`
-		ResetCredits *int `json:"rate_limit_reset_credits_available_count"`
+		ResetCredits         json.RawMessage `json:"rate_limit_reset_credits_available_count"`
+		ResetCreditInfo      json.RawMessage `json:"rate_limit_reset_credits"`
+		ResetCreditInfoCamel json.RawMessage `json:"rateLimitResetCredits"`
 	}
 	if err := json.Unmarshal(raw, &response); err != nil {
 		return quotaSnapshot{}, errors.New("invalid_quota_json")
@@ -108,9 +110,19 @@ func parseNativeQuota(raw []byte, authID, index string, observedAt time.Time) (q
 	if out.Plan.Type != "" {
 		out.Plan.Source = "cpa_usage"
 	}
-	if response.ResetCredits != nil && *response.ResetCredits >= 0 {
-		out.ResetCredits = *response.ResetCredits
-		out.ResetCreditsKnown = true
+	meta := parseResetCreditCounts(response.ResetCreditInfo)
+	if !meta.CountKnown && !meta.ApplicableKnown {
+		meta = parseResetCreditCounts(response.ResetCreditInfoCamel)
+	}
+	if !meta.CountKnown {
+		meta.Count, meta.CountKnown = resetCreditCount(response.ResetCredits)
+	}
+	if meta.CountKnown || meta.ApplicableKnown {
+		out.ResetCredits, out.ResetCreditsKnown = meta.Count, meta.CountKnown
+		out.ResetCreditsApplicable, out.ResetCreditsApplicableKnown = meta.Applicable, meta.ApplicableKnown
+		if meta.ApplicableKnown {
+			out.ResetCreditsApplicableObservedAt = observedAt
+		}
 		out.ResetCreditsObservedAt = observedAt
 	}
 	// Additional limits can be feature/model scoped. Do not treat those as
@@ -196,6 +208,10 @@ func quotaInventory(files []cpaAuthFileEntry) map[string]cpaAuthFileEntry {
 }
 
 func fetchCPAQuota(ctx context.Context, cfg pluginConfig, auth cpaAuthFileEntry) (cpaAPICallResponse, error) {
+	return fetchCPANative(ctx, cfg, auth, http.MethodGet, cfg.QuotaURL, "", nil)
+}
+
+func fetchCPANative(ctx context.Context, cfg pluginConfig, auth cpaAuthFileEntry, method, endpoint, data string, extra map[string]string) (cpaAPICallResponse, error) {
 	var result cpaAPICallResponse
 	key, err := os.ReadFile(cfg.CPAManagementKeyFile)
 	if err != nil || strings.TrimSpace(string(key)) == "" {
@@ -205,7 +221,10 @@ func fetchCPAQuota(ctx context.Context, cfg pluginConfig, auth cpaAuthFileEntry)
 	if auth.IDToken.AccountID != "" {
 		headers["ChatGPT-Account-Id"] = auth.IDToken.AccountID
 	}
-	body, _ := json.Marshal(cpaAPICallRequest{AuthIndex: auth.AuthIndex, Method: http.MethodGet, URL: cfg.QuotaURL, Header: headers})
+	for name, value := range extra {
+		headers[name] = value
+	}
+	body, _ := json.Marshal(cpaAPICallRequest{AuthIndex: auth.AuthIndex, Method: method, URL: endpoint, Header: headers, Data: data})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.CPAManagementURL, bytes.NewReader(body))
 	if err != nil {
 		return result, errors.New("invalid_management_url")
@@ -337,6 +356,12 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 	}
 	s.quotas = next
 	s.identities = identities
+	s.resetCreditInventory = inventory
+	for id, state := range s.resetCredits {
+		if auth, ok := inventory[id]; !ok || auth.AuthIndex != state.AuthIndex {
+			delete(s.resetCredits, id)
+		}
+	}
 	activeID := s.serialActiveAuthID
 	if cfg.SchedulerMode == "balanced" {
 		activeID = ""
@@ -525,6 +550,10 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 			}
 			s.recovery.observe(snapshot, time.Now(), cfg.StaleAfter)
 			s.quotaNative[id] = snapshot
+			if creditState, ok := s.resetCredits[id]; ok && snapshot.ResetCreditsKnown && creditState.CountKnown && snapshot.ResetCredits != creditState.Count && snapshot.ResetCreditsObservedAt.After(creditState.ObservedAt) {
+				creditState.NextAt = time.Time{}
+				s.resetCredits[id] = creditState
+			}
 			snapshot = mergePartialQuotaSnapshot(s.quotas[id], snapshot, time.Now(), cfg.StaleAfter)
 			s.quotas[id] = snapshot
 			s.quotas[auth.AuthIndex] = snapshot

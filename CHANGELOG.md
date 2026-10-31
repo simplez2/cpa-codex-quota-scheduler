@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.3.33 — 2026-11-01
+
+- Recognize nested native `rate_limit_reset_credits.available_count` and keep
+  backward compatibility with the old flat count. Distinguish total credits,
+  current applicability, explicit zero and missing optional metadata.
+- Read the official reset-credit list and display each available credit's exact
+  expiry in GMT+8, cache freshness and independent automatic-use status.
+- Add default-off `reset_credits_auto_use` and a configurable pre-expiry window
+  (default 10 minutes). Verify identity, plan support, current eligibility and
+  consumed quota before any redemption; custom quota adapters stay read-only.
+- Persist a generation-fenced redemption intent and native request UUID before
+  dispatch. Never replay an uncertain write after a timeout or hot reload. Retry
+  read verification of acknowledged redemptions without spending another card.
+- Verify fresh quota before targeted native cooldown recovery. Keep unrelated or
+  newer local bans and preserve existing routing, affinity and concurrency rules.
+- Test the actual nested/list schemas and simulated redemptions, including
+  unknown outcomes, expiry boundaries, manual consumption, reloads and backoff.
+  Real credits are not consumed by the test suite.
+
 ## 0.3.32 — 2026-10-31
 
 - Preserve v0.3.31 scheduling: usable 5h quota first, earlier confirmed resets
