@@ -291,6 +291,18 @@ func configureSchedulerRuntime(raw []byte) {
 	schedulerRuntime.concurrency.notify()
 
 	loadBanState(cfg.StatePath)
+	// Enabling auto-use or changing its lead time must not inherit a read-only
+	// cache schedule that falls after a card expires. Keep failure backoff intact.
+	schedulerRuntime.mu.Lock()
+	if cfg.ResetCreditsAutoUse {
+		for id, credit := range schedulerRuntime.resetCredits {
+			if credit.Error == "" && credit.AutoFailures == 0 {
+				credit.NextAt = time.Time{}
+				schedulerRuntime.resetCredits[id] = credit
+			}
+		}
+	}
+	schedulerRuntime.mu.Unlock()
 	if !cfg.Enabled {
 		return
 	}
