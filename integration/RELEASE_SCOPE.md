@@ -3,7 +3,8 @@
 This release combines the user's preceding requests in this same task: remove
 Keeper dependency, implement native CPA quota queries, persist warmup deduplication,
 balance weekly allowances, and switch accounts on quota failure without a 5h reserve.
-The user subsequently authorized updating GitHub and deploying to 157.254.234.196.
+This historical scope concerned GitHub publication and a separately authorized
+CPA deployment. It does not describe the current release or installation target.
 
 The staged source contains only this plugin, its tests/documentation, deterministic
 offline research, and a host patch. The large line count is dominated by 11,809

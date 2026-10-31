@@ -1,10 +1,25 @@
 # Codex Quota Scheduler
 
+[中文说明](README.zh-CN.md) · [Installation / 安装](INSTALL.zh-CN.md) ·
+[Changelog](CHANGELOG.md) · [Latest release](https://github.com/simplez2/cpa-codex-quota-scheduler/releases/latest)
+
 Standalone CPA plugin for balanced concurrent or serial Codex account selection, native quota polling,
 5h/weekly/monthly windows, persistent 429 quarantine and optional warmup.
-Source version: **0.3.31**. Published platform builds and checksums are available
+Source version: **0.3.32**. Published platform builds and checksums are available
 from [GitHub Releases](https://github.com/simplez2/cpa-codex-quota-scheduler/releases).
 See [CPA permissions and compatibility](CPA_PERMISSIONS.md) before installation.
+
+New sessions prefer usable 5h quota, then confirmed weekly-only backups. Within
+the same pool, an earlier confirmed reset has higher priority. Existing eligible
+sessions keep their credential affinity. Local generation counts never invent
+official reset credits or quota refills. See [the scheduling contract](README.zh-CN.md#调度规则).
+
+Every platform archive includes the MIT license, attribution, installation and
+permission notes, example configuration, and a `release-manifest.json` binding
+the library SHA-256 to its version, platform, Go toolchain and source commit.
+`checksums.txt` covers all four archives; `release-verification.json` records
+their validated manifests. These hashes detect mismatched or damaged downloads;
+they are not an independent publisher signature.
 
 The overview reports weekly and 5h pool balances separately in editable Team
 equivalents. Only credentials with an observed 5h limit enter the 5h denominator.
@@ -488,12 +503,13 @@ These controls reduce optional generation traffic. They do not establish an
 upstream risk threshold or guarantee that an account will not be restricted.
 
 Transparent recovery of the same streaming request also requires the matching
-CPA host pre-output quota failover patch. The deployment target is CPA v7.2.152
-with `codex.stream-bootstrap-buffering: true` and `max-retry-credentials: 0`
-(no separate credential-count cap within the host retry policy). Deployment
-completion must be verified against the running host; these requirements do not
-report a completed rollout. A scheduler plugin cannot replay an already
-committed client stream.
+CPA host pre-output quota failover patch. Use the host patch and configuration
+for the exact CPA version: the
+[v8.0.44 integration](integration/CONTINUITY-v8.0.44.md) and the older
+[v8.0.4 / v7.2.152 integrations](integration/README.md) have different bases and
+configuration keys. Verify the running host rather than treating installation
+of the plugin as proof of host integration. A scheduler plugin cannot replay an
+already committed client stream.
 
 ## Management and validation
 

@@ -31,6 +31,7 @@ output/anti-storm/
 output/audit/
 symbols.txt
 integration/continuity/__pycache__/
+.github/scripts/__pycache__/
 research/minute-v0313/
 
 research/affinity-v0314/

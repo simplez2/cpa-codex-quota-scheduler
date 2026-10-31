@@ -18,6 +18,11 @@ if entry["version"] != version:
     raise SystemExit("registry version does not match pluginVersion")
 if f"Source version: **{version}**" not in (root / "README.md").read_text(encoding="utf-8"):
     raise SystemExit("README source version does not match pluginVersion")
+if f"源码版本：**{version}**" not in (root / "README.zh-CN.md").read_text(encoding="utf-8"):
+    raise SystemExit("Chinese README source version does not match pluginVersion")
+if not re.search(rf"^## {re.escape(version)} — \d{{4}}-\d{{2}}-\d{{2}}$",
+                 (root / "CHANGELOG.md").read_text(encoding="utf-8"), re.MULTILINE):
+    raise SystemExit("CHANGELOG is missing the source version")
 if not (root / "SERIAL_CONFIG.example.yaml").read_text(encoding="utf-8").startswith(
         f"# Standalone CPA quota scheduler v{version}."):
     raise SystemExit("example config version does not match pluginVersion")
