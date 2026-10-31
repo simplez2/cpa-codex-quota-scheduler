@@ -19,6 +19,8 @@ const maxWarmupModelLength = 256
 type pluginConfig struct {
 	QuotaProbeOnDemand           bool
 	AuthExpiryAutoRepair         bool
+	ResetCreditsAutoUse          bool
+	ResetCreditsAutoUseBefore    time.Duration
 	QuotaURL                     string
 	QuotaRefreshBatch            int
 	Enabled                      bool
@@ -83,6 +85,8 @@ type pluginConfig struct {
 type yamlPluginConfig struct {
 	QuotaProbeOnDemand           *bool              `yaml:"quota_probe_on_demand"`
 	AuthExpiryAutoRepair         *bool              `yaml:"auth_expiry_auto_repair"`
+	ResetCreditsAutoUse          *bool              `yaml:"reset_credits_auto_use"`
+	ResetCreditsAutoUseBefore    string             `yaml:"reset_credits_auto_use_before"`
 	QuotaURL                     string             `yaml:"quota_url"`
 	QuotaRefreshBatch            *int               `yaml:"quota_refresh_batch"`
 	Enabled                      *bool              `yaml:"enabled"`
@@ -148,6 +152,7 @@ func defaultPluginConfig() pluginConfig {
 	return pluginConfig{
 		QuotaProbeOnDemand:           true,
 		AuthExpiryAutoRepair:         true,
+		ResetCreditsAutoUseBefore:    10 * time.Minute,
 		QuotaURL:                     "https://chatgpt.com/backend-api/wham/usage",
 		QuotaRefreshBatch:            8,
 		Enabled:                      true,
@@ -383,6 +388,16 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 	}
 	if in.AuthExpiryAutoRepair != nil {
 		cfg.AuthExpiryAutoRepair = *in.AuthExpiryAutoRepair
+	}
+	if in.ResetCreditsAutoUse != nil {
+		cfg.ResetCreditsAutoUse = *in.ResetCreditsAutoUse
+	}
+	if strings.TrimSpace(in.ResetCreditsAutoUseBefore) != "" {
+		v, ok := parseDuration(in.ResetCreditsAutoUseBefore)
+		if !ok || v < time.Minute || v > 24*time.Hour {
+			return cfg, fmt.Errorf("reset_credits_auto_use_before must be between 1m and 24h")
+		}
+		cfg.ResetCreditsAutoUseBefore = v
 	}
 	if in.WarmupEnabled != nil {
 		cfg.WarmupEnabled = *in.WarmupEnabled

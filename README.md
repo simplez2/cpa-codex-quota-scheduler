@@ -5,7 +5,7 @@
 
 Standalone CPA plugin for balanced concurrent or serial Codex account selection, native quota polling,
 5h/weekly/monthly windows, persistent 429 quarantine and optional warmup.
-Source version: **0.3.32**. Published platform builds and checksums are available
+Source version: **0.3.33**. Published platform builds and checksums are available
 from [GitHub Releases](https://github.com/simplez2/cpa-codex-quota-scheduler/releases).
 See [CPA permissions and compatibility](CPA_PERMISSIONS.md) before installation.
 
@@ -406,13 +406,29 @@ local warmup delay.
 The account table exposes the actual placement priority and sorts quota groups
 by the same pool/deadline rules. `selection_priority.rank` describes a group,
 not a promise that a busy, pinned, or already-bound request will use that account.
-`rate_limit_reset_credits_available_count` from native quota responses is shown
-as official available reset credits, with separate known/fresh flags and an
-observation timestamp. Missing counts are unknown, not zero. The local
+Nested `rate_limit_reset_credits.available_count` (and the legacy flat
+`rate_limit_reset_credits_available_count`) is shown as official available reset
+credits. Current `applicable_available_count` is separate. Each card's official
+expiry is fetched through the native reset-credit list and displayed in GMT+8;
+list reads are cached for at most 15 minutes. Missing counts are unknown, not zero. The local
 `observed_reset_count` is `cycle_generation - 1`: observed 5h transitions in the
 current weekly epoch, excluding missed cycles and the first observation. It is
 not official remaining reset credits and never raises selection priority.
-Reset credits are not consumed automatically. A complete, fresh response with
+`reset_credits_auto_use` is **off by default**. Opting in permits one real native
+redemption near the earliest expiry, by default `10m` beforehand (configurable
+from `1m` to `24h`). Identity, plan support, fresh applicability and already-used
+quota are rechecked; the feature does not generate model text. The upstream
+selects the card to consume, and the plugin verifies the earliest card vanished.
+A durable, generation-fenced journal and unique `redeem_request_id` prevent
+replaying a write after timeout, crash or reload. Unknown outcomes stop further
+automatic spending for that account and require administrator review. Confirmed
+redemptions only retry read verification. Preserve `state_path` and its
+`.reset-credits.json` sidecar during upgrades, rollback and migration. The service
+must be running; unsupported/custom adapters, provider restrictions or outages
+can prevent redemption. See [permissions](CPA_PERMISSIONS.md) and the
+[Chinese configuration guide](README.zh-CN.md#官方重置卡与到期自动使用).
+
+A complete, fresh response with
 explicitly absent 5h windows identifies weekly-only backup quota; missing or
 stale evidence remains unconfirmed. Announced provider-wide resets cannot be
 predicted from a local clock; fresh native observations confirm their effect.

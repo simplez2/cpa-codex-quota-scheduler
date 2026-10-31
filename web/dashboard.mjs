@@ -2,7 +2,7 @@ import { resourceBase, readPanelKey, validKey, decodeStored, rememberPanelKey, r
 import { createSettingsEditor, weeklyAllocationLabel, continuitySummary } from './settings.mjs';
 import { concurrencyView, waitReasons, availableQuota } from './concurrency.mjs';
 import { weeklyBudgetPercentPerMinute, formatWeeklyBudgetRate } from './budget.mjs';
-import { quotaPriorityText, resetCreditsText, observedResetsText, compareAccountPriorities } from './priority.mjs';
+import { quotaPriorityText, resetCreditsText, resetCreditDetails, observedResetsText, compareAccountPriorities } from './priority.mjs';
 import { poolWindowView } from './pool.mjs';
 import { createPanelMotion } from './motion.mjs';
 
@@ -277,8 +277,9 @@ function renderAccounts() {
     priority.title='新会话和换号按额度池、已确认重置时间排序；同一优先组内再按周预算分配。已有会话优先保留绑定，忙碌、认证和硬额度限制仍会影响实际选择。';
     info.append(priority);
     const resetCredits=element('span','subtext',resetCreditsText(account));
-    resetCredits.title='来自官方额度查询返回的可用重置次数；未返回不等于 0，不会自动消耗重置卡。'+(account.reset_credits_observed_at?' 观测时间：'+dateText(account.reset_credits_observed_at):'');
+    resetCredits.title='来自官方额度和重置卡明细查询；未返回不等于 0。自动使用由独立开关控制，默认关闭。'+(account.reset_credits_observed_at?' 观测时间：'+dateText(account.reset_credits_observed_at):'');
     info.append(resetCredits);
+    for(const line of resetCreditDetails(account))info.append(element('span','subtext',line));
     if (upstreamPlan && !automatic) info.append(element('span','subtext','上游：'+upstreamPlan+(account.upstream_plan_fresh?'':'（缓存已过期）')));
     if (ban) info.append(element('span','subtext','冷却到期 ' + dateText(ban.reset_at)));
     const pollError=state.quota_polls?.[account.auth_id]?.Error || '';

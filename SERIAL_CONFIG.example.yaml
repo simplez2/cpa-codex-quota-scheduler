@@ -1,4 +1,4 @@
-# Standalone CPA quota scheduler v0.3.32.
+# Standalone CPA quota scheduler v0.3.33.
 plugins:
   enabled: true
   configs:
@@ -63,6 +63,9 @@ plugins:
       half_open_probe_timeout: 15m
       half_open_retry_after: 2m
       prefer_reset_credits: true
+      # Optional: consumes a real reset credit before it expires. OFF by default.
+      reset_credits_auto_use: false
+      reset_credits_auto_use_before: 10m
       window_order: [5h, weekly, monthly]
       # Optional generation via CPA api-call, using the same connection as quota queries.
       warmup_enabled: false

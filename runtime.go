@@ -54,23 +54,29 @@ type quotaWindow struct {
 }
 
 type quotaSnapshot struct {
-	FiveHourLimitStatus     string
-	FiveHourLimitObservedAt time.Time
-	AuthID                  string
-	AuthIndex               string
-	AccountID               string
-	Plan                    quotaPlanObservation
-	Windows                 []quotaWindow
-	ResetCredits            int
-	ResetCreditsKnown       bool
-	ResetCreditsObservedAt  time.Time
-	RefreshedAt             time.Time
-	HeaderObservedAt        time.Time
+	FiveHourLimitStatus              string
+	FiveHourLimitObservedAt          time.Time
+	AuthID                           string
+	AuthIndex                        string
+	AccountID                        string
+	Plan                             quotaPlanObservation
+	Windows                          []quotaWindow
+	ResetCredits                     int
+	ResetCreditsKnown                bool
+	ResetCreditsObservedAt           time.Time
+	ResetCreditsApplicable           int
+	ResetCreditsApplicableKnown      bool
+	ResetCreditsApplicableObservedAt time.Time
+	RefreshedAt                      time.Time
+	HeaderObservedAt                 time.Time
 }
 
 type schedulerRuntimeState struct {
 	authExpiry            map[string]authExpiryState
 	quotaRefreshMu        sync.Mutex
+	resetCreditMu         sync.Mutex
+	resetCredits          map[string]resetCreditState
+	resetCreditInventory  map[string]cpaAuthFileEntry
 	quotaPolls            map[string]quotaPollState
 	quotaRunway           quotaRunwayTracker
 	quotaNative           map[string]quotaSnapshot
@@ -206,6 +212,8 @@ func configureSchedulerRuntime(raw []byte) {
 	schedulerRuntime.mu.Lock()
 	schedulerRuntime.cfg = cfg
 	schedulerRuntime.quotaPolls = make(map[string]quotaPollState)
+	schedulerRuntime.resetCredits = make(map[string]resetCreditState)
+	schedulerRuntime.resetCreditInventory = nil
 	schedulerRuntime.quotaRunway = quotaRunwayTracker{}
 	schedulerRuntime.continuityDemandUntil = make(map[string]time.Time)
 	schedulerRuntime.continuity.clearPacing(time.Now())
@@ -371,10 +379,14 @@ func (s *schedulerRuntimeState) refreshLoop(ctx context.Context) {
 	// failed quota query is non-fatal; serial mode preserves its committed
 	// account while waiting for fresh observations.
 	s.refreshOnce(ctx)
+	s.refreshResetCredits(ctx)
 	s.mu.RLock()
 	interval := s.cfg.RefreshInterval
 	s.mu.RUnlock()
 	if interval < time.Second {
+		interval = 30 * time.Second
+	}
+	if interval > 30*time.Second {
 		interval = 30 * time.Second
 	}
 	ticker := time.NewTicker(interval)
@@ -385,6 +397,7 @@ func (s *schedulerRuntimeState) refreshLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			s.refreshOnce(ctx)
+			s.refreshResetCredits(ctx)
 		}
 	}
 }
@@ -412,6 +425,12 @@ func mergePartialQuotaSnapshot(previous, current quotaSnapshot, now time.Time, s
 		current.ResetCredits = previous.ResetCredits
 		current.ResetCreditsKnown = previous.ResetCreditsKnown
 		current.ResetCreditsObservedAt = previous.ResetCreditsObservedAt
+	}
+	if previous.AuthID == current.AuthID && previous.AuthIndex == current.AuthIndex &&
+		previous.ResetCreditsApplicableObservedAt.After(current.RefreshedAt) && !previous.ResetCreditsApplicableObservedAt.After(now) {
+		current.ResetCreditsApplicable = previous.ResetCreditsApplicable
+		current.ResetCreditsApplicableKnown = previous.ResetCreditsApplicableKnown
+		current.ResetCreditsApplicableObservedAt = previous.ResetCreditsApplicableObservedAt
 	}
 	if previous.FiveHourLimitObservedAt.After(current.FiveHourLimitObservedAt) {
 		current.FiveHourLimitStatus = previous.FiveHourLimitStatus
@@ -1212,6 +1231,7 @@ func (s *schedulerRuntimeState) nextPick(n int) int {
 }
 
 type persistedBanState struct {
+	ResetCredits           map[string]resetCreditState       `json:"reset_credits,omitempty"`
 	HostMarker             string                            `json:"host_marker,omitempty"`
 	Recovery               map[string]recoveryEntry          `json:"recovery_guard,omitempty"`
 	AuthExpiry             map[string]authExpiryState        `json:"auth_expiry,omitempty"`
@@ -1352,6 +1372,17 @@ func (s *schedulerRuntimeState) loadBanStateWithConfirmationMode(path string, re
 	}
 	s.banResetMu.Unlock()
 	s.mu.Lock()
+	if s.resetCredits == nil {
+		s.resetCredits = make(map[string]resetCreditState)
+	}
+	for id, credit := range state.ResetCredits {
+		if replaceConfirmations && s.identities[credit.AuthIndex] != id {
+			continue
+		}
+		if credit.ObservedAt.After(s.resetCredits[id].ObservedAt) {
+			s.resetCredits[id] = credit
+		}
+	}
 	if s.quotaPolls == nil {
 		s.quotaPolls = make(map[string]quotaPollState)
 	}
@@ -1461,6 +1492,7 @@ func (s *schedulerRuntimeState) persistBanState() bool {
 	s.mu.RLock()
 	now := time.Now()
 	authExpiry := cloneAuthExpiryStates(s.authExpiry)
+	resetCredits := cloneResetCreditStates(s.resetCredits)
 	polls := make(map[string]quotaPollState, len(s.quotaPolls))
 	for id, poll := range s.quotaPolls {
 		polls[id] = poll
@@ -1523,9 +1555,10 @@ func (s *schedulerRuntimeState) persistBanState() bool {
 	}
 	s.banResetMu.Unlock()
 	state := persistedBanState{
-		HostMarker: currentRecoveryHostMarker(),
-		Recovery:   s.recovery.snapshot(),
-		QuotaPolls: polls, Quotas: quotas, BalancedSessions: balancedSessions, AuthExpiry: authExpiry,
+		ResetCredits: resetCredits,
+		HostMarker:   currentRecoveryHostMarker(),
+		Recovery:     s.recovery.snapshot(),
+		QuotaPolls:   polls, Quotas: quotas, BalancedSessions: balancedSessions, AuthExpiry: authExpiry,
 		Version:                8,
 		FiveHourPhases:         fiveHourPhases,
 		Bans:                   banStore.snapshot(),
@@ -1858,6 +1891,7 @@ func isJSONEmptyValue(value reflect.Value) bool {
 }
 
 type runtimeQuotaStatus struct {
+	ResetCreditDetails     resetCreditPanelStatus        `json:"reset_credit_details"`
 	SelectionPriority      runtimeQuotaPriorityStatus    `json:"selection_priority"`
 	FiveHourLimitStatus    string                        `json:"five_hour_limit_status,omitempty"`
 	FiveHourPhase          *runtimeFiveHourPhaseStatus   `json:"five_hour_phase,omitempty"`
@@ -2068,6 +2102,7 @@ func runtimeCostProfileFor(model, effort string, samples []float64) runtimeCostP
 func (s *schedulerRuntimeState) status() runtimeStatus {
 	s.mu.RLock()
 	now := time.Now()
+	resetCreditStates := cloneResetCreditStates(s.resetCredits)
 	authExpiry := cloneAuthExpiryStates(s.authExpiry)
 	cfg := s.cfg
 	quotas := make(map[string]quotaSnapshot, len(s.quotas))
@@ -2269,7 +2304,12 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 			ActiveWindows:       evaluation.ActiveWindows,
 			Reason:              evaluation.Reason,
 		}
-		if !snapshot.ResetCreditsObservedAt.IsZero() {
+		item.ResetCreditDetails = resetCreditStatus(resetCreditStates[canonical], snapshot, cfg, now)
+		if details := item.ResetCreditDetails; details.ListFresh && details.CountKnown && !snapshot.ResetCreditsObservedAt.After(resetCreditStates[canonical].ObservedAt) {
+			item.ResetCredits, item.ResetCreditsKnown, item.ResetCreditsFresh = details.Count, true, true
+			item.ResetCreditsObservedAt = details.ObservedAt
+		}
+		if item.ResetCreditsObservedAt == "" && !snapshot.ResetCreditsObservedAt.IsZero() {
 			item.ResetCreditsObservedAt = snapshot.ResetCreditsObservedAt.Format(time.RFC3339)
 		}
 		if phase, exists := fiveHourPhases[canonical]; exists && phase.AuthIndex == snapshot.AuthIndex {
