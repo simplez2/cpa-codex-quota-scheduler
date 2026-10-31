@@ -106,7 +106,7 @@ import (
 
 const (
 	pluginName    = "codex-quota-scheduler"
-	pluginVersion = "0.3.31"
+	pluginVersion = "0.3.32"
 
 	// providerCodex is the CPA provider key for OpenAI Codex (ChatGPT backend).
 	providerCodex = "codex"

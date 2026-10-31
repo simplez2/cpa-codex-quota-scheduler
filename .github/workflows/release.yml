@@ -11,6 +11,7 @@
 #   codex-quota-scheduler_<version>_darwin_arm64.zip     -> codex-quota-scheduler.dylib
 #   codex-quota-scheduler_<version>_windows_amd64.zip    -> codex-quota-scheduler.dll
 #   checksums.txt
+#   release-verification.json
 name: Release Plugin
 
 on:
@@ -108,14 +109,13 @@ jobs:
 
       - name: Pack zip (library at zip root)
         id: pack
-        shell: pwsh
+        shell: bash
         run: |
-          New-Item -ItemType Directory -Force -Path staging | Out-Null
-          Copy-Item codex-quota-scheduler.${{ matrix.ext }} staging/
-          $asset = "codex-quota-scheduler_${{ steps.ver.outputs.version }}_${{ matrix.goos }}_${{ matrix.goarch }}.zip"
-          # Compress-Archive stores the file at the archive root when given a bare file path.
-          Compress-Archive -Path "staging/codex-quota-scheduler.${{ matrix.ext }}" -DestinationPath $asset -Force
-          "asset=$asset" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          asset=$(python .github/scripts/release_assets.py pack \
+            --version '${{ steps.ver.outputs.version }}' --source-commit "$(git rev-parse HEAD)" \
+            --os '${{ matrix.goos }}' --arch '${{ matrix.goarch }}' \
+            --library 'codex-quota-scheduler.${{ matrix.ext }}' --assets .)
+          echo "asset=$asset" >> "$GITHUB_OUTPUT"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -130,6 +130,11 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Checkout release source for verification
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.release_tag || github.ref }}
+
       - name: Compute version
         id: ver
         env:
@@ -144,11 +149,14 @@ jobs:
           path: assets
           merge-multiple: true
 
-      - name: Generate checksums.txt
+      - name: Validate all packages and generate checksums
         run: |
-          cd assets
-          sha256sum *.zip > checksums.txt
-          cat checksums.txt
+          python .github/scripts/release_assets.py verify-set \
+            --version '${{ steps.ver.outputs.version }}' --source-commit "$(git rev-parse HEAD)" \
+            --assets assets --write-checksums
+          python .github/scripts/release_assets.py verify-set \
+            --version '${{ steps.ver.outputs.version }}' --source-commit "$(git rev-parse HEAD)" \
+            --assets assets
 
       - name: Upload assets to GitHub Release
         uses: softprops/action-gh-release@v2
@@ -157,4 +165,5 @@ jobs:
           files: |
             assets/*.zip
             assets/checksums.txt
+            assets/release-verification.json
           generate_release_notes: true
