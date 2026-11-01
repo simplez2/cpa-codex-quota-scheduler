@@ -960,7 +960,9 @@ func (s *schedulerRuntimeState) beginWarmupConcurrency(candidate warmupCandidate
 		}
 	}
 	key := g.keyLocked(aliases)
-	if cfg.Enabled && cfg.AccountConcurrencyEnabled && g.blockedLocked(key, nil, cfg.AccountMaxConcurrency, time.Now()) {
+	// Background activation yields to any foreground work or waiter on this
+	// credential, even when the operator allows several foreground slots.
+	if g.blockedLocked(key, nil, 1, time.Now()) {
 		return "", false
 	}
 	var entropy [16]byte

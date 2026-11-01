@@ -149,6 +149,7 @@ type adqAccountInput struct {
 	LastRoutingReason     string
 	AbsoluteCapacityKnown bool
 	CapacitySource        string
+	WeeklyOnly            bool
 }
 
 type adqAccountMetrics struct {
@@ -191,6 +192,7 @@ type adqAccountMetrics struct {
 	ProviderState              adqProviderState `json:"provider_state"`
 	ProviderRetryAt            time.Time        `json:"provider_retry_at,omitempty"`
 	Eligible                   bool             `json:"eligible"`
+	WeeklyOnly                 bool             `json:"weekly_only,omitempty"`
 	Reason                     string           `json:"reason,omitempty"`
 	ReservationFiveHour        float64          `json:"reservation_5h"`
 	ReservationWeekly          float64          `json:"reservation_weekly"`
@@ -212,6 +214,7 @@ type adqPoolMetrics struct {
 	SchedulerFailure     bool                `json:"scheduler_failure"`
 	CurrentDemandPerHour float64             `json:"current_demand_per_hour"`
 	ForecastDemandP95    float64             `json:"forecast_demand_p95"`
+	DemandKnown          bool                `json:"demand_known"`
 	Accounts             []adqAccountMetrics `json:"accounts,omitempty"`
 }
 
@@ -433,8 +436,12 @@ func adqAssessAccount(in adqAccountInput, p adqPolicy, now time.Time) adqAccount
 		WeeklyDebt: in.WeeklyDebt, ProviderState: in.ProviderState, ProviderRetryAt: in.ProviderRetryAt,
 		ReservationFiveHour: in.ReservationFiveHour, ReservationWeekly: in.ReservationWeekly,
 		SettlingFiveHour: in.SettlingFiveHour, SettlingWeekly: in.SettlingWeekly}
+	m.WeeklyOnly = in.WeeklyOnly
 	if m.H <= 0 {
 		m.H = m.W * p.MaxQuotaRatio5h
+	}
+	if in.WeeklyOnly {
+		m.H = 0
 	}
 	hardW, hardH := adqHardEffectiveQuota(in, p)
 	m.w, m.h = adqEffectiveQuota(in, p)
@@ -535,6 +542,14 @@ func adqAssessAccount(in adqAccountInput, p adqPolicy, now time.Time) adqAccount
 	if in.Sticky {
 		gateW, gateH = hardW, hardH
 	}
+	if in.WeeklyOnly {
+		gateH = 1 // confirmed absent 5h window; the weekly hard gate remains.
+		m.HEffective, m.h = 0, 0
+		m.Runway5hSeconds = math.NaN()
+		m.RunwayFinalSeconds = m.RunwayWeekSeconds
+		m.PFillCurrent, m.PFillFull = math.NaN(), math.NaN()
+		m.QLockMean, m.QLockP95 = math.NaN(), math.NaN()
+	}
 	m.Eligible = in.Healthy && providerReady && gateW > 0 && gateH > 0
 	if !in.Healthy {
 		m.Reason = "unhealthy"
@@ -551,7 +566,7 @@ func adqAssessAccount(in adqAccountInput, p adqPolicy, now time.Time) adqAccount
 	} else if providerState == adqProviderQuota {
 		m.Reason = "quota_exhausted"
 		m.State = "ACCOUNT_DEAD"
-	} else if in.Sticky && (m.w <= 0 || m.h <= 0) {
+	} else if in.Sticky && (m.w <= 0 || (!in.WeeklyOnly && m.h <= 0)) {
 		m.State = "READY"
 		m.Reason = "sticky_settlement_pending"
 	} else {
@@ -637,14 +652,19 @@ func compareADQLeximin(a, b []float64) int {
 }
 
 func adqComputePool(accounts []adqAccountMetrics, demandPerHour float64, p adqPolicy, now time.Time) adqPoolMetrics {
-	pool := adqPoolMetrics{Accounts: append([]adqAccountMetrics(nil), accounts...), CurrentDemandPerHour: maxADQ(demandPerHour, 0)}
+	pool := adqPoolMetrics{Accounts: append([]adqAccountMetrics(nil), accounts...), CurrentDemandPerHour: demandPerHour,
+		DemandKnown: finiteADQ(demandPerHour) && demandPerHour > 0}
 	totalW, totalH := 0.0, 0.0
 	totalCapacity := 0.0
 	for _, m := range accounts {
 		pool.FullWidth += int(math.Round(m.FullWidthContribution))
 		pool.EffectiveWidth += m.EffectiveWidthContribution
 		totalW += m.WEffective
-		totalH += m.HEffective
+		if m.WeeklyOnly {
+			totalH += m.WEffective
+		} else {
+			totalH += minADQ(m.HEffective, m.WEffective)
+		}
 		totalCapacity += minADQ(m.WEffective, m.H)
 	}
 	horizon := p.ForecastHorizon
@@ -664,33 +684,8 @@ func adqComputePool(accounts []adqAccountMetrics, demandPerHour float64, p adqPo
 	} else {
 		pool.M5h = math.Inf(1)
 	}
-	buckets := 1
-	if p.PhaseBucketSize > 0 && p.FiveHourWindow > 0 {
-		buckets = int(math.Ceil(p.FiveHourWindow.Seconds() / p.PhaseBucketSize.Seconds()))
-		if buckets < 1 {
-			buckets = 1
-		}
-	}
-	bucketCap := make([]float64, buckets)
-	for _, m := range accounts {
-		if m.PhaseBucket >= 0 && m.PhaseBucket < buckets {
-			bucketCap[m.PhaseBucket] += minADQ(m.HEffective, m.WEffective)
-		} else {
-			for i := range bucketCap {
-				bucketCap[i] += minADQ(m.HEffective, m.WEffective) / float64(buckets)
-			}
-		}
-	}
-	bucketDemand := maxADQ(demandPerHour, 0) * p.PhaseBucketSize.Hours()
-	if bucketDemand <= 0 {
-		pool.MPhase = math.Inf(1)
-	} else {
-		pool.MPhase = math.Inf(1)
-		for _, c := range bucketCap {
-			pool.MPhase = minADQ(pool.MPhase, c/bucketDemand)
-		}
-	}
-	pool.MSystem = minADQ(pool.MWeek, minADQ(pool.M5h, pool.MPhase))
+	pool.MPhase = adqRecoveryMargin(accounts, demandPerHour, horizon, now)
+	pool.MSystem = minADQ(pool.MWeek, pool.MPhase)
 	pool.PhaseHealth = pool.MPhase
 	switch {
 	case pool.MWeek < p.RiskModeThreshold:
@@ -705,10 +700,12 @@ func adqComputePool(accounts []adqAccountMetrics, demandPerHour float64, p adqPo
 		pool.Bottleneck = "BALANCED"
 	}
 	if pool.MSystem < p.RiskModeThreshold {
-		pool.CapacityFailure = totalCapacity < demand5
+		pool.CapacityFailure = pool.MPhase < 1 && totalCapacity < demand5
 	}
-	if !finiteADQ(pool.MSystem) {
-		pool.MSystem = 1e9
+	if !pool.DemandKnown {
+		pool.CurrentDemandPerHour, pool.ForecastDemandP95 = math.NaN(), math.NaN()
+		pool.MWeek, pool.M5h, pool.MPhase, pool.MSystem, pool.PhaseHealth = math.NaN(), math.NaN(), math.NaN(), math.NaN(), math.NaN()
+		pool.Bottleneck = "FORECAST_UNKNOWN"
 	}
 	_ = now
 	return pool
@@ -777,7 +774,9 @@ func adqChooseWithAllocation(accounts []adqAccountInput, demandPerHour, requestC
 					better = true
 				}
 			}
-			if allocation != nil && chosen >= 0 {
+			if chosen >= 0 && after.FullWidth != bestAfter.FullWidth {
+				better = after.FullWidth > bestAfter.FullWidth
+			} else if allocation != nil && chosen >= 0 {
 				score, best := allocation[metrics[i].AuthID], allocation[metrics[chosen].AuthID]
 				if score.Credit != best.Credit {
 					better = score.Credit > best.Credit
@@ -800,7 +799,10 @@ func adqChooseWithAllocation(accounts []adqAccountInput, demandPerHour, requestC
 		bestAfter = adqComputePool(afterMetrics, demandPerHour, p, now)
 	}
 	m := metrics[chosen]
-	reason := fmt.Sprintf("选择 %s：保持 FullWidth=%d，当前 p_fill=%.0f%%，完整 5h p_fill=%.0f%%，预计 Q_lock P95=%.3g，weekly waterline=%.1f%%，runway=%.0f 分钟。", m.AuthID, before.FullWidth, m.PFillCurrent*100, m.PFillFull*100, m.QLockP95, m.WeeklyWaterline*100, m.RunwayFinalSeconds/60)
+	reason := fmt.Sprintf("选择 %s：完整 5h 来源 %d → %d，周水位 %.1f%%；同级按额度份额分配。", m.AuthID, before.FullWidth, bestAfter.FullWidth, m.WeeklyWaterline*100)
+	if !before.DemandKnown {
+		reason += " 需求预测不足，使用普通调度。"
+	}
 	if allocation != nil {
 		reason = "按周额度分配策略的公平份额调度；" + reason
 	}

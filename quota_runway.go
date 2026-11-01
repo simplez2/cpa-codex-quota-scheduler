@@ -41,6 +41,16 @@ type quotaRunwayObservation struct {
 type quotaRunwayTracker struct {
 	bindings map[string]string
 	windows  map[quotaRunwayKey]quotaRunwayObservation
+	// A separate diagnostic tracker may follow a slower polling cadence. The
+	// admission/reserve tracker keeps its original short horizon.
+	maxSampleGap time.Duration
+}
+
+func (t *quotaRunwayTracker) sampleGap() time.Duration {
+	if t.maxSampleGap > quotaRunwayMaxSampleGap && t.maxSampleGap <= 2*time.Hour {
+		return t.maxSampleGap
+	}
+	return quotaRunwayMaxSampleGap
 }
 
 type quotaRunwayWindowAssessment struct {
@@ -90,6 +100,7 @@ func quotaRunwaySameReset(a, b time.Time) bool {
 // Equal timestamps do not add samples. Discontinuities establish a new baseline
 // and require two subsequent positive increments before predicting again.
 func (t *quotaRunwayTracker) Observe(snapshot quotaSnapshot, now time.Time) {
+	gap := t.sampleGap()
 	for _, window := range snapshot.Windows {
 		if window.Source != quotaSourceProbe {
 			return
@@ -134,7 +145,7 @@ func (t *quotaRunwayTracker) Observe(snapshot quotaSnapshot, now time.Time) {
 		previous, exists := t.windows[key]
 		elapsed := window.ObservedAt.Sub(previous.observedAt)
 		if !exists || !quotaRunwaySameReset(previous.resetAt, window.ResetAt) ||
-			previous.windowSeconds != window.WindowSeconds || elapsed < 0 || elapsed > quotaRunwayMaxSampleGap ||
+			previous.windowSeconds != window.WindowSeconds || elapsed < 0 || elapsed > gap ||
 			window.UsedPercent < previous.usedPercent {
 			t.windows[key] = baseline
 			continue
@@ -149,7 +160,7 @@ func (t *quotaRunwayTracker) Observe(snapshot quotaSnapshot, now time.Time) {
 		// historical burst classified as a current consumption rate forever.
 		kept := previous.samples[:0]
 		for _, sample := range previous.samples {
-			if window.ObservedAt.Sub(sample.at) <= quotaRunwayMaxSampleGap {
+			if window.ObservedAt.Sub(sample.at) <= gap {
 				kept = append(kept, sample)
 			}
 		}

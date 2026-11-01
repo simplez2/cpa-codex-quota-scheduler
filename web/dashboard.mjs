@@ -5,6 +5,7 @@ import { weeklyBudgetPercentPerMinute, formatWeeklyBudgetRate } from './budget.m
 import { quotaPriorityText, resetCreditsText, resetCreditDetails, observedResetsText, compareAccountPriorities } from './priority.mjs';
 import { poolWindowView } from './pool.mjs';
 import { createPanelMotion } from './motion.mjs';
+import { warmupRecords } from './warmup-history.mjs';
 
 const $ = id => document.getElementById(id);
 const motion = createPanelMotion();
@@ -113,7 +114,7 @@ function adqProviderText(value) {
   return labels[value] || value || '正常';
 }
 function adqBottleneckText(value) {
-  const labels = {BALANCED:'均衡',WEEK_CONSTRAINED:'周额度受限',PHASE_CONSTRAINED:'阶段受限',RISK:'风险区',TAIL_DRAIN:'尾部消耗',CAPACITY_FAILURE:'容量不足'};
+  const labels = {BALANCED:'均衡',WEEK_CONSTRAINED:'周额度受限',PHASE_CONSTRAINED:'阶段受限',RISK:'风险区',FORECAST_UNKNOWN:'需求预测不足，按普通调度运行',TAIL_DRAIN:'尾部消耗',CAPACITY_FAILURE:'容量不足'};
   return labels[value] || value || '未知';
 }
 function adqMetricPairs(adq) {
@@ -415,14 +416,16 @@ function renderPolicy() {
   }
 }
 function renderWarmups() {
+  renderFiveHourWarmups();
   $('warmup-enabled').textContent = state.warmup_enabled ? '已启用' : '已关闭';
-  $('warmup-description').textContent = state.warmup_enabled ? '按账号和额度周期记录结果。已确认的周期不再预热，等待确认和失败记录也受冷却约束。' : '当前不发起预热请求；已有记录继续保留。真实请求与额度查询仍可确认周期已开始。';
+  $('warmup-description').textContent = (state.warmup_enabled ? '一次调用可共同启动周与 5h；同一调用合并展示。' : '当前不发起预热请求。') + '记录保留最近 7 天、最多 256 次；额度重置后仍可查看，重试继续受冷却和预算限制。';
   const list = $('warmups'); list.replaceChildren();
-  for (const warmup of state.warmups || []) {
+  const records=warmupRecords(state);
+  for (const warmup of records) {
     const item = element('li');
     const line = element('div','warmup-line');
     const outcomeLabel = warmup.state==='failed' && warmup.dispatch_state==='not_sent' ? '未发送 · 等待重试' : warmup.state==='failed' && warmup.dispatch_state==='uncertain' ? '结果未知 · 暂停重复请求' : warmupStates[warmup.state] || warmup.state;
-    line.append(element('span','warmup-id',warmup.auth_id + ' · ' + warmup.window),element('span','badge' + (warmup.blocked ? ' warning' : ''),outcomeLabel));
+    line.append(element('span','warmup-id',warmup.auth_id + ' · ' + warmup.covered_windows.join(' + ')),element('span','badge' + (warmup.blocked ? ' warning' : ''),outcomeLabel));
     item.append(line,element('div','subtext','记录于 ' + dateText(warmup.outcome_at || warmup.activated_at || warmup.completed_at || warmup.attempted_at)));
     if (timestamp(warmup.suppress_until)) item.append(countdown(warmup.suppress_until,'重新校验倒计时 '));
     if (timestamp(warmup.suppress_until)) item.append(element('div','subtext',(warmup.dispatch_state==='not_sent'?'最早重试时间 ':'抑制重复预热至 ') + dateText(warmup.suppress_until)));
@@ -430,13 +433,50 @@ function renderWarmups() {
       const errors={auth_binding_stale:'CPA 中的账号当前不可用，请求尚未发送。',auth_binding_changed:'CPA 账号绑定已变更，等待最新额度确认。',cpa_inventory_unavailable:'CPA 账号列表暂时不可用，请求尚未发送。',management_key_unavailable:'无法读取 CPA 管理密钥，请求尚未发送。',timeout:'请求超时，等待确认是否已执行。',warmup_failed:'旧版未保存具体原因，需核对 CPA 日志。'};
       item.append(element('div','subtext error',errors[warmup.error]||warmup.error));
     }
-    if(warmup.blocked)item.append(action('允许再次重试',()=>mutate('/warmup-retry','POST',{auth_id:warmup.auth_id},'已解除预热重试阻止；仍遵循冷却、间隔和每日预算。')));
-    else if(warmup.error)item.append(action('重新安排预热',()=>confirmOperation('重新安排此账号的预热','仅在确认上次请求未执行或原因已修复后继续。仍遵循账号冷却、最小间隔和每日预算。',()=>mutate('/warmup-retry','POST',{auth_id:warmup.auth_id},'已重新安排；下一轮先检查周期是否已激活。'))));
+    if(warmup.current&&warmup.blocked)item.append(action('允许再次重试',()=>mutate('/warmup-retry','POST',{auth_id:warmup.auth_id},'已解除预热重试阻止；仍遵循冷却、间隔和每日预算。')));
+    else if(warmup.current&&warmup.error)item.append(action('重新安排预热',()=>confirmOperation('重新安排此账号的预热','仅在确认上次请求未执行或原因已修复后继续。仍遵循账号冷却、最小间隔和每日预算。',()=>mutate('/warmup-retry','POST',{auth_id:warmup.auth_id},'已重新安排；下一轮先检查周期是否已激活。'))));
     list.append(item);
   }
   if (!list.children.length) list.append(element('li','subtext','暂无预热记录'));
   $('retry-all').disabled=operating||editor.isSaving()||!(state.warmups||[]).some(w=>w.blocked);
 }
+function renderFiveHourWarmups() {
+  const list=$('five-hour-warmup-accounts');list.replaceChildren();
+  const now=Date.now(),enabled=state.warmup_enabled;
+  $('five-hour-warmup-mode').textContent=enabled?'自动尽量错峰 · 请求优先':'自动启动已关闭';
+  const accounts=(state.snapshots||[]).filter(a=>(a.windows||[]).some(w=>w.window==='5h'));
+  let active=0,waiting=0;
+  for(const account of accounts) {
+    const five=account.windows.find(w=>w.window==='5h'),phase=account.five_hour_phase||{};
+    const planned=timestamp(phase.activate_not_before),isFuture=planned&&planned.getTime()>now;
+    const picked=Date.parse(state.balanced_accounts?.[account.auth_id]?.last_picked||'');
+    const busy=(state.concurrency?.credentials?.[account.auth_id]?.active||0)>0||state.balanced_accounts?.[account.auth_id]?.pending_estimate>0||now-picked<60000;
+    let label;
+    if(five.cycle_started){active++;label='本轮已启动';}
+    else if(!enabled)label='后台 5h 预热已关闭';
+    else if(!account.eligible)label='暂不预热：'+({serial_threshold:'达到已设交接阈值',limit_reached:'额度已耗尽',not_allowed:'官方限制'}[account.reason]||account.reason||'等待额度确认');
+    else if(busy)label='本账号近期有调用，等待执行或额度确认';
+    else if(!account.fresh)label='等待新额度观测';
+    else if(phase.anchor_mode==='FIXED_PROVIDER_WINDOW')label='官方固定周期 · 正常预热';
+    else if(isFuture){waiting++;label='等待错峰时间';}
+    else if(planned)label='已到计划时间 · 等待预热检查';
+    else label='等待预热安排 · 周/月额度优先';
+    const item=element('li'),line=element('div','warmup-line');
+    line.append(element('span','warmup-id',account.auth_id),element('span','badge',label));item.append(line);
+    if(five.cycle_started)item.append(element('div','subtext','官方本轮重置：'+dateText(five.reset_at)));
+    else if(enabled&&planned){
+      item.append(element('div','subtext','本地预热计划：'+dateText(phase.activate_not_before)));
+      if(isFuture)item.append(countdown(phase.activate_not_before,'距离预热 '));
+      else item.append(element('div','subtext','错过时间不取消预热；额度、同账号占用和发送间隔仍需满足。'));
+    }
+    const record=fiveHourWarmupRecord(account.auth_id);
+    if(record)item.append(element('div','subtext','最近 5h 预热：'+dateText(record.outcome_at||record.attempted_at)+' · '+(warmupStates[record.state]||record.state)));
+    list.append(item);
+  }
+  $('five-hour-warmup-summary').textContent=accounts.length+' 个有 5h 限制的账号 · 已启动 '+active+' · 未启动 '+(accounts.length-active)+' · 等待错峰 '+waiting;
+  if(!accounts.length)list.append(element('li','subtext','当前没有已确认的 5h 限额账号；周/月预热继续独立工作。'));
+}
+function fiveHourWarmupRecord(id) {return warmupRecords(state).find(record=>record.auth_id===id&&record.covered_windows.includes('5h'));}
 function renderQuotaEpoch() {
   const epoch=state.quota_epoch||{}, badge=$('epoch-badge'), description=$('epoch-description'), metrics=$('epoch-metrics'), accounts=$('epoch-accounts');
   if(!badge||!description||!metrics||!accounts)return;

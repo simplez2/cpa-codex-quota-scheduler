@@ -11,7 +11,7 @@ import (
 // The resource namespace is public. Embed only static assets; account state and
 // credentials must continue to travel through CPA's authenticated management API.
 //
-//go:embed web/index.html web/dashboard.css web/dashboard.mjs web/session.mjs web/settings.mjs web/concurrency.mjs web/budget.mjs web/pool.mjs web/motion.mjs web/priority.mjs
+//go:embed web/index.html web/dashboard.css web/dashboard.mjs web/session.mjs web/settings.mjs web/concurrency.mjs web/budget.mjs web/pool.mjs web/motion.mjs web/priority.mjs web/warmup-history.mjs
 var dashboardFiles embed.FS
 
 const dashboardResourcePrefix = "/v0/resource/plugins/" + pluginName
@@ -28,6 +28,7 @@ func dashboardResources() []pluginapi.ResourceRoute {
 		{Path: "/priority.mjs"},
 		{Path: "/pool.mjs"},
 		{Path: "/motion.mjs"},
+		{Path: "/warmup-history.mjs"},
 	}
 }
 
@@ -55,6 +56,8 @@ func dashboardResource(method, path string) (pluginapi.ManagementResponse, bool)
 		file, contentType = "priority.mjs", "text/javascript; charset=utf-8"
 	case dashboardResourcePrefix + "/pool.mjs":
 		file, contentType = "pool.mjs", "text/javascript; charset=utf-8"
+	case dashboardResourcePrefix + "/warmup-history.mjs":
+		file, contentType = "warmup-history.mjs", "text/javascript; charset=utf-8"
 	case dashboardResourcePrefix + "/motion.mjs":
 		file, contentType = "motion.mjs", "text/javascript; charset=utf-8"
 	default:

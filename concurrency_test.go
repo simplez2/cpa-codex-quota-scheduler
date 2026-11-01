@@ -306,6 +306,7 @@ func TestAccountConcurrencyWarmupSharesForegroundSlot(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := len(s.warmupAttempts)
+	s.cfg.AccountMaxConcurrency = 3
 	s.selectionMu.Lock()
 	_, ok = s.beginWarmupConcurrency(candidate, s.cfg)
 	s.selectionMu.Unlock()

@@ -215,7 +215,14 @@ func (s *schedulerRuntimeState) nextFiveHourActivationLocked(id string, now time
 			continue
 		}
 		_, weight, _ := resolvedQuotaPlan(s.cfg, other, snapshot, now)
-		occupied[bucket] += math.Max(1, weight)
+		// A nearly empty weekly reservoir cannot back a whole future 5h.
+		backing := 1.0
+		for _, w := range snapshot.Windows {
+			if normalizeWindowClass(w.Class) == "weekly" {
+				backing = math.Min(1, math.Max(0, 100-w.UsedPercent)/(100*defaultADQPolicy().MaxQuotaRatio5h))
+			}
+		}
+		occupied[bucket] += math.Max(.01, weight*backing)
 	}
 	if !ready {
 		return now
@@ -277,6 +284,12 @@ func (s *schedulerRuntimeState) planFiveHourWarmups(candidates []warmupCandidate
 		if !phase.PlannedResetAt.Equal(phase.ActiveResetAt) || phase.ActivateAt.IsZero() {
 			phase.PlannedResetAt = phase.ActiveResetAt
 			phase.ActivateAt = s.nextFiveHourActivationLocked(candidate.Snapshot.AuthID, now)
+			s.fiveHourPhases[candidate.Snapshot.AuthID] = phase
+			changed = true
+		}
+		deadline := s.rotationActivationDeadlineLocked(candidate.Snapshot.AuthID, phase.ActivateAt, now)
+		if deadline.Before(phase.ActivateAt) {
+			phase.ActivateAt = deadline
 			s.fiveHourPhases[candidate.Snapshot.AuthID] = phase
 			changed = true
 		}

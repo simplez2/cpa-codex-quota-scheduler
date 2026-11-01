@@ -300,6 +300,47 @@ func TestWarmupBudgetConfigValidation(t *testing.T) {
 	}
 }
 
+func TestBalancedForegroundDoesNotStarveIdleSiblingWarmup(t *testing.T) {
+	resetBanStoreForTest()
+	t.Cleanup(resetBanStoreForTest)
+	key := filepath.Join(t.TempDir(), "key")
+	if err := os.WriteFile(key, []byte("test-key"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v0/management/auth-files":
+			_ = json.NewEncoder(w).Encode(map[string]any{"files": []cpaAuthFileEntry{
+				{ID: "a", AuthIndex: "idx-a", Provider: "codex", Status: "active", Note: "imported account"},
+				{ID: "b", AuthIndex: "idx-b", Provider: "codex", Status: "active", Note: "imported account"},
+			}})
+		case "/v0/management/api-call":
+			var call cpaAPICallRequest
+			if json.NewDecoder(r.Body).Decode(&call) != nil || call.AuthIndex != "idx-b" {
+				t.Error("warmup targeted foreground credential instead of idle sibling")
+			}
+			calls.Add(1)
+			_ = json.NewEncoder(w).Encode(cpaAPICallResponse{StatusCode: 200, Body: `{"status":"completed"}`})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	state := newManagedRuntimeForTest(t, filepath.Join(t.TempDir(), "state.json"))
+	state.cfg.WarmupEnabled, state.cfg.SchedulerMode = true, "balanced"
+	state.cfg.CPAManagementURL, state.cfg.CPAManagementKeyFile = server.URL+"/v0/management/api-call", key
+	now := time.Now()
+	state.quotas = map[string]quotaSnapshot{"a": readyWarmupQuota("a", now), "b": readyWarmupQuota("b", now)}
+	state.balancedAccounts = map[string]*balancedAccount{"a": {LastPicked: now, Pending: []balancedPending{{At: now}}}}
+	claimManagedRuntimeForTest(t, state)
+	state.scheduleWarmup(context.Background(), nil)
+	state.wg.Wait()
+	if calls.Load() != 1 || len(state.warmupAttempts) != 1 || state.warmupAttempts[0].AuthID != "b" {
+		t.Fatalf("idle sibling was starved: calls=%d attempts=%+v", calls.Load(), state.warmupAttempts)
+	}
+}
+
 func TestScheduleWarmupDoesNotSendWhenAdmissionCannotPersist(t *testing.T) {
 	resetBanStoreForTest()
 	t.Cleanup(resetBanStoreForTest)

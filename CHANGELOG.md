@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.3.35 — 2026-11-02
+
+- Unify weekly bootstrap and subsequent five-hour rotation under one activation
+  switch. A generation jointly starts unstarted windows; first-round clustering
+  is allowed, later activation staggers best effort, and real traffic wins.
+- Scope foreground warmup protection to the credential, preventing an active
+  sibling from starving the whole pool. Advance idle activation when observed
+  demand cannot bridge the wait; preserve budgets, backoff and duplicate guards.
+- Connect cadence-aware native-quota forecasts without weakening admission
+  reserves. Represent unknown demand honestly, evaluate coverage along confirmed
+  reset events, and cap future refills by remaining weekly quota.
+- Protect future full-width sources before same-tier fair-share tie breaking;
+  retain session affinity and five-hour/deadline placement priorities. Confirmed
+  weekly-only backups no longer appear as five-hour exhausted or add fake width.
+- Keep seven days / 256 activation outcomes independently of live deduplication
+  state; combine sibling windows from one actual call in the panel.
+
 ## 0.3.34 — 2026-11-01
 
 - Dismiss successful panel notifications automatically after three seconds,

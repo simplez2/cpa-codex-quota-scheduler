@@ -5,7 +5,7 @@
 
 Standalone CPA plugin for balanced concurrent or serial Codex account selection, native quota polling,
 5h/weekly/monthly windows, persistent 429 quarantine and optional warmup.
-Source version: **0.3.34**. Published platform builds and checksums are available
+Source version: **0.3.35**. Published platform builds and checksums are available
 from [GitHub Releases](https://github.com/simplez2/cpa-codex-quota-scheduler/releases).
 See [CPA permissions and compatibility](CPA_PERMISSIONS.md) before installation.
 
@@ -486,6 +486,24 @@ the global attempt ledger and does not clear account bans or successful cycles.
 
 Warmup uses conservative admission controls, separate from client failover:
 
+- The **周期启动 / 5h 轮转** panel has one activation switch. One request
+  jointly starts the weekly and first five-hour windows; first-round clustering
+  is allowed. Later five-hour cycles stagger automatically, with per-credential
+  foreground protection. Real requests always take precedence.
+- Native quota deltas feed a separate cadence-aware rotation forecast. Missing
+  demand remains unknown and uses ordinary scheduling. Recovery coverage follows
+  confirmed resets and weekly backing; an empty phase bucket is not a shortage.
+  Same-tier fair-share scores cannot unnecessarily reduce future full-width
+  accounts. Forecasts can advance background activation, never reject requests.
+- Outcomes persist for seven days, capped at 256 actual attempts, independently
+  from retry/deduplication state. Weekly and five-hour sibling records from one
+  request are combined in the panel.
+- Subsequent idle five-hour cycles use 15-minute slots spread over five hours.
+  A missed slot remains due; unknown/fixed provider clocks do not require a
+  reanchoring guarantee. Natural calls always bypass the background plan.
+  Foreground protection is per credential, so another busy credential cannot
+  starve the idle pool. The same credential's running work and waiters retain
+  priority even when its configured concurrency limit has spare capacity.
 - `warmup_min_interval: 1m` spaces attempts across the entire pool;
   `warmup_max_per_day: 8` caps admissions per account in a rolling 24-hour window.
   Failures count. The ledger survives restarts, hot reloads and manual retries.

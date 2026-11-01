@@ -1,4 +1,4 @@
-# Standalone CPA quota scheduler v0.3.34.
+# Standalone CPA quota scheduler v0.3.35.
 plugins:
   enabled: true
   configs:
@@ -69,6 +69,7 @@ plugins:
       window_order: [5h, weekly, monthly]
       # Optional generation via CPA api-call, using the same connection as quota queries.
       warmup_enabled: false
+      # One call starts weekly and first 5h together; later 5h cycles stagger best effort.
       warmup_model: gpt-5.6-luna
       warmup_retry_after: 15m
       # Pool-wide limits; failures count and reloads do not reset the budget.

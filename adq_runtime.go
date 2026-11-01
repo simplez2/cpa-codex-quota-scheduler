@@ -335,6 +335,11 @@ func (s *schedulerRuntimeState) adqInputForChoiceLocked(choice serialCandidate, 
 	}
 	pending := adqPendingWithoutReservation(account, s.adqReservations, now)
 	assessments := s.quotaRunway.Assess(snapshot, s.cfg, now)
+	burnMean, burnP90, burnP95, burnKnown := s.rotationBurnLocked(snapshot, "5h", fiveCapacity, now)
+	if !burnKnown {
+		burnMean = adqRunwayBurnForClass(assessments, "5h", fiveCapacity)
+		burnP90, burnP95 = burnMean, burnMean
+	}
 	circuit := s.adqCircuitLocked(id, now)
 	if circuit.State == "" && rawID != id {
 		circuit = s.adqCircuitLocked(rawID, now)
@@ -357,10 +362,10 @@ func (s *schedulerRuntimeState) adqInputForChoiceLocked(choice serialCandidate, 
 		FiveHourCapacity:      fiveCapacity,
 		FiveHourRemaining:     fiveCapacity * clampADQ(choice.FiveHourRemaining, 0, 100) / 100,
 		WeeklyResetAt:         adqResetForClass(snapshot, "weekly"),
-		FiveHourResetAt:       adqResetForClass(snapshot, "5h"),
-		BurnMean:              adqRunwayBurnForClass(assessments, "5h", fiveCapacity),
-		BurnP90:               adqRunwayBurnForClass(assessments, "5h", fiveCapacity),
-		BurnP95:               adqRunwayBurnForClass(assessments, "5h", fiveCapacity),
+		FiveHourResetAt:       choice.FiveHourResetAt,
+		BurnMean:              burnMean,
+		BurnP90:               burnP90,
+		BurnP95:               burnP95,
 		ReservationFiveHour:   reservationsFive,
 		ReservationWeekly:     reservationsWeek,
 		SettlingFiveHour:      settlingFive,
@@ -460,7 +465,7 @@ func (s *schedulerRuntimeState) adqRouteChoicesWithAllocationLocked(req pluginap
 		if balanced {
 			allocation, weights = s.balancedADQAllocationLocked(available, inputs, cost, now, policy)
 		}
-		decision, ok := adqChooseWithAllocation(inputs, 0, cost, policy, now, allocation)
+		decision, ok := adqChooseWithAllocation(inputs, s.adqForecastDemandLocked(now), cost, policy, now, allocation)
 		if !ok {
 			return "", adqReservation{}, false, true
 		}
