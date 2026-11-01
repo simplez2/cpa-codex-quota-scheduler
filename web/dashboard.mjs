@@ -17,6 +17,7 @@ const reasons = {weekly_budget_rebalance:'按周日均预算重新平衡',weekly
 const warmupStates = {confirmed:'已确认激活',pending_confirmation:'等待额度确认',attempted:'已尝试',blocked:'已停止重试',failed:'等待重试'};
 const epochAccountStates = {pending:'等待预热',natural:'真实调用已激活',warmed:'自动预热已完成',blocked:'需处理后重试'};
 let state = null, key = '', manual = false, busy = false, timer = null, failures = 0, authEpoch = 0, operating = false;
+let feedbackTimer = null;
 let storedKey = readStoredKey();
 let currentView = 'overview', pendingOperation = null;
 let pendingRemember = false;
@@ -178,7 +179,15 @@ function banFor(account) {
   return (state.bans || []).find(b=>b.auth_id === account.auth_id || (account.auth_index && b.auth_id === account.auth_index));
 }
 function usable(account) { return availableQuota(account,state.quota_probe_on_demand) && !banFor(account); }
-function feedback(message,kind='error') { $('feedback').textContent=message; $('feedback').dataset.kind=kind; $('feedback').hidden=!message; motion.feedback($('feedback')); }
+function feedback(message,kind='error') {
+  clearTimeout(feedbackTimer);feedbackTimer=null;
+  const node=$('feedback');
+  node.textContent=message;node.dataset.kind=kind;node.hidden=!message;
+  motion.feedback(node);
+  if(message && kind==='success')feedbackTimer=setTimeout(()=>{
+    node.hidden=true;node.textContent='';feedbackTimer=null;
+  },3000);
+}
 async function api(path,options={}) {
   if(!key)throw new Error('请先连接当前 CPA。');
   const epoch=authEpoch,controller=new AbortController(),timeout=setTimeout(()=>controller.abort(),10000);
@@ -502,7 +511,7 @@ function render() {
 function notice(message) { $('notice').textContent = message; $('notice').hidden = !message; }
 function login(message) {
   authEpoch++; key = ''; state = null; manual = false;
-  editor.reset();$('feedback').hidden=true;$('operation-dialog').close();pendingOperation=null;$('bans-list').replaceChildren();
+  editor.reset();feedback('');$('operation-dialog').close();pendingOperation=null;$('bans-list').replaceChildren();
   $('accounts-body').replaceChildren(); $('warmups').replaceChildren();
   $('epoch-metrics')?.replaceChildren(); $('epoch-accounts')?.replaceChildren();
   $('adq-metrics')?.replaceChildren(); $('adq-circuits')?.replaceChildren(); $('adq-accounts')?.replaceChildren();

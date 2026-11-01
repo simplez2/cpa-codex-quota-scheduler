@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.34 — 2026-11-01
+
+- Dismiss successful panel notifications automatically after three seconds,
+  including the saved-and-applied confirmation. New messages replace the prior
+  dismissal timer so an earlier success cannot hide a newer error. Clear the
+  timer when returning to login.
+
 ## 0.3.33 — 2026-11-01
 
 - Recognize nested native `rate_limit_reset_credits.available_count` and keep

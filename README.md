@@ -5,7 +5,7 @@
 
 Standalone CPA plugin for balanced concurrent or serial Codex account selection, native quota polling,
 5h/weekly/monthly windows, persistent 429 quarantine and optional warmup.
-Source version: **0.3.33**. Published platform builds and checksums are available
+Source version: **0.3.34**. Published platform builds and checksums are available
 from [GitHub Releases](https://github.com/simplez2/cpa-codex-quota-scheduler/releases).
 See [CPA permissions and compatibility](CPA_PERMISSIONS.md) before installation.
 
