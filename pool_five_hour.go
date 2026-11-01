@@ -1,6 +1,7 @@
 package main
 
 import (
+	"math"
 	"sort"
 	"time"
 )
@@ -61,12 +62,43 @@ func poolFiveHourLimitStatus(native quotaSnapshot, observed quotaSnapshot, now t
 
 type runtimePoolFiveHourStatus struct {
 	runtimePoolWeeklyStatus
-	InventoryAccounts       int      `json:"inventory_accounts"`
-	ExcludedAccounts        int      `json:"excluded_accounts"`
-	NoLimitReportedAccounts int      `json:"no_limit_reported_accounts"`
-	UnclassifiedAccounts    int      `json:"unclassified_accounts"`
-	ScopeComplete           bool     `json:"scope_complete"`
-	InventoryAuthIDs        []string `json:"inventory_auth_ids"`
+	InventoryAccounts         int      `json:"inventory_accounts"`
+	ExcludedAccounts          int      `json:"excluded_accounts"`
+	NoLimitReportedAccounts   int      `json:"no_limit_reported_accounts"`
+	UnclassifiedAccounts      int      `json:"unclassified_accounts"`
+	WeeklyBlockedAccounts     int      `json:"weekly_blocked_accounts"`
+	WeeklyUnconfirmedAccounts int      `json:"weekly_unconfirmed_accounts"`
+	ScopeComplete             bool     `json:"scope_complete"`
+	InventoryAuthIDs          []string `json:"inventory_auth_ids"`
+}
+
+// A visible 5h balance cannot be spent after its backing weekly quota reaches
+// the configured handoff or a hard limit. Expired/missing weekly observations
+// stay unconfirmed until a new native observation; time alone never refills it.
+func poolFiveHourWeeklyBacking(account runtimeQuotaStatus, cfg pluginConfig, now time.Time) string {
+	known := false
+	for _, window := range account.Windows {
+		if normalizeWindowClass(window.Window) != "weekly" {
+			continue
+		}
+		if reset, err := time.Parse(time.RFC3339, window.ResetAt); err == nil && window.CycleStarted &&
+			!window.PlaceholderReset && !reset.After(now) {
+			return "unknown"
+		}
+		if math.IsNaN(window.RemainingPercent) || math.IsInf(window.RemainingPercent, 0) ||
+			window.RemainingPercent < 0 || window.RemainingPercent > 100 {
+			return "unknown"
+		}
+		known = true
+		if serialWindowQuotaReason(quotaWindow{Class: "weekly", UsedPercent: 100 - window.RemainingPercent,
+			Allowed: window.Allowed, LimitReached: window.LimitReached}, cfg) != "eligible" {
+			return "blocked"
+		}
+	}
+	if !known {
+		return "unknown"
+	}
+	return "eligible"
 }
 
 func poolFiveHourStatus(accounts []runtimeQuotaStatus, cfg pluginConfig, now time.Time) runtimePoolFiveHourStatus {
@@ -102,13 +134,20 @@ func poolFiveHourStatus(accounts []runtimeQuotaStatus, cfg pluginConfig, now tim
 			}
 		}
 		if hasLimit {
-			limited = append(limited, account)
+			switch poolFiveHourWeeklyBacking(account, cfg, now) {
+			case "blocked":
+				out.WeeklyBlockedAccounts++
+			case "unknown":
+				out.WeeklyUnconfirmedAccounts++
+			default:
+				limited = append(limited, account)
+			}
 		} else {
 			out.UnclassifiedAccounts++
 		}
 	}
 	out.runtimePoolWeeklyStatus = poolWindowStatus(limited, cfg.PoolFiveHourCapacityWeights, "5h", now)
-	out.ScopeComplete = out.UnclassifiedAccounts == 0
+	out.ScopeComplete = out.UnclassifiedAccounts == 0 && out.WeeklyUnconfirmedAccounts == 0
 	sort.Strings(out.InventoryAuthIDs)
 	return out
 }

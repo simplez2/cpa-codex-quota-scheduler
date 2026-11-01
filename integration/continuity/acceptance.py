@@ -365,10 +365,23 @@ plugins:
         return request_json(self.port, "/v0/management/plugins/codex-quota-scheduler/scheduler-status")
 
     def ready(self):
+        stable_generation, stable_since = None, 0.0
         def check():
+            nonlocal stable_generation, stable_since
             if self.process.poll() is not None:
                 raise AssertionError(f"CPA exited with code {self.process.returncode}")
             status = self.status()
+            if not status.get("generation_active"):
+                stable_generation, stable_since = None, 0.0
+                return False
+            generation = status.get("runtime_generation")
+            if generation != stable_generation:
+                stable_generation, stable_since = generation, time.monotonic()
+                return False
+            # CPA can reconfigure the initial plugin after loading native
+            # credentials. Never seed a continuity test on that retired owner.
+            if time.monotonic() - stable_since < .5:
+                return False
             actual = request_json(self.port, "/v0/management/codex-api-key").get("codex-api-key", [])
             actual_indexes = {item.get("auth-index") for item in actual}
             expected_indexes = {item["auth_index"] for item in self.fixture.accounts}
@@ -412,12 +425,13 @@ plugins:
         self.log_file.close()
 
 
-def open_stream(port: int):
+def open_stream(port: int, headers=None):
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=35)
     payload = {"model": MODEL, "stream": True,
                "input": [{"role": "user", "content": "local test"}]}
-    conn.request("POST", "/v1/responses", json.dumps(payload), headers={
-        "Authorization": f"Bearer {CLIENT_KEY}", "Content-Type": "application/json"})
+    request_headers = {"Authorization": f"Bearer {CLIENT_KEY}", "Content-Type": "application/json"}
+    request_headers.update(headers or {})
+    conn.request("POST", "/v1/responses", json.dumps(payload), headers=request_headers)
     return conn, conn.getresponse()
 
 

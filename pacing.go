@@ -724,6 +724,15 @@ func (s *schedulerRuntimeState) applyStickyLocked(req pluginapi.SchedulerPickReq
 		return best
 	}
 	current := choices[currentIndex]
+	currentChoice := inspectSerialCandidate(current.Candidate, current.Snapshot, true, s.cfg, now)
+	bestChoice := inspectSerialCandidate(best.Candidate, best.Snapshot, true, s.cfg, now)
+	if quotaAffinityMustYield(currentChoice, []serialCandidate{bestChoice}, s.cfg) {
+		binding.AuthID, binding.LastUsedAt = best.Candidate.ID, now
+		binding.ChallengerID, binding.Confirmations = "", 0
+		s.stickyBindings[session] = binding
+		s.sessionSwitches++
+		return best
+	}
 	if current.Candidate.ID == best.Candidate.ID || best.ScorePercent-current.ScorePercent < s.cfg.SwitchHysteresisPercent {
 		binding.LastUsedAt = now
 		binding.ChallengerID = ""

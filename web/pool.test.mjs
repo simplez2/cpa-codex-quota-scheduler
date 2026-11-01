@@ -3,6 +3,15 @@ import assert from 'node:assert/strict';
 import {poolWeeklyDefaults,poolWeeklyView,poolWindowView} from './pool.mjs';
 import {changesBetween,fields} from './settings.mjs';
 
+test('5h pool explains weekly backing exclusions without inventing total capacity',()=>{
+  const blocked=poolWindowView({total_capacity:0,inventory_accounts:3,accounts:0,weekly_blocked_accounts:2,no_limit_reported_accounts:1},'5h');
+  assert.equal(blocked.text,'暂无可用');assert.equal(blocked.total,'0 Team');assert.match(blocked.scope,/周额度不足 2 个/);
+  const pending=poolWindowView({total_capacity:0,inventory_accounts:1,weekly_unconfirmed_accounts:1},'5h');
+  assert.equal(pending.text,'待确认');assert.match(pending.scope,/周额度待确认 1 个/);assert.match(pending.detail,/周额度尚未确认可用/);
+  const partial=poolWindowView({total_capacity:1,remaining_capacity:.5,remaining_percent:50,complete:true,accounts:1,weekly_blocked_accounts:2},'5h');
+  assert.equal(partial.total,'1 Team');assert.equal(partial.text,'50%');assert.match(partial.scope,/周额度不足 2 个/);
+});
+
 test('weekly report defaults use requested Team equivalents and editable map',()=>{
   assert.deepEqual(poolWeeklyDefaults,{team_standard:1,team_premium:5,plus:1,pro_5x:5,pro_20x:10});
   const spec=fields.find(field=>field[0]==='pool_weekly_capacity_weights');

@@ -133,6 +133,26 @@ func serialWindowHandoffPolicy(cfg pluginConfig, class string) (mode string, thr
 	return mode, threshold
 }
 
+// Routing and usable-pool reporting share the exact configured weekly gate.
+func serialWindowQuotaReason(window quotaWindow, cfg pluginConfig) string {
+	if !window.Allowed {
+		return "not_allowed"
+	}
+	if window.LimitReached || window.UsedPercent >= usedPercentThreshold {
+		return "limit_reached"
+	}
+	class := normalizeWindowClass(window.Class)
+	mode, threshold := serialWindowHandoffPolicy(cfg, class)
+	if mode == "reserve_aware" && class != "" && reserveForWindow(cfg, class) > 0 &&
+		100-window.UsedPercent <= reserveForWindow(cfg, class) {
+		return "serial_threshold"
+	}
+	if mode != "429_only" && window.UsedPercent >= threshold {
+		return "serial_threshold"
+	}
+	return "eligible"
+}
+
 func inspectSerialCandidate(candidate pluginapi.SchedulerAuthCandidate, snapshot quotaSnapshot, found bool, cfg pluginConfig, now time.Time) serialCandidate {
 	choice := serialCandidate{
 		Candidate:   candidate,
@@ -206,10 +226,6 @@ func inspectSerialCandidate(candidate pluginapi.SchedulerAuthCandidate, snapshot
 		}
 	}
 	choice.WeeklyProtected = choice.WeeklyKnown && choice.WeeklyRemaining <= cfg.ReserveWeeklyPercent
-	threshold := cfg.SerialSwitchPercent
-	if threshold <= 0 || threshold > 100 {
-		threshold = 98
-	}
 	reason := "eligible"
 	for _, window := range snapshot.Windows {
 		if !window.ResetAt.IsZero() && !now.Before(window.ResetAt) {
@@ -227,26 +243,20 @@ func inspectSerialCandidate(candidate pluginapi.SchedulerAuthCandidate, snapshot
 		// Inspect every active quota window before deciding. quota probe does not
 		// guarantee row order, and a soft weekly threshold must never mask a
 		// later hard 5h limit (or vice versa).
-		if !window.Allowed {
+		windowReason := serialWindowQuotaReason(window, cfg)
+		if windowReason == "not_allowed" {
 			reason = "not_allowed"
 			continue
 		}
-		if window.LimitReached || window.UsedPercent >= usedPercentThreshold {
+		if windowReason == "limit_reached" {
 			if reason != "not_allowed" {
 				reason = "limit_reached"
 			}
 			continue
 		}
-		class := normalizeWindowClass(window.Class)
-		handoffMode, threshold := serialWindowHandoffPolicy(cfg, class)
-		reserve := reserveForWindow(cfg, class)
-		reserveReached := handoffMode == "reserve_aware" &&
-			class != "" && reserve > 0 &&
-			100-window.UsedPercent <= reserve
-		thresholdReached := handoffMode != "429_only" && window.UsedPercent >= threshold
 		// Configured thresholds stay authoritative even near reset; expiry only
 		// ranks candidates and never silently raises a user-selected limit.
-		if reason == "eligible" && (reserveReached || thresholdReached) {
+		if reason == "eligible" && windowReason == "serial_threshold" {
 			reason = "serial_threshold"
 		}
 	}
@@ -590,7 +600,8 @@ func (s *schedulerRuntimeState) serialOverdraftPickLocked(
 }
 
 // serialPick preserves each live conversation independently of the global primary.
-// Only a new conversation or a configured/hard handoff re-enters pool ranking.
+// New conversations, weekly-only recovery handoffs and configured/hard limits
+// re-enter pool ranking; 5h-to-5h affinity stays intact.
 func (s *schedulerRuntimeState) serialPick(req pluginapi.SchedulerPickRequest, now time.Time) pluginapi.SchedulerPickResponse {
 	blocked := make(map[string]banDisposition, len(req.Candidates))
 	for _, candidate := range req.Candidates {
@@ -630,7 +641,12 @@ func (s *schedulerRuntimeState) serialPick(req pluginapi.SchedulerPickRequest, n
 			snapshot = s.serialConservativeQuotaLocked(snapshot, now)
 			choice := inspectSerialCandidate(candidate, snapshot, found, s.cfg, now)
 			s.annotateSerialCandidateLocked(&choice, now)
-			if choice.Eligible || (s.cfg.SerialSoftContinuation && choice.Reason == "serial_threshold") {
+			if s.quotaAffinityMustYieldLocked(choice, req, now) {
+				// The same session may have a legacy soft-continuation binding;
+				// remove that path too before re-entering normal pool ranking.
+				delete(s.serialOverdraft, session)
+				bound = false
+			} else if choice.Eligible || (s.cfg.SerialSoftContinuation && choice.Reason == "serial_threshold") {
 				response = pluginapi.SchedulerPickResponse{AuthID: binding.AuthID, Handled: true}
 				s.balancedSessionHits++
 			}

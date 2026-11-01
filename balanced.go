@@ -206,29 +206,36 @@ func (s *schedulerRuntimeState) balancedPick(req pluginapi.SchedulerPickRequest,
 	remaining := choices
 	for len(remaining) > 0 {
 		group, rest := nextQuotaPriorityGroup(remaining, s.cfg, now)
-		if sticky != nil {
-			if _, present := serialChoiceByID(group, sticky.Candidate.ID); !present {
-				group = append(group, *sticky)
+		groupSticky := sticky
+		if groupSticky != nil && quotaAffinityMustYield(*groupSticky, group, s.cfg) {
+			groupSticky = nil
+		}
+		if groupSticky != nil {
+			if _, present := serialChoiceByID(group, groupSticky.Candidate.ID); !present {
+				group = append(group, *groupSticky)
 			}
 		}
 		adqSelected, reserved, adqOK, adqHandled := s.adqRouteChoicesWithAllocationLocked(req, group, cost, now, session, func() string {
-			if sticky == nil {
+			if groupSticky == nil {
 				return ""
 			}
-			return sticky.Candidate.ID
+			return groupSticky.Candidate.ID
 		}(), true)
 		if adqOK {
 			// ADQ commits the policy's fair-share round only after reservation;
 			// the fallback cannot overwrite this decision or double-credit it.
 			selected = adqSelected
 			reservation = reserved
-			if sticky != nil && selected == sticky.Candidate.ID {
+			if groupSticky != nil && selected == groupSticky.Candidate.ID {
 				s.balancedSessionHits++
 			}
 		} else if adqHandled {
 			// Complete telemetry with a hard gate/collision is an admission failure,
 			// not permission to bypass reservations through the legacy fallback.
-			remaining, sticky = rest, nil
+			remaining = rest
+			if groupSticky != nil {
+				sticky = nil
+			}
 			continue
 		} else {
 			total := 0.0
@@ -248,8 +255,8 @@ func (s *schedulerRuntimeState) balancedPick(req pluginapi.SchedulerPickRequest,
 					bestScore = account.Credit
 				}
 			}
-			if sticky != nil {
-				selected = sticky.Candidate.ID
+			if groupSticky != nil {
+				selected = groupSticky.Candidate.ID
 				s.balancedSessionHits++
 			}
 		}

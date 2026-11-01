@@ -387,6 +387,10 @@ func (s *schedulerRuntimeState) concurrencyPreferred(req pluginapi.SchedulerPick
 		}
 		snapshot, found := s.lookupQuotaLocked(candidate.ID, candidateAuthIndex(candidate))
 		choice := inspectSerialCandidate(candidate, snapshot, found, cfg, now)
+		if serialPinnedAuthID(req) == "" && normalizeSerialSelectionSource(s.serialSelectionSource) != "manual" &&
+			s.quotaAffinityMustYieldLocked(choice, req, now) {
+			return ""
+		}
 		stickyEligible := choice.Eligible || (cfg.SerialSoftContinuation && choice.Reason == "serial_threshold")
 		if stickyEligible && banStore.schedulable(candidate.ID, now) && !s.adqProviderCircuitActiveLockedForConcurrency(candidate, now) {
 			return preferred

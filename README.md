@@ -5,13 +5,14 @@
 
 Standalone CPA plugin for balanced concurrent or serial Codex account selection, native quota polling,
 5h/weekly/monthly windows, persistent 429 quarantine and optional warmup.
-Source version: **0.3.35**. Published platform builds and checksums are available
+Source version: **0.3.36**. Published platform builds and checksums are available
 from [GitHub Releases](https://github.com/simplez2/cpa-codex-quota-scheduler/releases).
 See [CPA permissions and compatibility](CPA_PERMISSIONS.md) before installation.
 
 New sessions prefer usable 5h quota, then confirmed weekly-only backups. Within
 the same pool, an earlier confirmed reset has higher priority. Existing eligible
-sessions keep their credential affinity. Local generation counts never invent
+sessions keep their credential affinity within the 5h pool. A weekly-only backup
+binding yields when higher-priority 5h quota becomes usable again. Local generation counts never invent
 official reset credits or quota refills. See [the scheduling contract](README.zh-CN.md#调度规则).
 
 Every platform archive includes the MIT license, attribution, installation and
@@ -22,7 +23,10 @@ their validated manifests. These hashes detect mismatched or damaged downloads;
 they are not an independent publisher signature.
 
 The overview reports weekly and 5h pool balances separately in editable Team
-equivalents. Only credentials with an observed 5h limit enter the 5h denominator.
+equivalents. Only credentials with an observed 5h limit and spendable weekly
+backing enter the 5h denominator. A weekly handoff threshold or hard limit
+excludes both that credential's total 5h capacity and its remaining 5h balance;
+missing or expired weekly evidence stays unconfirmed until observed again.
 `pool_5h_capacity_weights` is independent of `pool_weekly_capacity_weights`.
 `pool_5h_excluded_accounts` manually excludes credentials from 5h reporting only.
 A fresh full native response without a 5h window is labelled as not reporting a
@@ -295,7 +299,9 @@ in the panel; clients must supply a stable session/thread identity for affinity.
 The panel's **会话绑定空闲有效期** (`sticky_seconds`, default 1500 seconds) renews
 on requests and matched completions; a tracked in-flight generation does not
 expire as idle. Set it to 0 to disable affinity. Better relative quota, plan
-weights, or temporary budget rankings never preempt an active conversation. A
+weights, or temporary budget rankings within the same quota pool never preempt
+an active conversation. A weekly-only fallback binding yields to usable 5h
+quota according to `window_order`. A
 configured quota switch threshold, hard quota limit, quarantine/429, unavailable
 credential or incompatible model allows failover and rebind the conversation to its replacement. Explicit account
 pins remain isolated from ordinary conversation bindings. An already emitted

@@ -168,18 +168,23 @@ func TestQuotaPriorityReservationFailureAdvancesWithoutBypassingGate(t *testing.
 	}
 }
 
-func TestQuotaPriorityPreservesExistingWeeklySessionButPlacesNewSessionOnFiveHour(t *testing.T) {
+func TestQuotaPriorityWeeklyBackupAffinityCannotBypassFiveHour(t *testing.T) {
 	resetBanStoreForTest()
 	defer resetBanStoreForTest()
 	for _, mode := range []string{"balanced", "serial"} {
 		t.Run(mode, func(t *testing.T) {
 			s, req := expiryPriorityFixture(t, mode, mode == "balanced")
 			s.bindBalancedSessionLocked(schedulerSessionHash(withBalancedSession(req, "existing")), "weekly-backup", "weekly-backup", time.Now())
-			for _, tc := range []struct{ session, want string }{{"existing", "weekly-backup"}, {"new", "five-sooner"}, {"existing", "weekly-backup"}} {
+			for _, tc := range []struct{ session, want string }{{"existing", "five-sooner"}, {"new", "five-sooner"}, {"existing", "five-sooner"}} {
 				got, err := s.schedulerPickUncapped(withBalancedSession(req, tc.session))
 				if err != nil || got.AuthID != tc.want {
 					t.Fatalf("session=%s got=%+v err=%v want=%s", tc.session, got, err, tc.want)
 				}
+			}
+			pinned := req
+			pinned.Options.Metadata = map[string]any{"pinned_auth_id": "weekly-backup"}
+			if got, err := s.schedulerPickUncapped(pinned); err != nil || got.AuthID != "weekly-backup" {
+				t.Fatalf("explicit CPA account pin was ignored: %+v %v", got, err)
 			}
 		})
 	}
