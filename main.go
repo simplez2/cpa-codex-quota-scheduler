@@ -106,7 +106,7 @@ import (
 
 const (
 	pluginName    = "codex-quota-scheduler"
-	pluginVersion = "0.3.36"
+	pluginVersion = "0.3.37"
 
 	// providerCodex is the CPA provider key for OpenAI Codex (ChatGPT backend).
 	providerCodex = "codex"
@@ -683,8 +683,8 @@ func pluginRegistration() registration {
 				{Name: "serial_budget_rebalance_percent", Type: pluginapi.ConfigFieldTypeNumber, Description: "Relative weekly budget advantage before proactive sustainable handoff (default 20 percent, 0 disables); requires independent evidence and minimum hold."},
 				{Name: "serial_soft_continuation", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Legacy session continuation past a soft threshold; defaults false so subsequent session requests follow the replacement."},
 				{Name: "quota_default_plan", Type: pluginapi.ConfigFieldTypeString, Description: "Fallback capacity prior when native plan detection is unavailable: team_standard (default), plus, pro_5x, pro_20x or team_premium. Explicit quota_account_plans overrides take precedence over detection. Priors are not guaranteed weekly limits."},
-				{Name: "pool_weekly_capacity_weights", Type: pluginapi.ConfigFieldTypeObject, Description: "Editable Team-equivalent weekly reporting weights. Team Standard/Plus=1, Team Premium/Pro 5x=5, Pro 20x=10. Reporting only."},
-				{Name: "pool_5h_capacity_weights", Type: pluginapi.ConfigFieldTypeObject, Description: "Independent Team-equivalent 5h reporting weights. Team Standard/Plus=1, Team Premium/Pro 5x=5, Pro 20x=10. Reporting only."},
+				{Name: "pool_weekly_capacity_weights", Type: pluginapi.ConfigFieldTypeObject, Description: "Editable weekly reporting multipliers in x units. Team Standard/Plus=1x, Team Premium/Pro 5x=10x, Pro 20x=20x. Reporting only; saved custom weights are preserved."},
+				{Name: "pool_5h_capacity_weights", Type: pluginapi.ConfigFieldTypeObject, Description: "Independent 5h reporting multipliers in x units. Team Standard/Plus=1x, Team Premium/Pro 5x=10x, Pro 20x=20x. Reporting only; saved custom weights are preserved."},
 				{Name: "pool_5h_excluded_accounts", Type: pluginapi.ConfigFieldTypeArray, Description: "Credential IDs manually excluded from 5h reporting, for accounts without a 5h limit. Does not change weekly reporting or scheduling."},
 				{Name: "serial_weekly_rebalance_percent", Type: pluginapi.ConfigFieldTypeNumber, Description: "Weekly remaining percentage-point advantage required for proactive serial balancing (default 10, 0 disables). Two distinct fresh observations of both accounts are required."},
 				{Name: "serial_weekly_rebalance_min_hold", Type: pluginapi.ConfigFieldTypeString, Description: "Minimum primary hold before proactive weekly balancing (1m-24h, default 5m). Hard limits, quarantine and other safety handoffs do not wait."},

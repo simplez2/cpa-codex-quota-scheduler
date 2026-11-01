@@ -45,7 +45,7 @@ func quotaPlanForAuth(cfg pluginConfig, id string) (string, float64) {
 func quotaPlanWeight(plan string) float64 {
 	switch plan {
 	case "pro_5x", "team_premium":
-		return 5
+		return 10
 	case "pro_20x":
 		return 20
 	default:

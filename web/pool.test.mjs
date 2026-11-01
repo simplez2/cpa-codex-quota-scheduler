@@ -1,19 +1,21 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {poolWeeklyDefaults,poolWeeklyView,poolWindowView} from './pool.mjs';
+import {poolCapacity,poolWeeklyDefaults,poolWeeklyView,poolWindowView} from './pool.mjs';
 import {changesBetween,fields} from './settings.mjs';
 
 test('5h pool explains weekly backing exclusions without inventing total capacity',()=>{
   const blocked=poolWindowView({total_capacity:0,inventory_accounts:3,accounts:0,weekly_blocked_accounts:2,no_limit_reported_accounts:1},'5h');
-  assert.equal(blocked.text,'暂无可用');assert.equal(blocked.total,'0 Team');assert.match(blocked.scope,/周额度不足 2 个/);
+  assert.equal(blocked.text,'暂无可用');assert.equal(blocked.total,'0x');assert.match(blocked.scope,/周额度不足 2 个/);
   const pending=poolWindowView({total_capacity:0,inventory_accounts:1,weekly_unconfirmed_accounts:1},'5h');
   assert.equal(pending.text,'待确认');assert.match(pending.scope,/周额度待确认 1 个/);assert.match(pending.detail,/周额度尚未确认可用/);
   const partial=poolWindowView({total_capacity:1,remaining_capacity:.5,remaining_percent:50,complete:true,accounts:1,weekly_blocked_accounts:2},'5h');
-  assert.equal(partial.total,'1 Team');assert.equal(partial.text,'50%');assert.match(partial.scope,/周额度不足 2 个/);
+  assert.equal(partial.total,'1x');assert.equal(partial.text,'50%');assert.match(partial.scope,/周额度不足 2 个/);
 });
 
-test('weekly report defaults use requested Team equivalents and editable map',()=>{
-  assert.deepEqual(poolWeeklyDefaults,{team_standard:1,team_premium:5,plus:1,pro_5x:5,pro_20x:10});
+test('weekly report uses 1x 10x 20x defaults and preserves editable multipliers',()=>{
+  assert.deepEqual(poolWeeklyDefaults,{team_standard:1,team_premium:10,plus:1,pro_5x:10,pro_20x:20});
+  const premium=poolWindowView({total_capacity:5,remaining_capacity:2.5,remaining_percent:50,complete:true,accounts:1});
+  assert.equal(premium.total,'5x');assert.equal(premium.balance,'2.5x');
   const spec=fields.find(field=>field[0]==='pool_weekly_capacity_weights');
   assert.equal(spec[3],'weights');assert.equal(spec[2],'allocation');
   const edited={...poolWeeklyDefaults,pro_20x:12};
@@ -27,7 +29,7 @@ test('5h excludes uncapped capacity and distinguishes missing scope from no appl
   assert.equal(missing.text,'待确认');assert.match(missing.detail,/缺失数据不等于无限额/);
   const partial=poolWindowView({total_capacity:10,remaining_capacity:5,remaining_percent:50,complete:true,coverage_percent:100,accounts:1,unclassified_accounts:1},'5h');
   assert.equal(partial.text,'50%');assert.equal(partial.caption,'已确认有 5h 限制的账号');assert.equal(partial.quality,'范围待确认');
-  assert.match(partial.scope,/范围待确认 1 个/);assert.equal(partial.total,'10 Team');
+  assert.match(partial.scope,/范围待确认 1 个/);assert.equal(partial.total,'10x');
 });
 
 test('5h expired balances remain incomplete, cached data and independent settings stay explicit',()=>{
@@ -35,8 +37,8 @@ test('5h expired balances remain incomplete, cached data and independent setting
   assert.match(view.detail,/1 个账号 5h 额度待确认/);assert.equal(view.quality,'额度待确认');assert.equal(view.complete,false);
   assert.equal(poolWindowView({total_capacity:1,remaining_percent:0,remaining_capacity:0,complete:true,accounts:1},'5h').text,'0%');
   const initial={pool_weekly_capacity_weights:poolWeeklyDefaults,pool_5h_capacity_weights:poolWeeklyDefaults,pool_5h_excluded_accounts:[]};
-  const changes=changesBetween(initial,{...initial,pool_5h_capacity_weights:{...poolWeeklyDefaults,pro_20x:20},pool_5h_excluded_accounts:['no-limit']});
-  assert.equal(changes.pool_weekly_capacity_weights,undefined);assert.equal(changes.pool_5h_capacity_weights.pro_20x,20);assert.deepEqual(changes.pool_5h_excluded_accounts,['no-limit']);
+  const changes=changesBetween(initial,{...initial,pool_5h_capacity_weights:{...poolWeeklyDefaults,pro_20x:12},pool_5h_excluded_accounts:['no-limit']});
+  assert.equal(changes.pool_weekly_capacity_weights,undefined);assert.equal(changes.pool_5h_capacity_weights.pro_20x,12);assert.deepEqual(changes.pool_5h_excluded_accounts,['no-limit']);
 });
 test('zero remaining is real zero; incomplete coverage displays a range',()=>{
   const empty=poolWeeklyView({total_capacity:5,accounts:5,remaining_capacity:0,remaining_percent:0,complete:true,known_accounts:5});
@@ -47,5 +49,6 @@ test('zero remaining is real zero; incomplete coverage displays a range',()=>{
 test('cached weekly estimates disclose their coverage without rounding to false zero',()=>{
   const view=poolWeeklyView({total_capacity:5,accounts:5,remaining_capacity:4.97,remaining_percent:99.4,complete:true,cached_accounts:2});
   assert.equal(view.text,'99.4%');assert.match(view.detail,/2 个账号使用缓存估算/);
+  assert.match(view.detail,/剩余 4\.97x/);assert.equal(poolCapacity(null),'—');assert.equal(poolCapacity(NaN),'—');assert.equal(poolCapacity(0),'0x');
   assert.equal(poolWeeklyView(null).text,'—');
 });

@@ -1,7 +1,8 @@
-export const poolWeeklyDefaults = Object.freeze({team_standard:1,team_premium:5,plus:1,pro_5x:5,pro_20x:10});
-export const poolWeeklyLabels = Object.freeze({team_standard:'普通 Team',team_premium:'Team 5x',plus:'Plus',pro_5x:'Pro 5x',pro_20x:'Pro 20x'});
+export const poolWeeklyDefaults = Object.freeze({team_standard:1,team_premium:10,plus:1,pro_5x:10,pro_20x:20});
+export const poolWeeklyLabels = Object.freeze({team_standard:'Team Standard · 1x',team_premium:'Team Premium · 10x',plus:'Plus · 1x',pro_5x:'Pro 5x · 当前 10x',pro_20x:'Pro · 20x'});
 const number = value => typeof value==='number' && Number.isFinite(value);
 export const poolNumber = value => number(value) ? value.toLocaleString('zh-CN',{maximumFractionDigits:2}) : '—';
+export const poolCapacity = value => number(value) ? poolNumber(value)+'x' : '—';
 export function poolWeeklyView(pool) {
   if(!pool || !(pool.total_capacity>0))return {text:'—',used:'等待额度',fill:0,complete:false,detail:'等待账号池周额度快照。'};
   const complete=pool.complete===true&&number(pool.remaining_percent);
@@ -11,7 +12,7 @@ export function poolWeeklyView(pool) {
     used:complete?'已用 '+poolNumber(100-pool.remaining_percent)+'%':'部分额度待确认',
     fill:complete?Math.max(0,Math.min(100,pool.remaining_percent)):lower,
     complete,
-    detail:'全池 '+pool.accounts+' 个账号 · 总容量 '+poolNumber(pool.total_capacity)+' Team · 已观测剩余 '+poolNumber(pool.remaining_capacity)+' Team'+(pool.cached_accounts?' · '+pool.cached_accounts+' 个账号使用缓存估算':'')+(pool.unknown_accounts?' · '+pool.unknown_accounts+' 个账号周额度待确认':'')
+    detail:'全池 '+pool.accounts+' 个账号 · 总容量 '+poolCapacity(pool.total_capacity)+' · 已观测剩余 '+poolCapacity(pool.remaining_capacity)+(pool.cached_accounts?' · '+pool.cached_accounts+' 个账号使用缓存估算':'')+(pool.unknown_accounts?' · '+pool.unknown_accounts+' 个账号周额度待确认':'')
   };
 }
 
@@ -20,14 +21,14 @@ export function poolWindowView(pool, kind='weekly') {
   if(!pool || !(pool.total_capacity>0)) {
     const backingPending=five&&pool?.weekly_unconfirmed_accounts>0;
     const pending=five&&(pool?.unclassified_accounts>0||backingPending);
-    if(five&&pool?.weekly_blocked_accounts>0&&!pending)return {text:'暂无可用',used:'周额度不足',fill:0,complete:false,detail:'周额度达到配置阈值或已耗尽的账号，其 5h 容量与剩余额度均不计入；恢复后自动重新纳入。',balance:'0 Team',total:'0 Team',coverage:'—',quality:'周额度阻断',scope:poolScope(pool),nextReset:null,caption:'周额度可用的 5h 账号'};
+    if(five&&pool?.weekly_blocked_accounts>0&&!pending)return {text:'暂无可用',used:'周额度不足',fill:0,complete:false,detail:'周额度达到配置阈值或已耗尽的账号，其 5h 容量与剩余额度均不计入；恢复后自动重新纳入。',balance:'0x',total:'0x',coverage:'—',quality:'周额度阻断',scope:poolScope(pool),nextReset:null,caption:'周额度可用的 5h 账号'};
     const inapplicable=five&&pool?.inventory_accounts>0&&!pending;
     return {text:pending?'待确认':inapplicable?'不适用':'—',used:inapplicable?'当前账号均未纳入 5h 统计':'等待额度',fill:0,complete:false,detail:pending?(backingPending?'周额度尚未确认可用，暂不计入 5h 容量；需要新的额度观测后重新纳入。':'尚未确认有 5h 限制的账号，缺失数据不等于无限额。'):inapplicable?'无 5h 限制或已手动排除的账号不参与分子、分母。':'等待账号池'+label+'额度快照。',balance:'—',total:'—',coverage:'—',quality:backingPending?'周额度待确认':pending?'范围待确认':inapplicable?'无需统计':'等待观测',scope:five?poolScope(pool):'全账号池',nextReset:null,caption:five?'周额度可用的 5h 账号':'各账号当前周窗口'};
   }
   const view=poolWeeklyView(pool);
   if(five)view.detail=view.detail.replace('全池 ','有 5h 限制的 ').replace('个账号周额度待确认','个账号 5h 额度待确认');
   return {...view,
-    balance:poolNumber(pool.remaining_capacity)+' Team',total:poolNumber(pool.total_capacity)+' Team',
+    balance:poolCapacity(pool.remaining_capacity),total:poolCapacity(pool.total_capacity),
     coverage:poolNumber(pool.coverage_percent??(pool.complete?100:0))+'%',
     quality:five&&(pool.unclassified_accounts||pool.weekly_unconfirmed_accounts)?'范围待确认':!view.complete?'额度待确认':pool.cached_accounts?'含缓存估算':'观测完整',
     scope:five?poolScope(pool):'全池 '+pool.accounts+' 个账号',

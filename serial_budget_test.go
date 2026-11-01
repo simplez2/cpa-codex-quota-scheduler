@@ -165,7 +165,7 @@ func TestSerialBudgetConfigurationAndPlanPriors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for id, want := range map[string]float64{"alpha": 5, "beta": 20, "gamma": 5, "unspecified": 1} {
+	for id, want := range map[string]float64{"alpha": 10, "beta": 20, "gamma": 10, "unspecified": 1} {
 		if _, weight := quotaPlanForAuth(cfg, id); weight != want {
 			t.Fatalf("%s weight=%v", id, weight)
 		}

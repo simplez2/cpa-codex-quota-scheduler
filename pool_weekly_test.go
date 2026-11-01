@@ -10,17 +10,17 @@ func poolAccount(id, plan string, remaining float64) runtimeQuotaStatus {
 	return runtimeQuotaStatus{AuthID: id, Plan: plan, Fresh: true, Windows: []runtimeQuotaWindowStatus{{Window: "weekly", Allowed: true, RemainingPercent: remaining}}}
 }
 
-func TestPoolWeeklyUsesUserEquivalentsAndRetainsThresholdAccounts(t *testing.T) {
+func TestPoolWeeklyUsesMultipliersAndRetainsThresholdAccounts(t *testing.T) {
 	cfg := defaultPluginConfig()
 	accounts := []runtimeQuotaStatus{poolAccount("a", "pro_20x", 50), poolAccount("b", "pro_5x", 100), poolAccount("c", "team_premium", 0), poolAccount("d", "plus", 100)}
 	accounts[0].Eligible = false // A 5h routing restriction does not erase weekly inventory.
 	accounts[0].Reason = "serial_threshold"
 	accounts = append(accounts, accounts[0]) // Alias snapshots must not double-count capacity.
 	got := poolWeeklyStatus(accounts, cfg, time.Now())
-	if !got.Complete || got.Accounts != 4 || got.TotalCapacity != 21 || got.RemainingPercent == nil || math.Abs(*got.RemainingPercent-1100./21) > 1e-9 {
+	if got.Unit != "x" || !got.Complete || got.Accounts != 4 || got.TotalCapacity != 41 || got.RemainingPercent == nil || math.Abs(*got.RemainingPercent-2100./41) > 1e-9 {
 		t.Fatalf("wrong weighted pool: %+v", got)
 	}
-	if quotaPlanWeight("pro_20x") != 20 || quotaPlanWeight("team_premium") != 5 {
+	if quotaPlanWeight("pro_20x") != 20 || quotaPlanWeight("team_premium") != 10 {
 		t.Fatal("reporting weights changed routing priors")
 	}
 }
@@ -34,7 +34,7 @@ func TestPoolWeeklyUnknownAndExpiredWindowsRemainInDenominator(t *testing.T) {
 	c.Windows[0].CycleStarted = true
 	c.Windows[0].ResetAt = now.Add(-time.Minute).Format(time.RFC3339)
 	got := poolWeeklyStatus([]runtimeQuotaStatus{a, b, c}, defaultPluginConfig(), now)
-	if got.Complete || got.RemainingPercent != nil || got.UnknownAccounts != 2 || got.CachedAccounts != 1 || got.TotalCapacity != 7 || math.Abs(got.MinimumPercent-50./7) > 1e-9 || math.Abs(got.MaximumPercent-650./7) > 1e-9 {
+	if got.Complete || got.RemainingPercent != nil || got.UnknownAccounts != 2 || got.CachedAccounts != 1 || got.TotalCapacity != 12 || math.Abs(got.MinimumPercent-50./12) > 1e-9 || math.Abs(got.MaximumPercent-1150./12) > 1e-9 {
 		t.Fatalf("unknown quota was invented or omitted: %+v", got)
 	}
 }
@@ -64,7 +64,7 @@ func TestPoolWeeklyIncludesUnobservedInventoryCredentials(t *testing.T) {
 	now := time.Now()
 	accounts := poolWeeklyAccounts([]runtimeQuotaStatus{poolAccount("known", "team_standard", 100)}, map[string]string{"i1": "known", "i2": "missing", "alias": "missing"}, ifCfg, now)
 	got := poolWeeklyStatus(accounts, ifCfg, now)
-	if got.Accounts != 2 || got.TotalCapacity != 11 || got.UnknownAccounts != 1 || got.Complete || math.Abs(got.MinimumPercent-100./11) > 1e-9 || got.MaximumPercent != 100 {
+	if got.Accounts != 2 || got.TotalCapacity != 21 || got.UnknownAccounts != 1 || got.Complete || math.Abs(got.MinimumPercent-100./21) > 1e-9 || got.MaximumPercent != 100 {
 		t.Fatalf("unobserved inventory capacity omitted: %+v", got)
 	}
 }

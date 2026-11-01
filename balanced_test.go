@@ -139,10 +139,10 @@ func TestBalancedPlanCapacityAndWeeklyBudgetShares(t *testing.T) {
 	now := time.Now()
 	s, req := balancedFixture(now)
 	s.cfg.QuotaAccountPlans = map[string]string{"b": "pro_5x"}
-	for i := 0; i < 600; i++ {
+	for i := 0; i < 660; i++ {
 		s.balancedPick(req, now)
 	}
-	if s.balancedAccounts["a"].Picks != 100 || s.balancedAccounts["b"].Picks != 500 {
+	if s.balancedAccounts["a"].Picks != 60 || s.balancedAccounts["b"].Picks != 600 {
 		t.Fatalf("capacity shares: %+v", s.balancedStatusLocked(now))
 	}
 	s, req = balancedFixture(now)

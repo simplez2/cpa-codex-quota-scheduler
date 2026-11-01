@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.37 — 2026-11-02
+
+- Use x capacity units throughout weekly/5h balances, details, editors and the
+  status API. Display remaining capacity as e.g. 2.5x instead of Team equivalents.
+- Align reporting defaults and plan capacity priors to 1x, 10x and 20x:
+  Pro 5x and Team Premium now use 10x, and Pro 20x uses 20x. Preserve explicit
+  custom reporting weights and keep weekly/5h reporting independently configurable.
+
 ## 0.3.36 — 2026-11-02
 
 - Keep automatic weekly-only fallback affinity and its concurrency queue target
