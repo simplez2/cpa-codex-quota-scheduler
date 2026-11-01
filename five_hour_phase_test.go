@@ -63,8 +63,12 @@ func TestPhaseSecondGenerationPlansSpreadAcrossFiveHoursAndAreDurable(t *testing
 	for i := 0; i < 4; i++ {
 		id := fmt.Sprintf("a%d", i)
 		reset := now.Add(-time.Second)
-		s.observeFiveHourPhaseLocked(phaseSnapshot(id, reset.Add(-time.Hour), reset, 50), reset.Add(-time.Hour))
 		q := phaseSnapshot(id, now, now.Add(5*time.Hour), 0)
+		previous := phaseSnapshot(id, reset.Add(-time.Hour), reset, 50)
+		// Both observations belong to the same weekly cycle, even when the
+		// five-hour bucket straddles UTC midnight.
+		previous.Windows[1].ResetAt = q.Windows[1].ResetAt
+		s.observeFiveHourPhaseLocked(previous, reset.Add(-time.Hour))
 		s.quotas[id] = q
 		candidates = append(candidates, warmupCandidate{Snapshot: q, Window: q.Windows[0]})
 	}
