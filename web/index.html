@@ -28,7 +28,7 @@
     <nav class="view-nav" aria-label="额度调度功能">
       <button type="button" data-view="overview" aria-pressed="true">账号与额度</button>
       <button type="button" data-view="allocation" aria-pressed="false">调配设置</button>
-      <button type="button" data-view="warmup" aria-pressed="false">预热管理</button>
+      <button type="button" data-view="warmup" aria-pressed="false">周期启动 / 5h 轮转</button>
       <button type="button" data-view="advanced" aria-pressed="false">连接与高级</button>
     </nav>
     <div id="view-overview" data-panel>
@@ -84,9 +84,10 @@
     <p id="settings-unavailable" class="notice" hidden>设置读取失败，请刷新重试；额度概览仍可查看。</p>
     <form id="settings-form" novalidate>
       <section id="view-allocation" class="settings-page" data-panel hidden><div class="settings-intro"><h2>调配设置</h2><p>配置每凭据并发上限、何时切号、怎样分配周额度，以及套餐参考。</p></div><div id="fields-allocation" class="settings-fields"></div></section>
-      <section id="view-warmup" class="settings-page" data-panel hidden><div class="settings-intro"><h2>预热管理</h2><p>设置预热频率，查看每个账号周期的确认结果。</p></div><div id="fields-warmup" class="settings-fields"></div>
-        <section class="detail-panel epoch-status" aria-labelledby="epoch-title"><div class="section-header"><div><h2 id="epoch-title">当前最大周期</h2><p id="epoch-description">等待最大周期状态</p></div><span id="epoch-badge" class="badge">—</span></div><dl id="epoch-metrics" class="policy epoch-metrics"></dl><ul id="epoch-accounts" class="warmups"></ul></section>
-        <section class="detail-panel warmup-records" aria-labelledby="warmup-title"><div class="section-header"><h2 id="warmup-title">预热记录</h2><div class="toolbar"><span id="warmup-enabled" class="badge"></span><button id="retry-all" class="runtime-action" type="button" disabled>恢复已阻止的重试</button></div></div><p id="warmup-description"></p><ul id="warmups" class="warmups"></ul></section>
+      <section id="view-warmup" class="settings-page" data-panel hidden><div class="settings-intro"><h2>账号周期启动与 5h 轮转</h2><p>一次调用共同启动周与首轮 5h；后续周期尽量错峰，额度紧张时提前启动。错峰只影响后台预热，真实调用随时可用。</p></div><div id="fields-warmup" class="settings-fields"></div>
+        <section class="detail-panel epoch-status" aria-labelledby="epoch-title"><div class="section-header"><div><h2 id="epoch-title">周 / 月额度 · 全账号激活</h2><p id="epoch-description">等待周/月周期状态</p></div><span id="epoch-badge" class="badge">—</span></div><dl id="epoch-metrics" class="policy epoch-metrics"></dl><ul id="epoch-accounts" class="warmups"></ul></section>
+        <section class="detail-panel epoch-status" aria-labelledby="five-hour-warmup-title"><div class="section-header"><div><h2 id="five-hour-warmup-title">5h 额度 · 错峰预热</h2><p id="five-hour-warmup-summary">等待账号状态</p></div><span id="five-hour-warmup-mode" class="badge">—</span></div><p class="muted">第二轮起按 15 分钟时间槽尽量分散到完整 5 小时；错过计划后继续预热，不等待下一轮。官方固定周期只能错开使用，不能改变官方时钟；是否重新锚定以实际额度查询确认。</p><ul id="five-hour-warmup-accounts" class="warmups"></ul></section>
+        <section class="detail-panel warmup-records" aria-labelledby="warmup-title"><div class="section-header"><h2 id="warmup-title">最近预热记录 · 5h / 周</h2><div class="toolbar"><span id="warmup-enabled" class="badge"></span><button id="retry-all" class="runtime-action" type="button" disabled>恢复已阻止的重试</button></div></div><p id="warmup-description"></p><ul id="warmups" class="warmups"></ul></section>
       </section>
       <section id="view-advanced" class="settings-page" data-panel hidden><div class="settings-intro"><h2>查询与恢复</h2><p>调整额度查询节奏、缓存有效期和限额恢复等待时间。</p></div><div id="fields-advanced" class="settings-fields"></div>
         <details class="settings-details"><summary>CPA 连接与状态存储</summary><p>服务器内部地址和文件路径。无需编辑配置文本，也不会显示密钥内容。</p><div id="fields-connection" class="settings-fields"></div></details>

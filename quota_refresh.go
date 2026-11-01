@@ -328,6 +328,7 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 		}
 		if p := s.quotaPolls[id]; p.AuthIndex != auth.AuthIndex {
 			s.quotaRunway.ForgetAuth(id)
+			s.rotationRunway.ForgetAuth(id)
 			delete(s.quotaNative, id)
 			delete(s.continuityDemandUntil, id)
 			s.resetSerialWeeklyEvidenceForAuthLocked(id)
@@ -343,6 +344,7 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 	for id := range s.quotaPolls {
 		if _, ok := inventory[id]; !ok {
 			s.quotaRunway.ForgetAuth(id)
+			s.rotationRunway.ForgetAuth(id)
 			delete(s.quotaNative, id)
 			delete(s.continuityDemandUntil, id)
 			s.resetSerialWeeklyEvidenceForAuthLocked(id)
@@ -501,6 +503,7 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 		var observeSettlement bool
 		if fetchErr != nil {
 			s.quotaRunway.ForgetAuth(id)
+			s.rotationRunway.ForgetAuth(id)
 			delete(s.quotaNative, id)
 			s.resetSerialWeeklyEvidenceForAuthLocked(id)
 			poll.Failures++
@@ -545,6 +548,7 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 				snapshot.AccountID = normalizeNativePlanType(auth.IDToken.AccountID)
 			}
 			s.quotaRunway.Observe(snapshot, time.Now())
+			s.observeRotationQuotaLocked(snapshot, time.Now())
 			if s.quotaNative == nil {
 				s.quotaNative = make(map[string]quotaSnapshot)
 			}

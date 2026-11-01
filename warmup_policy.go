@@ -177,6 +177,9 @@ func (s *schedulerRuntimeState) warmupCandidateStillEligible(candidate warmupCan
 	s.mu.RLock()
 	snapshot, ok := s.quotas[candidate.Snapshot.AuthID]
 	cfg, activeID, poll := s.cfg, s.serialActiveAuthID, s.quotaPolls[candidate.Snapshot.AuthID]
+	if cfg.SchedulerMode == "balanced" {
+		activeID = ""
+	}
 	epoch := cloneQuotaEpochState(s.quotaEpoch)
 	s.mu.RUnlock()
 	epochID, epochAllowed := quotaEpochWarmupAllowance(epoch, snapshot, poll, now)

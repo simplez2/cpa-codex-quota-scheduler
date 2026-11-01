@@ -105,6 +105,7 @@ type schedulerRuntimeState struct {
 	warmupMu                    sync.Mutex
 	warmupRunning               bool
 	warmups                     map[string]warmupEntry
+	warmupHistory               []warmupEntry
 	warmupAttempts              []warmupAttempt
 	warmupCandidatesLast        int
 	warmupSkippedBannedLast     int
@@ -146,6 +147,7 @@ type schedulerRuntimeState struct {
 	adqReservationCollisions uint64
 	adqDecisions             uint64
 	adqLastDecision          adqDecision
+	rotationRunway           quotaRunwayTracker
 	quotaEpoch               quotaEpochState
 
 	pricing             map[string]modelPricing
@@ -231,6 +233,7 @@ func configureSchedulerRuntime(raw []byte) {
 	schedulerRuntime.adqReservationCollisions = 0
 	schedulerRuntime.adqDecisions = 0
 	schedulerRuntime.adqLastDecision = adqDecision{}
+	schedulerRuntime.rotationRunway = quotaRunwayTracker{}
 	schedulerRuntime.quotaEpoch = newQuotaEpochState()
 	schedulerRuntime.quotas = make(map[string]quotaSnapshot)
 	schedulerRuntime.identities = make(map[string]string)
@@ -240,6 +243,7 @@ func configureSchedulerRuntime(raw []byte) {
 	schedulerRuntime.stopping = false
 	schedulerRuntime.detached = false
 	schedulerRuntime.warmups = make(map[string]warmupEntry)
+	schedulerRuntime.warmupHistory = nil
 	schedulerRuntime.warmupAttempts = nil
 	schedulerRuntime.warmupCandidatesLast = 0
 	schedulerRuntime.warmupSkippedBannedLast = 0
@@ -1253,6 +1257,7 @@ type persistedBanState struct {
 	Version                int                               `json:"version"`
 	Bans                   map[string]banEntry               `json:"bans"`
 	Warmups                map[string]warmupEntry            `json:"warmups,omitempty"`
+	WarmupHistory          []warmupEntry                     `json:"warmup_history,omitempty"`
 	WarmupAttempts         []warmupAttempt                   `json:"warmup_attempts,omitempty"`
 	BanResetConfirmations  map[string]banResetConfirmation   `json:"ban_reset_confirmations,omitempty"`
 	SerialActiveAuthID     string                            `json:"serial_active_auth_id,omitempty"`
@@ -1365,6 +1370,15 @@ func (s *schedulerRuntimeState) loadBanStateWithConfirmationMode(path string, re
 			continue
 		}
 		s.warmups[key] = entry
+	}
+	s.warmupHistory = nil
+	for _, entry := range state.WarmupHistory {
+		s.rememberWarmupLocked(entry, true, time.Now())
+	}
+	if len(s.warmupHistory) == 0 {
+		for _, entry := range state.Warmups {
+			s.rememberWarmupLocked(entry, true, time.Now())
+		}
 	}
 	s.mergeWarmupAttemptsLocked(state.WarmupAttempts, time.Now())
 	s.warmupMu.Unlock()
@@ -1559,6 +1573,7 @@ func (s *schedulerRuntimeState) persistBanState() bool {
 	}
 	s.mergeWarmupAttemptsLocked(nil, time.Now())
 	warmupAttempts := append([]warmupAttempt(nil), s.warmupAttempts...)
+	warmupHistory := append([]warmupEntry(nil), s.warmupHistory...)
 	s.warmupMu.Unlock()
 	s.banResetMu.Lock()
 	confirmations := make(map[string]banResetConfirmation, len(s.banResetConfirmations))
@@ -1575,6 +1590,7 @@ func (s *schedulerRuntimeState) persistBanState() bool {
 		FiveHourPhases:         fiveHourPhases,
 		Bans:                   banStore.snapshot(),
 		Warmups:                warmups,
+		WarmupHistory:          warmupHistory,
 		WarmupAttempts:         warmupAttempts,
 		BanResetConfirmations:  confirmations,
 		SerialActiveAuthID:     serialActiveAuthID,
@@ -1764,6 +1780,7 @@ type runtimeStatus struct {
 	RecentDecisions               []schedulerDecisionAudit         `json:"recent_decisions,omitempty"`
 	Snapshots                     []runtimeQuotaStatus             `json:"snapshots,omitempty"`
 	Warmups                       []runtimeWarmupStatus            `json:"warmups,omitempty"`
+	WarmupHistory                 []warmupEntry                    `json:"warmup_history,omitempty"`
 }
 
 // MarshalJSON keeps the internal scheduler math expressive while ensuring the
@@ -2035,7 +2052,7 @@ func runtimeCapacityEstimate(state pacingStateSnapshot, class string) (float64, 
 	return estimate.Credits, true
 }
 
-func runtimeADQAccountFor(snapshot quotaSnapshot, cfg pluginConfig, policy adqPolicy, state pacingStateSnapshot, circuit adqProviderCircuit, reservations *adqReservationBook, runway []quotaRunwayWindowAssessment, now time.Time) *runtimeADQAccountStatus {
+func runtimeADQAccountFor(snapshot quotaSnapshot, cfg pluginConfig, policy adqPolicy, state pacingStateSnapshot, circuit adqProviderCircuit, reservations *adqReservationBook, runway []quotaRunwayWindowAssessment, now time.Time, rotation ...[3]float64) *runtimeADQAccountStatus {
 	id := strings.TrimSpace(snapshot.AuthID)
 	if id == "" {
 		id = strings.TrimSpace(snapshot.AuthIndex)
@@ -2078,14 +2095,30 @@ func runtimeADQAccountFor(snapshot quotaSnapshot, cfg pluginConfig, policy adqPo
 	if cacheAge < 0 {
 		cacheAge = 0
 	}
+	weeklyOnly := poolFiveHourLimitStatus(quotaSnapshot{}, snapshot, now, cfg.StaleAfter) == "not_reported"
+	if _, present := fiveHourWindow(snapshot); !present && !weeklyOnly {
+		return nil
+	}
+	burnClass, burnCapacity := "5h", fiveCapacity
+	if weeklyOnly {
+		burnClass, burnCapacity = "weekly", weeklyCapacity
+	}
+	burnMean := adqRunwayBurnForClass(runway, burnClass, burnCapacity)
+	burnP90, burnP95 := burnMean, burnMean
+	if len(rotation) > 0 && rotation[0][2] > 0 {
+		burnMean, burnP90, burnP95 = rotation[0][0]*burnCapacity/100, rotation[0][1]*burnCapacity/100, rotation[0][2]*burnCapacity/100
+	}
+	for _, window := range snapshot.Windows {
+		if normalizeWindowClass(window.Class) == "5h" && !quotaWindowCycleStarted(window, snapshot.RefreshedAt, now) {
+			fiveReset = time.Time{}
+		}
+	}
 	input := adqAccountInput{
 		ID: id, AuthIndex: strings.TrimSpace(snapshot.AuthIndex), Plan: plan,
 		WeeklyCapacity: weeklyCapacity, WeeklyRemaining: weeklyCapacity * weeklyRemaining / 100,
 		FiveHourCapacity: fiveCapacity, FiveHourRemaining: fiveCapacity * fiveRemaining / 100,
 		WeeklyResetAt: weeklyReset, FiveHourResetAt: fiveReset,
-		BurnMean: adqRunwayBurnForClass(runway, "5h", fiveCapacity),
-		BurnP90:  adqRunwayBurnForClass(runway, "5h", fiveCapacity),
-		BurnP95:  adqRunwayBurnForClass(runway, "5h", fiveCapacity),
+		BurnMean: burnMean, BurnP90: burnP90, BurnP95: burnP95, WeeklyOnly: weeklyOnly,
 		CacheAge: cacheAge, ReservationFiveHour: reservationFive, ReservationWeekly: reservationWeek,
 		SettlingFiveHour: settlingFive, SettlingWeekly: settlingWeek,
 		ProviderState: circuit.State, ProviderRetryAt: circuit.RetryAt,
@@ -2191,6 +2224,8 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 	serialOverdraftSessions := len(s.serialOverdraft)
 	serialWeeklyRebalance := s.serialWeeklyRebalance
 	runwayByAuth := make(map[string][]quotaRunwayWindowAssessment)
+	rotationByAuth := make(map[string][3]float64)
+	rotationDemand := s.adqForecastDemandLocked(now)
 	for _, snapshot := range s.quotas {
 		canonical := strings.TrimSpace(snapshot.AuthID)
 		if canonical == "" {
@@ -2201,6 +2236,14 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 		}
 		if _, ok := runwayByAuth[canonical]; !ok {
 			runwayByAuth[canonical] = s.quotaRunway.Assess(snapshot, cfg, now)
+			class := "5h"
+			if _, present := fiveHourWindow(snapshot); !present {
+				class = "weekly"
+			}
+			mean, p90, p95, known := s.rotationBurnLocked(snapshot, class, 100, now)
+			if known {
+				rotationByAuth[canonical] = [3]float64{mean, p90, p95}
+			}
 		}
 	}
 	warmupCandidates := s.warmupCandidatesLast
@@ -2235,6 +2278,7 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 
 	s.warmupMu.Lock()
 	warmupTraffic := s.warmupTrafficStatusLocked(cfg, now)
+	warmupHistory := append([]warmupEntry(nil), s.warmupHistory...)
 	warmupAccounts := make(map[string]warmupTrafficStatus)
 	for _, snapshot := range quotas {
 		id := strings.TrimSpace(snapshot.AuthID)
@@ -2340,7 +2384,7 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 			if !stateOK && snapshot.AuthIndex != "" {
 				state, stateOK = pacingStates[strings.TrimSpace(snapshot.AuthIndex)]
 			}
-			adq := runtimeADQAccountFor(snapshot, cfg, adqPolicy, state, circuit, adqReservations, runwayByAuth[canonical], now)
+			adq := runtimeADQAccountFor(snapshot, cfg, adqPolicy, state, circuit, adqReservations, runwayByAuth[canonical], now, rotationByAuth[canonical])
 			if adq != nil {
 				if phase, exists := fiveHourPhases[canonical]; exists && phase.AuthIndex == snapshot.AuthIndex {
 					adq.PhaseAnchorMode, adq.PhaseBucket = phase.AnchorMode, phaseBucket(phase.ActiveResetAt)
@@ -2508,7 +2552,7 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 		AccountsTotal: len(seen), CalibratedAccounts: adqCalibratedAccounts, EstimatedAccounts: adqEstimatedAccounts,
 		ProviderCircuits: make(map[string]runtimeADQProviderCircuitStatus)}
 	if adqEnabled {
-		adqStatus.Pool = adqComputePool(adqMetrics, 0, adqPolicy, now)
+		adqStatus.Pool = adqComputePool(adqMetrics, rotationDemand, adqPolicy, now)
 		adqStatus.UsingFallback = len(adqMetrics) == 0
 		if len(adqMetrics) == 0 && len(seen) > 0 {
 			adqStatus.FallbackReason = "尚未获得可用于调度的额度窗口"
@@ -2684,6 +2728,7 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 	for index := len(decisions) - 1; index >= 0; index-- {
 		out.RecentDecisions = append(out.RecentDecisions, decisions[index])
 	}
+	out.WarmupHistory = warmupHistory
 	for _, entry := range warmups {
 		state := "attempted"
 		if entry.Blocked {

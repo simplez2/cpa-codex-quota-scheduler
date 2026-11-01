@@ -112,6 +112,12 @@ func (s *schedulerRuntimeState) quotaProbeReason(id string, now time.Time) strin
 	q := s.quotas[id]
 	health := s.authExpiry[id]
 	phase := s.fiveHourPhases[id]
+	originalPlan := phase.ActivateAt
+	if cfg.WarmupEnabled && phase.ActivateAt.After(now) {
+		phase.ActivateAt = s.rotationActivationDeadlineLocked(id, phase.ActivateAt, now)
+	}
+	rotationUrgent := originalPlan.After(now) && !phase.ActivateAt.After(now) && p.Failures == 0 &&
+		!now.Before(p.AttemptedAt.Add(max(cfg.WarmupMinInterval, 15*time.Minute)))
 	continuityUntil := s.continuityDemandUntil[id]
 	epochReason := s.quotaEpochProbeReasonLocked(id, now)
 	s.mu.RUnlock()
@@ -124,7 +130,7 @@ func (s *schedulerRuntimeState) quotaProbeReason(id string, now time.Time) strin
 	if epochReason != "" && (p.Failures == 0 || !now.Before(p.NextAt)) {
 		return epochReason
 	}
-	if now.Before(p.NextAt) {
+	if now.Before(p.NextAt) && !rotationUrgent {
 		return ""
 	}
 	// A live host continuity assessment may ask for a post-reset observation.

@@ -23,21 +23,22 @@ import (
 // no token or response body, only the auth/window bookkeeping needed to avoid
 // repeating the request after a CPA restart.
 type warmupEntry struct {
-	AuthID        string    `json:"auth_id"`
-	AuthIndex     string    `json:"auth_index,omitempty"`
-	Window        string    `json:"window"`
-	AttemptedAt   time.Time `json:"attempted_at"`
-	OutcomeAt     time.Time `json:"outcome_at,omitempty"`
-	Failures      int       `json:"failures,omitempty"`
-	CompletedAt   time.Time `json:"completed_at,omitempty"`
-	ActivatedAt   time.Time `json:"activated_at,omitempty"`
-	ResetAt       time.Time `json:"reset_at,omitempty"`
-	SuppressUntil time.Time `json:"suppress_until,omitempty"`
-	Status        int       `json:"status,omitempty"`
-	Error         string    `json:"error,omitempty"`
-	DispatchState string    `json:"dispatch_state,omitempty"`
-	Blocked       bool      `json:"blocked,omitempty"`
-	EpochID       string    `json:"epoch_id,omitempty"`
+	AuthID         string    `json:"auth_id"`
+	AuthIndex      string    `json:"auth_index,omitempty"`
+	Window         string    `json:"window"`
+	AttemptedAt    time.Time `json:"attempted_at"`
+	OutcomeAt      time.Time `json:"outcome_at,omitempty"`
+	Failures       int       `json:"failures,omitempty"`
+	CompletedAt    time.Time `json:"completed_at,omitempty"`
+	ActivatedAt    time.Time `json:"activated_at,omitempty"`
+	ResetAt        time.Time `json:"reset_at,omitempty"`
+	SuppressUntil  time.Time `json:"suppress_until,omitempty"`
+	Status         int       `json:"status,omitempty"`
+	Error          string    `json:"error,omitempty"`
+	DispatchState  string    `json:"dispatch_state,omitempty"`
+	Blocked        bool      `json:"blocked,omitempty"`
+	EpochID        string    `json:"epoch_id,omitempty"`
+	CoveredWindows []string  `json:"covered_windows,omitempty"`
 }
 
 type warmupCandidate struct {
@@ -129,26 +130,24 @@ func (s *schedulerRuntimeState) warmupStartupReady(now time.Time) bool {
 func (s *schedulerRuntimeState) scheduleWarmup(parent context.Context, skipAuthIDs map[string]struct{}) {
 	s.mu.RLock()
 	cfg := s.cfg
-	foregroundBusy := false
 	foregroundAuthIDs := make(map[string]struct{})
-	epochPending := s.quotaEpochHasPendingLocked()
 	if cfg.SchedulerMode == "balanced" {
 		now := time.Now()
 		for authID, account := range s.balancedAccounts {
 			if now.Sub(account.LastPicked) < time.Minute {
-				foregroundBusy = true
 				foregroundAuthIDs[authID] = struct{}{}
 			}
 			for _, pending := range account.Pending {
 				if now.Sub(pending.At) < balancedPendingTTL {
-					foregroundBusy = true
 					foregroundAuthIDs[authID] = struct{}{}
 				}
 			}
 		}
 	}
 	s.mu.RUnlock()
-	if !cfg.Enabled || !cfg.WarmupEnabled || (foregroundBusy && !epochPending) || strings.TrimSpace(cfg.StatePath) == "" || parent.Err() != nil {
+	// Foreground protection is credential-scoped. Continuous traffic on one
+	// credential must not starve idle siblings' weekly or five-hour activation.
+	if !cfg.Enabled || !cfg.WarmupEnabled || strings.TrimSpace(cfg.StatePath) == "" || parent.Err() != nil {
 		return
 	}
 	if !s.generationOwnerActive() {
@@ -340,6 +339,9 @@ func (s *schedulerRuntimeState) findWarmupCandidates(eligible map[string]warmupA
 	}
 	cfg := s.cfg
 	activeID := s.serialActiveAuthID
+	if cfg.SchedulerMode == "balanced" {
+		activeID = ""
+	}
 	polls := make(map[string]quotaPollState, len(s.quotaPolls))
 	for key, poll := range s.quotaPolls {
 		polls[key] = poll
@@ -758,6 +760,7 @@ func (s *schedulerRuntimeState) confirmPendingWarmups(quotas map[string]quotaSna
 			entry.Error = ""
 			s.warmups[key] = entry
 			changed = true
+			s.rememberWarmupLocked(entry, false, now)
 			slog.Info("codex-quota-scheduler: confirmed warmup reset anchor from quota probe",
 				"auth_id", entry.AuthID,
 				"window", entry.Window,
@@ -1168,7 +1171,14 @@ func (s *schedulerRuntimeState) recordWarmupOutcome(candidate warmupCandidate, s
 	// Without an upstream reset header this remains pending_confirmation. The
 	// local suppress_until prevents duplicate low-cost calls, while the next
 	// fresh quota probe snapshot supplies the real reset anchor shown in status.
+	target.CoveredWindows = nil
+	if epochWindows := warmupActivationWindows(candidate.Snapshot, now); err == nil && status >= 200 && status < 300 {
+		for _, window := range epochWindows {
+			target.CoveredWindows = append(target.CoveredWindows, window.Class)
+		}
+	}
 	s.warmups[targetKey] = target
+	s.rememberWarmupLocked(target, true, now)
 	epochSuccess := err == nil && status >= 200 && status < 300
 	epochCode, epochBlocked := classifyWarmupFailure(status, err)
 	s.warmupMu.Unlock()
