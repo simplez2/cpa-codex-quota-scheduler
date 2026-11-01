@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.36 — 2026-11-02
+
+- Keep automatic weekly-only fallback affinity and its concurrency queue target
+  behind usable higher-priority 5h credentials, including after Pro/Premium quota
+  changes. Preserve affinity within the 5h pool and explicit CPA account pins.
+- Admit confirmed weekly-only accounts through atomic weekly reservations and
+  settlement, without inventing 5h capacity or bypassing weekly admission gates.
+- Exclude an account's 5h capacity and remaining balance when its backing weekly
+  quota reaches the configured handoff threshold or a hard limit. Show blocked
+  and unconfirmed backing separately, and re-include only after a usable observation.
+
 ## 0.3.35 — 2026-11-02
 
 - Unify weekly bootstrap and subsequent five-hour rotation under one activation

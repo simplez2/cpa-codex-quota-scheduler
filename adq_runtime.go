@@ -295,7 +295,8 @@ func adqPendingWithoutReservation(account *balancedAccount, reservations *adqRes
 
 func (s *schedulerRuntimeState) adqInputForChoiceLocked(choice serialCandidate, now time.Time) (adqAccountInput, bool) {
 	rawID := strings.TrimSpace(choice.Candidate.ID)
-	if rawID == "" || !choice.QuotaKnown || !choice.WeeklyKnown || !choice.FiveHourKnown {
+	weeklyOnly := !choice.FiveHourKnown && poolFiveHourLimitStatus(quotaSnapshot{}, choice.Snapshot, now, s.cfg.StaleAfter) == "not_reported"
+	if rawID == "" || !choice.QuotaKnown || !choice.WeeklyKnown || (!choice.FiveHourKnown && !weeklyOnly) {
 		return adqAccountInput{}, false
 	}
 	snapshot := choice.Snapshot
@@ -318,11 +319,18 @@ func (s *schedulerRuntimeState) adqInputForChoiceLocked(choice serialCandidate, 
 	if !fiveKnown {
 		fiveCapacity, fiveKnown = adqCapacityFromSnapshot(snapshot, "5h")
 	}
+	if weeklyOnly {
+		// An upgrade invalidates the former plan's 5h capacity calibration.
+		fiveCapacity, fiveKnown = 0, false
+	}
 	plan, planWeight, _ := resolvedQuotaPlan(s.cfg, id, snapshot, now)
 	policy := s.adqPolicyLocked()
 	weeklyCapacity, fiveCapacity, capacitySource, fullyObserved := adqResolveCapacities(
 		weeklyCapacity, weeklyKnown, fiveCapacity, fiveKnown, planWeight, policy.MaxQuotaRatio5h,
 	)
+	if weeklyOnly {
+		fiveCapacity, fullyObserved = 0, weeklyKnown
+	}
 	reservationsFive, reservationsWeek := 0.0, 0.0
 	settlingFive, settlingWeek := 0.0, 0.0
 	if s.adqReservations != nil {
@@ -335,9 +343,13 @@ func (s *schedulerRuntimeState) adqInputForChoiceLocked(choice serialCandidate, 
 	}
 	pending := adqPendingWithoutReservation(account, s.adqReservations, now)
 	assessments := s.quotaRunway.Assess(snapshot, s.cfg, now)
-	burnMean, burnP90, burnP95, burnKnown := s.rotationBurnLocked(snapshot, "5h", fiveCapacity, now)
+	burnClass, burnCapacity := "5h", fiveCapacity
+	if weeklyOnly {
+		burnClass, burnCapacity = "weekly", weeklyCapacity
+	}
+	burnMean, burnP90, burnP95, burnKnown := s.rotationBurnLocked(snapshot, burnClass, burnCapacity, now)
 	if !burnKnown {
-		burnMean = adqRunwayBurnForClass(assessments, "5h", fiveCapacity)
+		burnMean = adqRunwayBurnForClass(assessments, burnClass, burnCapacity)
 		burnP90, burnP95 = burnMean, burnMean
 	}
 	circuit := s.adqCircuitLocked(id, now)
@@ -380,6 +392,7 @@ func (s *schedulerRuntimeState) adqInputForChoiceLocked(choice serialCandidate, 
 		CapacitySource:        capacitySource,
 		PhaseAnchor:           s.fiveHourPhases[id].ActiveResetAt,
 		PhaseAnchorMode:       s.fiveHourPhases[id].AnchorMode,
+		WeeklyOnly:            weeklyOnly,
 	}, true
 }
 
@@ -469,9 +482,13 @@ func (s *schedulerRuntimeState) adqRouteChoicesWithAllocationLocked(req pluginap
 		if !ok {
 			return "", adqReservation{}, false, true
 		}
+		fiveCost := cost
+		if decision.Metrics.WeeklyOnly {
+			fiveCost = 0
+		}
 		reservation, ok := s.adqReservations.TryReserve(adqReservationRequest{
 			AuthID: decision.AuthID, SessionKey: session, Model: req.Model,
-			FiveHour: cost, Weekly: cost, TTL: policy.ReservationTimeout,
+			FiveHour: fiveCost, Weekly: cost, TTL: policy.ReservationTimeout,
 		}, now)
 		if ok {
 			decision.ReservationID = reservation.ID

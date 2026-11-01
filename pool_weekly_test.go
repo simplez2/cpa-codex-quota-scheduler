@@ -7,7 +7,7 @@ import (
 )
 
 func poolAccount(id, plan string, remaining float64) runtimeQuotaStatus {
-	return runtimeQuotaStatus{AuthID: id, Plan: plan, Fresh: true, Windows: []runtimeQuotaWindowStatus{{Window: "weekly", RemainingPercent: remaining}}}
+	return runtimeQuotaStatus{AuthID: id, Plan: plan, Fresh: true, Windows: []runtimeQuotaWindowStatus{{Window: "weekly", Allowed: true, RemainingPercent: remaining}}}
 }
 
 func TestPoolWeeklyUsesUserEquivalentsAndRetainsThresholdAccounts(t *testing.T) {

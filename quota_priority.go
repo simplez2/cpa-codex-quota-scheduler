@@ -1,6 +1,11 @@
 package main
 
-import "time"
+import (
+	"strings"
+	"time"
+
+	"github.com/simplez2/cpa-codex-quota-scheduler/cpasdk/pluginapi"
+)
 
 // Quota priority is shared by all selectors. A weekly budget can distribute
 // equal-deadline work, but cannot spend a weekly-only backup ahead of usable 5h
@@ -62,6 +67,43 @@ func compareQuotaPriority(a, b quotaSelectionPriority) int {
 		return 1
 	}
 	return 0
+}
+
+// Affinity keeps conversations within a quota pool. A binding created while
+// using a weekly-only backup must yield when usable, higher-priority 5h quota
+// returns. A plan name alone never establishes either quota class.
+func quotaAffinityMustYield(current serialCandidate, choices []serialCandidate, cfg pluginConfig) bool {
+	if !current.QuotaKnown || current.FiveHourKnown {
+		return false
+	}
+	for _, choice := range choices {
+		if choice.Eligible && choice.QuotaKnown && choice.FiveHourKnown &&
+			windowRankInOrder("5h", cfg.WindowOrder) < windowRankInOrder(current.WindowClass, cfg.WindowOrder) {
+			return true
+		}
+	}
+	return false
+}
+
+// Caller owns s.mu. Use the same host candidate, quota and provider gates as
+// routing before giving up an old weekly-only affinity or its queue target.
+func (s *schedulerRuntimeState) quotaAffinityMustYieldLocked(current serialCandidate, req pluginapi.SchedulerPickRequest, now time.Time) bool {
+	if !current.QuotaKnown || current.FiveHourKnown {
+		return false
+	}
+	for _, candidate := range req.Candidates {
+		if strings.TrimSpace(candidate.ID) == current.Candidate.ID || !banStore.schedulable(candidate.ID, now) ||
+			s.adqProviderCircuitActiveLockedForConcurrency(candidate, now) {
+			continue
+		}
+		snapshot, found := s.lookupQuotaLocked(candidate.ID, candidateAuthIndex(candidate))
+		snapshot = s.serialConservativeQuotaLocked(snapshot, now)
+		choice := inspectSerialCandidate(candidate, snapshot, found, s.cfg, now)
+		if quotaAffinityMustYield(current, []serialCandidate{choice}, s.cfg) {
+			return true
+		}
+	}
+	return false
 }
 
 // A rejected atomic reservation advances to the next priority group. It must

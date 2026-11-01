@@ -15,6 +15,7 @@ class PriorityFixture(Fixture):
     def __init__(self, profile="expiry"):
         self.profile = profile
         self.anchor = int(time.time())
+        self.recovered = False
         super().__init__("priority")
         self.accounts = [
             {"id": credential_id(key, self.base_url),
@@ -43,14 +44,18 @@ class PriorityFixture(Fixture):
                     self.reply(400, b"{}")
                     return
                 weekly_only = position == 2
-                used = 100 if fixture.profile == "fallback" else (18, 8, 0)[position]
+                unavailable = fixture.profile == "fallback" or (fixture.profile == "recovery" and not fixture.recovered)
+                used = 100 if unavailable else (18, 8, 0)[position]
                 primary = None if weekly_only else {
                     "used_percent": used, "limit_window_seconds": 18000,
-                    "reset_at": fixture.anchor + (40 if position == 0 else 180) * 60}
-                weekly = {"used_percent": (51, 7, 1)[position],
+                    "reset_at": fixture.anchor + (3 if fixture.profile == "recovery" and not fixture.recovered else
+                                                   (40 if position == 0 else 180) * 60)}
+                weekly_used = (98, 98, 1) if fixture.profile == "weekly-threshold" else (51, 7, 1)
+                weekly = {"used_percent": weekly_used[position],
                           "limit_window_seconds": 604800,
                           "reset_at": fixture.anchor + (3600 if weekly_only else 6 * 86400)}
-                quota = {"plan_type": "team", "rate_limit": {"allowed": True,
+                plan = "self_serve_business_prolite" if weekly_only else "team"
+                quota = {"plan_type": plan, "rate_limit": {"allowed": True,
                          "limit_reached": False, "primary_window": primary,
                          "secondary_window": weekly}}
                 if not weekly_only:
@@ -65,12 +70,14 @@ class PriorityFixture(Fixture):
 
 
 def select_mode(cpa, mode):
-    if mode != "serial":
+    if mode != "serial" or cpa.fixture.profile == "recovery":
         path = cpa.dir / "config.yaml"
         source = path.read_text(encoding="utf-8")
         assert "      scheduler_mode: serial\n" in source
-        path.write_text(source.replace("      scheduler_mode: serial\n",
-                                       f"      scheduler_mode: {mode}\n"), encoding="utf-8")
+        source = source.replace("      scheduler_mode: serial\n", f"      scheduler_mode: {mode}\n")
+        if cpa.fixture.profile == "recovery":
+            source = source.replace("      warmup_enabled: false\n", "      warmup_enabled: false\n      quota_probe_on_demand: false\n")
+        path.write_text(source, encoding="utf-8")
         wait_until(lambda: cpa.status().get("scheduler_mode") == mode, 15,
                    "native configuration reload")
     cpa.ready()
@@ -88,7 +95,11 @@ def run_case(cpa, fixture, mode):
     if fixture.profile == "expiry":
         assert sooner["selection_priority"]["rank"] < later["selection_priority"]["rank"]
         assert later["selection_priority"]["rank"] < weekly["selection_priority"]["rank"]
-    connection, response = open_stream(cpa.port)
+    if fixture.profile == "weekly-threshold":
+        assert before["pool_5h"]["total_capacity"] == 0, before["pool_5h"]
+        assert before["pool_5h"]["weekly_blocked_accounts"] == 2, before["pool_5h"]
+    session_headers = {"Session-Id": "local-weekly-backup-recovery"}
+    connection, response = open_stream(cpa.port, session_headers)
     try:
         payload = read_to_end(response)
     finally:
@@ -98,8 +109,25 @@ def run_case(cpa, fixture, mode):
     generations = fixture.snapshot()["generations"]
     expected = fixture.accounts[0 if fixture.profile == "expiry" else 2]
     assert len(generations) == 1 and generations[0]["auth_index"] == expected["auth_index"], generations
+    if fixture.profile == "recovery":
+        with fixture.lock:
+            fixture.recovered = True
+        def five_hour_observed():
+            row = next(item for item in cpa.status()["snapshots"] if item["auth_id"] == fixture.accounts[0]["id"])
+            return any(w["window"] == "5h" and w["used_percent"] == 18 for w in row["windows"])
+        wait_until(five_hour_observed, 45, "native 5h recovery observation")
+        connection, response = open_stream(cpa.port, session_headers)
+        try:
+            payload = read_to_end(response)
+        finally:
+            response.close()
+            connection.close()
+        assert b"response.completed" in payload, payload[:1000]
+        generations = fixture.snapshot()["generations"]
+        assert len(generations) == 2 and generations[1]["auth_index"] == fixture.accounts[0]["auth_index"], generations
     return {"status": "PASS", "profile": fixture.profile, "mode": mode,
-            "selected": "five-hour-sooner" if fixture.profile == "expiry" else "weekly-only-backup",
+            "selected": "weekly-backup-then-recovered-five-hour" if fixture.profile == "recovery" else
+                        "five-hour-sooner" if fixture.profile == "expiry" else "weekly-only-backup",
             "generations": len(generations), "official_counts_distinguish_2_0_unknown": True,
             "generation_active": before.get("generation_active")}
 
@@ -115,7 +143,7 @@ def main():
               "cpa_sha256": digest(executable), "plugin_sha256": digest(plugin),
               "harness_sha256": digest(Path(__file__).resolve()), "cases": {}}
     for mode in ("serial", "balanced"):
-        for profile in ("expiry", "fallback"):
+        for profile in ("expiry", "fallback", "recovery", "weekly-threshold"):
             name = mode + "/" + profile
             temp = Path(tempfile.mkdtemp(prefix="cpa-continuity-priority-"))
             fixture, cpa = PriorityFixture(profile), None

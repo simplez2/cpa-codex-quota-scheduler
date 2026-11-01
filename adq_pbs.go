@@ -1121,6 +1121,10 @@ func (b *adqReservationBook) Settle(id string, actualFive, actualWeek float64, s
 		now = time.Now()
 	}
 	actualFive = maxADQ(actualFive, 0)
+	if r.FiveHour == 0 {
+		// Weekly-only admissions have no 5h reservoir to settle against.
+		actualFive = 0
+	}
 	actualWeek = maxADQ(actualWeek, 0)
 	if actualFive <= 0 && actualWeek <= 0 {
 		r.Status = adqReservationReconciled

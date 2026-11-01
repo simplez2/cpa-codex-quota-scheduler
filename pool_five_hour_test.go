@@ -29,7 +29,7 @@ func TestFiveHourBalanceSurvivesRuntimeStatusJSONSanitizer(t *testing.T) {
 func fiveHourPoolAccount(id, plan string, remaining float64) runtimeQuotaStatus {
 	account := poolAccount(id, plan, 75)
 	account.FiveHourLimitStatus = "limited"
-	account.Windows = append(account.Windows, runtimeQuotaWindowStatus{Window: "5h", RemainingPercent: remaining})
+	account.Windows = append(account.Windows, runtimeQuotaWindowStatus{Window: "5h", Allowed: true, RemainingPercent: remaining})
 	return account
 }
 
@@ -139,6 +139,66 @@ func TestFiveHourReportingWeightsAndExclusionsAreIndependent(t *testing.T) {
 		if _, err := parsePluginConfig([]byte(text)); err == nil {
 			t.Fatalf("accepted %s", text)
 		}
+	}
+}
+
+func TestFiveHourPoolRequiresSpendableWeeklyBacking(t *testing.T) {
+	now := time.Now()
+	for _, tc := range []struct {
+		name, mode                       string
+		used, reserve                    float64
+		allowed, exhausted, wantIncluded bool
+	}{
+		{"before-threshold", "threshold_only", 97.9, 0, true, false, true},
+		{"at-threshold", "threshold_only", 98, 0, true, false, false},
+		{"above-threshold", "threshold_only", 99, 0, true, false, false},
+		{"hard-exhausted", "429_only", 100, 0, true, false, false},
+		{"provider-exhausted", "429_only", 50, 0, true, true, false},
+		{"provider-disallowed", "429_only", 50, 0, false, false, false},
+		{"at-reserve", "reserve_aware", 95, 5, true, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := defaultPluginConfig()
+			cfg.SerialHandoffMode, cfg.SerialSwitchPercent, cfg.ReserveWeeklyPercent = tc.mode, 98, tc.reserve
+			a := fiveHourPoolAccount("account", "pro_20x", 100)
+			a.Windows[0].RemainingPercent = 100 - tc.used
+			a.Windows[0].Allowed, a.Windows[0].LimitReached = tc.allowed, tc.exhausted
+			got := poolFiveHourStatus([]runtimeQuotaStatus{a, a}, cfg, now)
+			if tc.wantIncluded {
+				if got.Accounts != 1 || got.TotalCapacity != 10 || got.RemainingCapacity != 10 || got.WeeklyBlockedAccounts != 0 {
+					t.Fatalf("usable weekly backing omitted: %+v", got)
+				}
+			} else if got.Accounts != 0 || got.TotalCapacity != 0 || got.RemainingCapacity != 0 || got.WeeklyBlockedAccounts != 1 {
+				t.Fatalf("unspendable 5h capacity counted: %+v", got)
+			}
+			if got.InventoryAccounts != 1 || poolWeeklyStatus([]runtimeQuotaStatus{a}, cfg, now).TotalCapacity != 10 {
+				t.Fatal("usable 5h filtering erased weekly inventory")
+			}
+		})
+	}
+}
+
+func TestFiveHourPoolWeeklyResetNeedsFreshBalanceBeforeReentry(t *testing.T) {
+	now := time.Now()
+	cfg := defaultPluginConfig()
+	a := fiveHourPoolAccount("account", "team_standard", 100)
+	a.Windows[0].CycleStarted = true
+	a.Windows[0].ResetAt = now.Add(-time.Second).Format(time.RFC3339)
+	a.Windows[0].RemainingPercent = 0
+	got := poolFiveHourStatus([]runtimeQuotaStatus{a}, cfg, now)
+	if got.TotalCapacity != 0 || got.WeeklyUnconfirmedAccounts != 1 || got.ScopeComplete {
+		t.Fatalf("expired weekly cycle fabricated available 5h capacity: %+v", got)
+	}
+	a.Windows[0].ResetAt = now.Add(7 * 24 * time.Hour).Format(time.RFC3339)
+	a.Windows[0].RemainingPercent = 100
+	got = poolFiveHourStatus([]runtimeQuotaStatus{a}, cfg, now)
+	if got.TotalCapacity != 1 || got.RemainingCapacity != 1 || got.WeeklyUnconfirmedAccounts != 0 {
+		t.Fatalf("new weekly observation failed to restore 5h pool: %+v", got)
+	}
+	a.Windows = a.Windows[1:]
+	got = poolFiveHourStatus([]runtimeQuotaStatus{a}, cfg, now)
+	if got.TotalCapacity != 0 || got.WeeklyUnconfirmedAccounts != 1 {
+		t.Fatalf("missing weekly backing inferred unlimited: %+v", got)
 	}
 }
 
