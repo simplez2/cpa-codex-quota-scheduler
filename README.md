@@ -5,7 +5,7 @@
 
 Standalone CPA plugin for balanced concurrent or serial Codex account selection, native quota polling,
 5h/weekly/monthly windows, persistent 429 quarantine and optional warmup.
-Source version: **0.3.36**. Published platform builds and checksums are available
+Source version: **0.3.37**. Published platform builds and checksums are available
 from [GitHub Releases](https://github.com/simplez2/cpa-codex-quota-scheduler/releases).
 See [CPA permissions and compatibility](CPA_PERMISSIONS.md) before installation.
 
@@ -22,8 +22,8 @@ the library SHA-256 to its version, platform, Go toolchain and source commit.
 their validated manifests. These hashes detect mismatched or damaged downloads;
 they are not an independent publisher signature.
 
-The overview reports weekly and 5h pool balances separately in editable Team
-equivalents. Only credentials with an observed 5h limit and spendable weekly
+The overview reports weekly and 5h pool balances separately using editable
+capacity multipliers (1x, 10x, 20x). Only credentials with an observed 5h limit and spendable weekly
 backing enter the 5h denominator. A weekly handoff threshold or hard limit
 excludes both that credential's total 5h capacity and its remaining 5h balance;
 missing or expired weekly evidence stays unconfirmed until observed again.
@@ -52,8 +52,11 @@ Visual references: [Nick Ho](https://nickho-motorsports.nl/),
 [CSS/SVG refraction](https://kube.io/blog/liquid-glass-css-svg/).
 
 The weekly pool progress uses editable `pool_weekly_capacity_weights`, independent
-of routing priors: Team Standard and Plus default to 1 Team;
-Team Premium and Pro 5x default to 5 and Pro 20x to 10. Remaining percentage is
+of routing priors: Team Standard and Plus default to 1x;
+Team Premium and Pro 5x default to the current 10x capacity, and Pro 20x to 20x.
+Saved custom weights are preserved; older saved 5x/10x reporting defaults can
+be updated to 10x/20x in the panel.
+Remaining percentage is
 `sum(capacity * weekly remaining percent) / sum(capacity)`. Cached observations
 are disclosed; missing or expired weekly windows stay in the denominator and
 produce a range until observed. Edit these weights in the allocation panel or
@@ -447,10 +450,12 @@ countdown. These plans reduce simultaneous optional activations; they do not
 guarantee that every pool can avoid simultaneous exhaustion under sustained load.
 
 Plan priors default to `team_standard`. `plus` and `team_standard` use 1;
-`pro_5x` and `team_premium` use 5; `pro_20x` uses 20. Set per-auth overrides in
+`pro_5x` and `team_premium` use 10; `pro_20x` uses 20. The legacy `pro_5x`
+configuration key is retained for compatibility and now represents 10x capacity.
+Set per-auth overrides in
 `quota_account_plans` (highest priority). Otherwise the existing CPA quota poll
 automatically maps `team` to Standard (1x), `self_serve_business_prolite` to
-Premium (5x), and `plus` to Plus (1x). Missing usage metadata falls back to CPA
+Premium (10x), and `plus` to Plus (1x). Missing usage metadata falls back to CPA
 `id_token.plan_type`; unknown or stale labels use `quota_default_plan`. Native
 `business`, usage-based plans and ambiguous `pro` never imply a fixed tier.
 The panel shows the raw upstream SKU, observation source and override status.

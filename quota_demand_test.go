@@ -162,7 +162,7 @@ func TestDemandRetainsCachedPlanWithoutRefreshingObservation(t *testing.T) {
 	cfg.QuotaProbeOnDemand = true
 	q := quotaSnapshot{Plan: quotaPlanObservation{Type: "self_serve_business_prolite", Source: "cpa_usage", ObservedAt: now.Add(-time.Hour)}}
 	plan, weight, source := resolvedQuotaPlan(cfg, "a", q, now)
-	if plan != "team_premium" || weight != 5 || source != "cpa_usage" || q.Plan.fresh(now, cfg.StaleAfter) {
+	if plan != "team_premium" || weight != 10 || source != "cpa_usage" || q.Plan.fresh(now, cfg.StaleAfter) {
 		t.Fatal("cached plan lost or made fresh")
 	}
 	cfg.QuotaProbeOnDemand = false

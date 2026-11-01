@@ -5,9 +5,9 @@ import (
 	"time"
 )
 
-// These user-defined weekly equivalents are independent of routing priors.
+// Reporting multipliers are editable independently of routing priors.
 func defaultPoolWeeklyCapacityWeights() map[string]float64 {
-	return map[string]float64{"team_standard": 1, "team_premium": 5, "plus": 1, "pro_5x": 5, "pro_20x": 10}
+	return map[string]float64{"team_standard": 1, "team_premium": 10, "plus": 1, "pro_5x": 10, "pro_20x": 20}
 }
 
 // A successfully fetched inventory includes credentials with no quota snapshot.
@@ -60,7 +60,7 @@ func poolWindowStatus(accounts []runtimeQuotaStatus, overrides map[string]float6
 			weights[plan] = value
 		}
 	}
-	out := runtimePoolWeeklyStatus{Unit: "Team", CapacityWeights: weights, Plans: make(map[string]int)}
+	out := runtimePoolWeeklyStatus{Unit: "x", CapacityWeights: weights, Plans: make(map[string]int)}
 	seen := make(map[string]bool)
 	for _, account := range accounts {
 		if account.AuthID == "" || seen[account.AuthID] {

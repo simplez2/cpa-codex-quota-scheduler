@@ -21,7 +21,7 @@ func TestFiveHourBalanceSurvivesRuntimeStatusJSONSanitizer(t *testing.T) {
 	if err := json.Unmarshal(response["pool_5h"], &balance); err != nil {
 		t.Fatal(err)
 	}
-	if balance["total_capacity"] != float64(1) || balance["remaining_percent"] != float64(75) || balance["accounts"] != float64(1) || balance["inventory_accounts"] != float64(1) {
+	if balance["unit"] != "x" || balance["total_capacity"] != float64(1) || balance["remaining_percent"] != float64(75) || balance["accounts"] != float64(1) || balance["inventory_accounts"] != float64(1) {
 		t.Fatalf("public API lost embedded balance: %s", response["pool_5h"])
 	}
 }
@@ -47,10 +47,10 @@ func TestFiveHourPoolExcludesUncappedAndUnclassifiedWithoutChangingWeekly(t *tes
 	accounts = append(accounts, accounts[0])
 	weekly := poolWeeklyStatus(accounts, cfg, time.Now())
 	five := poolFiveHourStatus(accounts, cfg, time.Now())
-	if five.Accounts != 1 || five.InventoryAccounts != 4 || five.ExcludedAccounts != 1 || five.NoLimitReportedAccounts != 1 || five.UnclassifiedAccounts != 1 || five.ScopeComplete || five.TotalCapacity != 10 || five.RemainingPercent == nil || *five.RemainingPercent != 50 {
+	if five.Accounts != 1 || five.InventoryAccounts != 4 || five.ExcludedAccounts != 1 || five.NoLimitReportedAccounts != 1 || five.UnclassifiedAccounts != 1 || five.ScopeComplete || five.TotalCapacity != 20 || five.RemainingPercent == nil || *five.RemainingPercent != 50 {
 		t.Fatalf("wrong five-hour scope: %+v", five)
 	}
-	if weekly.Accounts != 4 || weekly.TotalCapacity != 17 || weekly.UnknownAccounts != 1 {
+	if weekly.Accounts != 4 || weekly.TotalCapacity != 32 || weekly.UnknownAccounts != 1 {
 		t.Fatalf("five-hour exclusions changed weekly inventory: %+v", weekly)
 	}
 	if len(five.InventoryAuthIDs) != 4 {
@@ -68,7 +68,7 @@ func TestFiveHourPoolExpiredAndUnstartedWindows(t *testing.T) {
 	idle.Windows[1].PlaceholderReset = true
 	idle.Windows[1].ResetAt = now.Add(-time.Hour).Format(time.RFC3339)
 	got := poolFiveHourStatus([]runtimeQuotaStatus{expired, idle}, defaultPluginConfig(), now)
-	if got.Complete || got.UnknownAccounts != 1 || got.CachedAccounts != 1 || got.TotalCapacity != 6 || got.RemainingPercent != nil || math.Abs(got.MinimumPercent-500./6) > 1e-9 || got.MaximumPercent != 100 {
+	if got.Complete || got.UnknownAccounts != 1 || got.CachedAccounts != 1 || got.TotalCapacity != 11 || got.RemainingPercent != nil || math.Abs(got.MinimumPercent-1000./11) > 1e-9 || got.MaximumPercent != 100 {
 		t.Fatalf("expired cycle invented a refill or idle pool omitted: %+v", got)
 	}
 }
@@ -122,14 +122,14 @@ func TestFiveHourLimitAbsenceNeedsCurrentFullNativeResponse(t *testing.T) {
 }
 
 func TestFiveHourReportingWeightsAndExclusionsAreIndependent(t *testing.T) {
-	cfg, err := parsePluginConfig([]byte("pool_5h_capacity_weights: {pro_20x: 20}\npool_5h_excluded_accounts: [manual]\n"))
+	cfg, err := parsePluginConfig([]byte("pool_5h_capacity_weights: {pro_20x: 12}\npool_5h_excluded_accounts: [manual]\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	accounts := []runtimeQuotaStatus{fiveHourPoolAccount("pro", "pro_20x", 50), fiveHourPoolAccount("plus", "plus", 100), fiveHourPoolAccount("manual", "team_standard", 100)}
 	five := poolFiveHourStatus(accounts, cfg, time.Now())
 	weekly := poolWeeklyStatus(accounts, cfg, time.Now())
-	if five.TotalCapacity != 21 || five.RemainingPercent == nil || math.Abs(*five.RemainingPercent-1100./21) > 1e-9 || weekly.TotalCapacity != 12 {
+	if five.TotalCapacity != 13 || five.RemainingPercent == nil || math.Abs(*five.RemainingPercent-700./13) > 1e-9 || weekly.TotalCapacity != 22 {
 		t.Fatalf("independent weights not applied: five=%+v weekly=%+v", five, weekly)
 	}
 	if changes, fields := validatePanelSettings(nil, map[string]any{"pool_5h_capacity_weights": map[string]float64{"pro_20x": 20}, "pool_5h_excluded_accounts": []string{"manual"}}); len(fields) > 0 || len(changes) != 2 {
@@ -165,13 +165,13 @@ func TestFiveHourPoolRequiresSpendableWeeklyBacking(t *testing.T) {
 			a.Windows[0].Allowed, a.Windows[0].LimitReached = tc.allowed, tc.exhausted
 			got := poolFiveHourStatus([]runtimeQuotaStatus{a, a}, cfg, now)
 			if tc.wantIncluded {
-				if got.Accounts != 1 || got.TotalCapacity != 10 || got.RemainingCapacity != 10 || got.WeeklyBlockedAccounts != 0 {
+				if got.Accounts != 1 || got.TotalCapacity != 20 || got.RemainingCapacity != 20 || got.WeeklyBlockedAccounts != 0 {
 					t.Fatalf("usable weekly backing omitted: %+v", got)
 				}
 			} else if got.Accounts != 0 || got.TotalCapacity != 0 || got.RemainingCapacity != 0 || got.WeeklyBlockedAccounts != 1 {
 				t.Fatalf("unspendable 5h capacity counted: %+v", got)
 			}
-			if got.InventoryAccounts != 1 || poolWeeklyStatus([]runtimeQuotaStatus{a}, cfg, now).TotalCapacity != 10 {
+			if got.InventoryAccounts != 1 || poolWeeklyStatus([]runtimeQuotaStatus{a}, cfg, now).TotalCapacity != 20 {
 				t.Fatal("usable 5h filtering erased weekly inventory")
 			}
 		})

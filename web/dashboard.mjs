@@ -280,7 +280,7 @@ function renderAccounts() {
     planLabel.title = account.upstream_plan_type ? '上游标签：'+account.upstream_plan_type+' · '+(account.upstream_plan_source==='cpa_usage'?'CPA 额度查询':'CPA 认证信息')+' · '+dateText(account.upstream_plan_observed_at) : '上游尚未返回可识别的套餐标签';
     meta.append(planLabel);
     info.append(meta);
-    const capacity = (account.five_hour_capacity_weight_prior || 1)+'×';
+    const capacity = (account.five_hour_capacity_weight_prior || 1)+'x';
     const planStatus = automatic ? '自动识别 · 容量参考 '+capacity : account.plan_source==='account_override' ? '手动覆盖 · 容量参考 '+capacity : '默认档位 '+configuredPlan+' · 容量参考 '+capacity;
     info.append(element('span','subtext',planStatus+(automatic&&!account.upstream_plan_fresh?' · 缓存识别':'')));
     const priority=element('span','subtext',quotaPriorityText(account));

@@ -1,5 +1,5 @@
 import {poolWeeklyDefaults,poolWeeklyLabels} from './pool.mjs';
-const plans = [['team_standard','Team Standard · 1×'],['plus','Plus · 1×'],['pro_5x','Pro 5x · 5×'],['team_premium','Team Premium · 5×'],['pro_20x','Pro 20x · 20×']];
+const plans = [['team_standard','Team Standard · 1x'],['plus','Plus · 1x'],['pro_5x','Pro 5x · 当前 10x'],['team_premium','Team Premium · 10x'],['pro_20x','Pro · 20x']];
 const handoff = [['threshold_only','达到使用阈值'],['reserve_aware','保留安全余量']];
 // Metadata is presentation only. Defaults and validation come from the running
 // plugin so an omitted YAML field is never silently saved as zero or empty.
@@ -34,8 +34,8 @@ export const fields = [
   ['serial_prefer_active_cycle','优先使用已开始的周期','allocation','boolean','在符合额度条件的账号中优先考虑已开始计时的周期。'],
   ['serial_soft_continuation','允许旧会话越过软阈值','allocation','boolean','默认关闭，达到设定阈值后该会话换号。开启时可继续使用原凭据直到真实不可用；其他会话的换号不迁移本会话，已输出内容的请求不回放。'],
   ['quota_account_plans','每个账号的套餐','allocation','plans','默认自动识别 Team Standard、Team Premium 和 Plus。手动覆盖优先于自动识别，仅影响调度参考，不会更改订阅。'],
-  ['pool_weekly_capacity_weights','总池周额度换算','allocation','weights','每种套餐的周容量折成多少个 Team。默认普通 Team、Plus 为 1，Team 5x、Pro 5x 为 5，Pro 20x 为 10。只影响总额度统计。'],
-  ['pool_5h_capacity_weights','有 5h 限制账号的容量换算','allocation','weights','与周额度分别设置。默认普通 Team、Plus 为 1，Team 5x、Pro 5x 为 5，Pro 20x 为 10。只影响 5h 统计，不代表上游承诺的固定调用次数。'],
+  ['pool_weekly_capacity_weights','周额度容量倍率','allocation','weights','以基础容量 1x 计量。Team Standard、Plus 默认 1x，Pro 5x 与 Team Premium 按当前 10x 计，Pro 20x 按 20x 计。剩余量按实际百分比加权，可自定义倍率。'],
+  ['pool_5h_capacity_weights','5h 额度容量倍率','allocation','weights','与周额度分别设置。默认使用 1x、10x、20x 容量倍率；仅纳入有 5h 限制且周额度可用的账号。倍率是容量参考，不代表固定调用次数。'],
   ['pool_5h_excluded_accounts','不参与 5h 统计的账号','allocation','excluded','仅勾选你已确认没有 5h 限制的账号。自动识别会跳过当前完整额度响应中未返回 5h 限制的账号；查询失败仍显示待确认。此处不改变周额度、切号或预热。'],
   ['quota_probe_on_demand','按需探测额度','allocation','boolean','默认开启。空闲时停止周期探测；新调用产生后按冷却间隔合并查询。初始化、已知周期重置和预热前校验只按事件触发。'],
   ['auth_expiry_auto_repair','自动恢复失效的认证过期标记','allocation','boolean','仅处理明确标记的长期令牌：连续两次原生额度认证成功且凭据未变化后恢复。保留 OAuth/JWT 过期限制；不增加生成或预热请求。'],
@@ -186,9 +186,9 @@ export function createSettingsEditor({api,notify,onSaved,onView}) {
         const box=make('div','capacity-weights');
         for(const [plan,text] of Object.entries(poolWeeklyLabels)) {
           const label=make('label','',text),input=make('input');input.type='number';input.min=.001;input.max=1000;input.step='any';input.required=true;
-          input.id='setting-'+name+'-'+plan;input.setAttribute('aria-label',text+'折算 Team 容量');input.value=draft[name]?.[plan]??poolWeeklyDefaults[plan];
+          input.id='setting-'+name+'-'+plan;input.setAttribute('aria-label',text+'容量倍率');input.value=draft[name]?.[plan]??poolWeeklyDefaults[plan];
           input.addEventListener('input',()=>{draft[name]={...poolWeeklyDefaults,...draft[name],[plan]:input.value===''?null:Number(input.value)};update();});
-          label.append(input,make('span','subtext','Team'));box.append(label);
+          label.append(input,make('span','subtext','x'));box.append(label);
           if(!controls.has(name))controls.set(name,input);
         }
         row.append(box);

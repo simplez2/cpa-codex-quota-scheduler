@@ -18,7 +18,7 @@ func TestNativeQuotaPlanResolution(t *testing.T) {
 		weight    float64
 	}{
 		{"team", "team_standard", 1}, {"plus", "plus", 1},
-		{"self_serve_business_prolite", "team_premium", 5},
+		{"self_serve_business_prolite", "team_premium", 10},
 		{"business", "team_standard", 1}, {"pro", "team_standard", 1},
 		{"self_serve_business_usage_based", "team_standard", 1}, {"unknown_future", "team_standard", 1},
 	} {
@@ -40,7 +40,7 @@ func TestNativeQuotaPlanResolution(t *testing.T) {
 			cfg.QuotaDefaultPlan = "pro_5x"
 			cfg.QuotaProbeOnDemand = false
 			for _, at := range []time.Time{now.Add(cfg.StaleAfter + time.Second), now.Add(-time.Second)} {
-				if p, w, s := resolvedQuotaPlan(cfg, "a", q, at); p != "pro_5x" || w != 5 || s != "default" {
+				if p, w, s := resolvedQuotaPlan(cfg, "a", q, at); p != "pro_5x" || w != 10 || s != "default" {
 					t.Fatalf("stale/future metadata: %s %v %s", p, w, s)
 				}
 			}
@@ -131,15 +131,15 @@ func TestNativePremiumWeightsReachBalancedSerialAndPanel(t *testing.T) {
 		q.Plan = quotaPlanObservation{Type: label, Source: "cpa_usage", ObservedAt: now}
 		s.quotas[id] = q
 	}
-	for i := 0; i < 600; i++ {
+	for i := 0; i < 660; i++ {
 		s.balancedPick(req, now)
 	}
-	if s.balancedAccounts["a"].Picks != 100 || s.balancedAccounts["b"].Picks != 500 {
+	if s.balancedAccounts["a"].Picks != 60 || s.balancedAccounts["b"].Picks != 600 {
 		t.Fatalf("automatic capacity shares: %+v", s.balancedStatusLocked(now))
 	}
 	choice := inspectSerialCandidate(pluginapi.SchedulerAuthCandidate{ID: "b"}, s.quotas["b"], true, s.cfg, now)
 	s.annotateSerialCandidateLocked(&choice, now)
-	if choice.Plan != "team_premium" || choice.PlanWeight != 5 {
+	if choice.Plan != "team_premium" || choice.PlanWeight != 10 {
 		t.Fatalf("serial capacity: %+v", choice)
 	}
 	found := false
@@ -147,7 +147,7 @@ func TestNativePremiumWeightsReachBalancedSerialAndPanel(t *testing.T) {
 		if q.AuthID == "b" {
 			found = true
 		}
-		if q.AuthID == "b" && (q.Plan != "team_premium" || q.PlanWeight != 5 || q.PlanSource != "cpa_usage" || !q.UpstreamPlanFresh) {
+		if q.AuthID == "b" && (q.Plan != "team_premium" || q.PlanWeight != 10 || q.PlanSource != "cpa_usage" || !q.UpstreamPlanFresh) {
 			t.Fatalf("panel capacity: %+v", q)
 		}
 	}
