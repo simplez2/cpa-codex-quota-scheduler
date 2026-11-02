@@ -24,17 +24,25 @@ test('account order follows backend priority groups instead of account names or 
   assert.deepEqual(accounts.sort(compareAccountPriorities).map(a=>a.auth_id),['z-expiring','b-dormant','a-weekly','unknown']);
 });
 
-test('reset credit details show distinct applicability, exact GMT+8 expiry and opt-in status',()=>{
-  const d={applicable_known:true,applicable:0,applicable_fresh:true,count:2,complete:true,list_fresh:true,auto_enabled:false,credits:[
+test('reset credit details use supported cards instead of the zero usage applicability hint',()=>{
+  const d={applicable_known:true,applicable:0,applicable_fresh:true,supported_available_known:true,supported_available_count:2,supported_available_fresh:true,count:2,complete:true,list_fresh:true,auto_enabled:false,credits:[
     {expires_at:'2026-11-07T00:04:39.734115Z'},{expires_at:'2026-11-30T20:42:04.744230Z'}
   ]};
   const text=resetCreditDetails({reset_credit_details:d},Date.parse('2026-11-01T00:00:00Z')).join('\n');
-  assert.match(text,/当前允许使用：0 次/);
+  assert.match(text,/当前套餐可用重置卡：2 张/);
+  assert.doesNotMatch(text,/当前允许使用|官方当前不允许/);
   assert.match(text,/2026\/11\/07 08:04:39（GMT\+8）/);
   assert.match(text,/2026\/12\/01 04:42:04（GMT\+8）/);
   assert.match(text,/自动用卡：已关闭/);
   assert.doesNotMatch(text,/已过期/);
   assert.match(resetCreditDetails({reset_credit_details:{...d,auto_enabled:true,auto_before:'10m0s',auto_reason:'previous_attempt_requires_review'}}).join('\n'),/停止自动消耗/);
+});
+
+test('raw usage applicability alone does not establish card availability',()=>{
+  const raw=resetCreditDetails({reset_credit_details:{applicable_known:true,applicable:0,applicable_fresh:true,auto_enabled:false}}).join('\n');
+  assert.doesNotMatch(raw,/当前允许使用|当前套餐可用重置卡/);
+  const cached=resetCreditDetails({reset_credit_details:{supported_available_known:true,supported_available_count:2,supported_available_fresh:false,auto_enabled:false}}).join('\n');
+  assert.match(cached,/2 张（缓存，使用前重新核验）/);
 });
 
 test('missing and stale reset data never imply zero, unlimited credits or verified success',()=>{

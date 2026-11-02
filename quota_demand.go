@@ -130,8 +130,16 @@ func (s *schedulerRuntimeState) quotaProbeReason(id string, now time.Time) strin
 	if epochReason != "" && (p.Failures == 0 || !now.Before(p.NextAt)) {
 		return epochReason
 	}
-	if now.Before(p.NextAt) && !rotationUrgent {
+	// An idle account's 30-minute standby cooldown must not postpone a due
+	// activation whose stricter two-minute preflight has expired. This only
+	// advances successful observations; failed calls keep their own backoff.
+	warmupDue := p.Failures == 0 && p.Error == "" && !p.AttemptedAt.IsZero() &&
+		s.warmupQuotaProbeDue(id, cfg, q, p, phase, now)
+	if now.Before(p.NextAt) && !rotationUrgent && !warmupDue {
 		return ""
+	}
+	if warmupDue {
+		return "warmup"
 	}
 	// A live host continuity assessment may ask for a post-reset observation.
 	// It never overrides per-credential backoff or authenticates a refill.
@@ -177,37 +185,43 @@ func (s *schedulerRuntimeState) quotaProbeReason(id string, now time.Time) strin
 	if confirm.Confirmations == 1 {
 		return "reset_confirmation"
 	}
-	if !cfg.WarmupEnabled {
-		return ""
+	return ""
+}
+
+// Budget, suppression, timing and quota evidence must all agree before an
+// activation may request a fresher observation. This never sends model text.
+func (s *schedulerRuntimeState) warmupQuotaProbeDue(id string, cfg pluginConfig, q quotaSnapshot, p quotaPollState, phase fiveHourPhaseState, now time.Time) bool {
+	if !cfg.WarmupEnabled || !warmupQuotaHasHeadroom(q, cfg) || warmupSnapshotFresh(q, now, cfg.StaleAfter) {
+		return false
 	}
 	if _, banned := banStore.lookup(id); banned {
-		return ""
+		return false
 	}
 	s.warmupMu.Lock()
 	defer s.warmupMu.Unlock()
 	if s.warmupRunning || s.warmupTrafficStatusLocked(cfg, now).HoldReason != "" || s.warmupTrafficStatusLocked(cfg, now, id).HoldReason != "" {
-		return ""
+		return false
 	}
 	window, needs := unstartedWarmupWindow(q, now)
 	if !needs {
-		return ""
+		return false
 	}
 	if normalizeWindowClass(window.Class) == "5h" && phase.ActivateAt.After(now) {
-		return ""
+		return false
 	}
 	if s.warmupSuppressedAccountsLocked(now, cfg.WarmupRetryAfter)[id] {
-		return ""
+		return false
 	}
 	entry, found := s.warmups[warmupKey(id, window.Class)]
 	if found && warmupEntrySuppressesNow(entry, now, cfg.WarmupRetryAfter) {
-		return ""
+		return false
 	}
 	// At most one preflight per admission interval even if CPA cannot admit a warmup.
 	interval := max(cfg.WarmupMinInterval, 15*time.Minute)
-	if !quotaSnapshotFresh(q, now, cfg.StaleAfter) && !now.Before(p.AttemptedAt.Add(interval)) {
-		return "warmup"
+	if normalizeWindowClass(window.Class) == "5h" && !phase.ActivateAt.IsZero() && !phase.ActivateAt.After(now) {
+		interval = max(cfg.WarmupMinInterval, warmupQuotaMaxAge)
 	}
-	return ""
+	return !now.Before(p.AttemptedAt.Add(interval))
 }
 
 // An authoritative cooldown is a timed restriction. Expiration releases that

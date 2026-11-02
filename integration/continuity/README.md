@@ -34,6 +34,10 @@ weekly-only backup have larger weekly budgets. When both 5h windows are hard
 exhausted, the original request must complete through the weekly-only backup.
 The same native status response must distinguish official available reset counts
 of 2, 0, and unknown. Run with the same `--cpa`, `--plugin` and `--output` options.
+`reset_credits.py` additionally verifies default-off discovery, plan-supported
+card counts and opt-in pre-expiry redemption when usage applicability is zero,
+then verifies that a reload cannot replay the same durable redemption intent.
+All cards and redemptions in that fixture are synthetic.
 `--case` selects one case, and `--keep` retains the otherwise temporary CPA
 configuration and logs for investigation. A skipped or failed case gives a
 nonzero exit status. The seven cases are:

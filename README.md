@@ -5,7 +5,7 @@
 
 Standalone CPA plugin for balanced concurrent or serial Codex account selection, native quota polling,
 5h/weekly/monthly windows, persistent 429 quarantine and optional warmup.
-Source version: **0.3.37**. Published platform builds and checksums are available
+Source version: **0.3.38**. Published platform builds and checksums are available
 from [GitHub Releases](https://github.com/simplez2/cpa-codex-quota-scheduler/releases).
 See [CPA permissions and compatibility](CPA_PERMISSIONS.md) before installation.
 
@@ -417,7 +417,11 @@ by the same pool/deadline rules. `selection_priority.rank` describes a group,
 not a promise that a busy, pinned, or already-bound request will use that account.
 Nested `rate_limit_reset_credits.available_count` (and the legacy flat
 `rate_limit_reset_credits_available_count`) is shown as official available reset
-credits. Current `applicable_available_count` is separate. Each card's official
+credits. Available, unexpired cards explicitly supported by the current plan
+are counted separately. The usage endpoint's `applicable_available_count` is
+retained as diagnostic metadata, not interpreted as redemption permission:
+it can be zero while CPA's native panel allows a reset from the credit list.
+Each card's official
 expiry is fetched through the native reset-credit list and displayed in GMT+8;
 list reads are cached for at most 15 minutes. Missing counts are unknown, not zero. The local
 `observed_reset_count` is `cycle_generation - 1`: observed 5h transitions in the
@@ -425,7 +429,7 @@ current weekly epoch, excluding missed cycles and the first observation. It is
 not official remaining reset credits and never raises selection priority.
 `reset_credits_auto_use` is **off by default**. Opting in permits one real native
 redemption near the earliest expiry, by default `10m` beforehand (configurable
-from `1m` to `24h`). Identity, plan support, fresh applicability and already-used
+from `1m` to `24h`). Identity, fresh available-card details, plan support and already-used
 quota are rechecked; the feature does not generate model text. The upstream
 selects the card to consume, and the plugin verifies the earliest card vanished.
 A durable, generation-fenced journal and unique `redeem_request_id` prevent

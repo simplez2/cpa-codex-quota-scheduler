@@ -964,6 +964,9 @@ func (s *schedulerRuntimeState) executeCPAWarmup(parent context.Context, cfg plu
 		return
 	}
 	s.recordWarmupOutcome(candidate, result.StatusCode, windows, nil)
+	// This completed model call is new usage, not a synthetic timer event.
+	// Confirm its fixed reset anchor without waiting for an idle poll cooldown.
+	s.requestImmediateQuotaProbe(candidate.Snapshot.AuthID, time.Now())
 
 	activated := 0
 	for _, window := range windows {
