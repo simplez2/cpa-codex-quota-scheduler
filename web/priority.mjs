@@ -24,8 +24,8 @@ export function resetCreditDetails(account, now=Date.now()) {
   const d=account?.reset_credit_details;
   if(!d)return [];
   const lines=[];
-  if(d.applicable_known===true && Number.isSafeInteger(d.applicable) && d.applicable>=0) {
-    lines.push('当前允许使用：'+d.applicable+' 次'+(d.applicable_fresh?'':'（缓存，使用前重新核验）'));
+  if(d.supported_available_known===true && Number.isSafeInteger(d.supported_available_count) && d.supported_available_count>=0) {
+    lines.push('当前套餐可用重置卡：'+d.supported_available_count+' 张'+(d.supported_available_fresh?'':'（缓存，使用前重新核验）'));
   }
   const date=value=>{
     const n=Date.parse(value);
@@ -42,7 +42,7 @@ export function resetCreditDetails(account, now=Date.now()) {
   else if(d.count>0 && !d.complete)lines.push('部分到期明细未返回，自动用卡暂停。');
   const reasons={
     details_unconfirmed:'等待到期明细',details_incomplete:'明细不完整',details_changed:'用卡明细已变化，等待重新检查',scheduled:'等待临近到期',no_available_credits:'没有未过期的卡',
-    due:'正在核验',plan_unsupported:'套餐支持情况待确认',too_late:'已过安全操作时间',not_applicable:'官方当前不允许使用',
+    due:'正在核验',plan_unsupported:'套餐支持情况待确认',too_late:'已过安全操作时间',not_applicable:'用卡条件待重新核验',
     quota_unused:'额度尚未消耗',identity_unconfirmed:'凭据身份待确认',quota_not_confirmed:'额度查询未确认',
     previous_attempt_requires_review:'前次结果待人工核查，已停止自动消耗',verification_pending:'官方已确认，等待明细核验',
     used:'已使用并核验',recovery_pending:'用卡已确认，额度或路由恢复仍待核验',dispatch_canceled:'操作取消，需核查记录',adapter_unsupported:'自定义额度接口不支持自动用卡',

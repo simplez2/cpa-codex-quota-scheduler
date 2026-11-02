@@ -55,7 +55,7 @@ class ResetFixture(PriorityFixture):
                             "secondary_window": {"used_percent": used, "limit_window_seconds": 604800,
                                                  "reset_at": fixture.anchor + 86400}},
                             "rate_limit_reset_credits": {"available_count": count,
-                                                         "applicable_available_count": int(used > 0)}}
+                                                         "applicable_available_count": 0}}
                     elif method == "GET" and url == CREDITS:
                         def credit(name, offset):
                             return {"id": index + "-" + name, "reset_type": "codex_rate_limits",
@@ -103,7 +103,9 @@ def run(cpa, fixture):
     assert fixture.posts == 0, "default-off discovery consumed a credit"
     before = snapshots(cpa)
     assert all(not s["reset_credit_details"]["auto_enabled"] for s in before)
-    assert all(s["reset_credit_details"]["applicable"] == 1 for s in before)
+    assert all(s["reset_credit_details"]["applicable"] == 0 for s in before)
+    assert all(s["reset_credit_details"]["supported_available_count"] == 2
+               and s["reset_credit_details"]["supported_available_fresh"] for s in before)
     source = source.replace("reset_credits_auto_use: false", "reset_credits_auto_use: true")
     config.write_text(source, encoding="utf-8")
     wait_until(lambda: fixture.posts == 3 and all(
@@ -126,6 +128,7 @@ def run(cpa, fixture):
     assert not fixture.assertions, fixture.assertions
     assert not fixture.snapshot()["generations"], "reset feature generated model text"
     return {"status": "PASS", "credentials": 3, "default_off_writes": 0,
+            "zero_usage_applicability_did_not_block_supported_cards": True,
             "simulated_redemptions": fixture.posts, "unique_durable_intents": 3,
             "duplicate_redemptions_after_reload": 0, "model_requests": 0}
 

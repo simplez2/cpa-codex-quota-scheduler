@@ -110,7 +110,7 @@ func TestWarmupEligibilityRejectsUnsafeOrUnnecessaryRequests(t *testing.T) {
 	resetBanStoreForTest()
 	t.Cleanup(resetBanStoreForTest)
 	now := time.Now()
-	for _, scenario := range []string{"healthy", "weekly_exhausted", "weekly_reserve", "weekly_disallowed", "active", "poll_failed", "stale", "binding_changed", "used_since_admission"} {
+	for _, scenario := range []string{"healthy", "weekly_exhausted", "weekly_reserve", "weekly_threshold", "weekly_disallowed", "active", "poll_failed", "stale", "binding_changed", "used_since_admission"} {
 		t.Run(scenario, func(t *testing.T) {
 			q := readyWarmupQuota("a", now)
 			candidate := warmupCandidate{Snapshot: q, Window: q.Windows[0]}
@@ -120,6 +120,10 @@ func TestWarmupEligibilityRejectsUnsafeOrUnnecessaryRequests(t *testing.T) {
 				q.Windows[1].UsedPercent = 100
 			case "weekly_reserve":
 				q.Windows[1].UsedPercent = 95
+			case "weekly_threshold":
+				state.cfg.ReserveWeeklyPercent = 0
+				state.cfg.SerialSwitchPercent = 98
+				q.Windows[1].UsedPercent = 98
 			case "weekly_disallowed":
 				q.Windows[1].Allowed = false
 			case "active":

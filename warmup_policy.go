@@ -143,6 +143,9 @@ func warmupFailureDelay(base time.Duration, failures int) time.Duration {
 func warmupQuotaHasHeadroom(snapshot quotaSnapshot, cfg pluginConfig) bool {
 	for _, window := range snapshot.Windows {
 		class := normalizeWindowClass(window.Class)
+		if class == "weekly" && serialWindowQuotaReason(window, cfg) != "eligible" {
+			return false
+		}
 		if class != "" && window.UsedPercent >= 100-reserveForWindow(cfg, class) {
 			return false
 		}

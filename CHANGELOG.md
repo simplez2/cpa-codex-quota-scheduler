@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.38 — 2026-11-02
+
+- Match CPA's native reset eligibility: use fresh available, unexpired,
+  plan-supported reset cards instead of blocking on a zero or missing usage
+  applicability hint. Preserve expiry timing, identity rechecks and durable
+  duplicate protection. Display plan-supported card counts without claiming
+  that the usage hint is a redemption permission.
+- Stop background activation when weekly quota reaches the configured handoff
+  threshold. Refresh stale due-activation preflights before a successful idle
+  polling cooldown, while retaining failure backoff and warmup budgets.
+- Immediately request a native quota observation after a completed warmup so
+  confirmation does not wait for the idle polling cooldown.
+
 ## 0.3.37 — 2026-11-02
 
 - Use x capacity units throughout weekly/5h balances, details, editors and the

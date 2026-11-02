@@ -59,7 +59,10 @@ change it only to an endpoint trusted to receive that credential.
 Reset-credit lists use `GET https://chatgpt.com/backend-api/wham/rate-limit-reset-credits`.
 `reset_credits_auto_use` defaults to **false**. Enabling it permits a real
 `POST .../rate-limit-reset-credits/consume` with a unique `redeem_request_id`
-shortly before expiry (default `10m`), after fresh eligibility/identity checks.
+shortly before expiry (default `10m`), after fresh identity, available-card and
+plan-support checks. As in CPA's native panel, the credit list establishes
+availability; a zero `applicable_available_count` in usage metadata is not a
+redemption veto. This does not permit spending outside the configured expiry window.
 The server chooses the consumed card; the plugin cannot specify a card ID.
 This is an opt-in upstream mutation, separate from model warmup. A generation-
 fenced journal at `state_path + ".reset-credits.json"` prevents write replay;

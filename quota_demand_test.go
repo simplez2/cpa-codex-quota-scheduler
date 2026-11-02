@@ -194,6 +194,57 @@ func TestImmediateRecoveryProbeOverridesStandbyBackoff(t *testing.T) {
 	}
 }
 
+func TestDueFiveHourWarmupRefreshesStalePreflightBeforeStandbyCooldown(t *testing.T) {
+	for _, scenario := range []string{"due", "upstream_backoff", "not_due", "weekly_threshold", "fresh", "recent_probe", "daily_budget", "already_warmed"} {
+		t.Run(scenario, func(t *testing.T) {
+			resetBanStoreForTest()
+			t.Cleanup(resetBanStoreForTest)
+			now := time.Now().UTC().Truncate(time.Second)
+			cfg := defaultPluginConfig()
+			cfg.WarmupEnabled, cfg.QuotaProbeOnDemand = true, true
+			cfg.ReserveWeeklyPercent = 0
+			cfg.SerialSwitchPercent = 98
+			q := readyWarmupQuota("a", now.Add(-8*time.Minute))
+			poll := quotaPollState{AuthIndex: q.AuthIndex, AttemptedAt: now.Add(-8 * time.Minute), NextAt: now.Add(22 * time.Minute)}
+			phase := fiveHourPhaseState{AuthID: "a", AuthIndex: q.AuthIndex, Cycle: 2,
+				ActiveResetAt: now.Add(-time.Hour), PlannedResetAt: now.Add(-time.Hour), ActivateAt: now.Add(-time.Minute)}
+			state := schedulerRuntimeState{cfg: cfg, quotas: map[string]quotaSnapshot{"a": q},
+				quotaPolls: map[string]quotaPollState{"a": poll}, fiveHourPhases: map[string]fiveHourPhaseState{"a": phase},
+				warmups: make(map[string]warmupEntry)}
+			switch scenario {
+			case "upstream_backoff":
+				poll.Failures, poll.Error = 1, "quota_http_429"
+				state.quotaPolls["a"] = poll
+			case "not_due":
+				phase.ActivateAt = now.Add(time.Hour)
+				state.fiveHourPhases["a"] = phase
+			case "weekly_threshold":
+				q.Windows[1].UsedPercent = 98
+				state.quotas["a"] = q
+			case "fresh":
+				state.quotas["a"] = readyWarmupQuota("a", now)
+			case "recent_probe":
+				poll.AttemptedAt = now.Add(-time.Minute)
+				state.quotaPolls["a"] = poll
+			case "daily_budget":
+				for i := 0; i < cfg.WarmupMaxPerDay; i++ {
+					state.warmupAttempts = append(state.warmupAttempts, warmupAttempt{AuthID: "a", At: now.Add(-time.Duration(i+2) * time.Hour)})
+				}
+			case "already_warmed":
+				state.warmups["a|5h"] = warmupEntry{AuthID: "a", Window: "5h", AttemptedAt: now.Add(-time.Hour),
+					CompletedAt: now.Add(-time.Hour), ActivatedAt: now.Add(-time.Hour), ResetAt: now.Add(4 * time.Hour), SuppressUntil: now.Add(4 * time.Hour)}
+			}
+			reason := state.quotaProbeReason("a", now)
+			if (reason == "warmup") != (scenario == "due") {
+				t.Fatalf("preflight reason=%q for %s", reason, scenario)
+			}
+			if state.quotas["a"].RefreshedAt != q.RefreshedAt && scenario != "fresh" {
+				t.Fatal("preflight request fabricated quota freshness")
+			}
+		})
+	}
+}
+
 func TestResetCPACredentialCooldownUsesHostRuntimeReset(t *testing.T) {
 	state := schedulerRuntimeState{
 		cfg: defaultPluginConfig(),

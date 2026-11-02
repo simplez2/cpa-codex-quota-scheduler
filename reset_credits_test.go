@@ -303,6 +303,41 @@ func TestResetCreditAutoUsesOnceAndSurvivesReload(t *testing.T) {
 	}
 }
 
+func TestResetCreditAutoUsesSupportedCardDespiteUsageApplicabilityHint(t *testing.T) {
+	for _, applicable := range []any{0, nil} {
+		t.Run(fmt.Sprintf("applicable-%v", applicable), func(t *testing.T) {
+			f := newResetCreditFixture(t)
+			f.state.cfg.ResetCreditsAutoUse = true
+			f.applicable = applicable
+			f.tick()
+			if f.posts != 1 || f.state.resetCredits[f.auth.ID].LastAction != "verified" {
+				t.Fatalf("supported expiring card blocked by usage hint: posts=%d state=%+v", f.posts, f.state.resetCredits)
+			}
+			f.tick()
+			if f.posts != 1 {
+				t.Fatal("usage hint permitted a duplicate redemption")
+			}
+		})
+	}
+}
+
+func TestResetCreditPanelCountsOnlyUnexpiredPlanSupportedCards(t *testing.T) {
+	f := newResetCreditFixture(t)
+	f.credits = append(f.credits, resetTestCredit("expired", time.Now().Add(-time.Hour)))
+	f.credits[1]["is_supported_by_plan"] = false
+	f.tick()
+	panel := f.state.status().Snapshots[0].ResetCreditDetails
+	if panel.Count != 3 || panel.SupportedAvailable != 1 || !panel.SupportedAvailableKnown || !panel.SupportedAvailableFresh {
+		t.Fatalf("wrong plan-supported availability: %+v", panel)
+	}
+	state := f.state.resetCredits[f.auth.ID]
+	state.Complete = false
+	panel = resetCreditStatus(state, f.state.quotas[f.auth.ID], f.state.cfg, time.Now())
+	if panel.SupportedAvailableKnown || panel.SupportedAvailableFresh {
+		t.Fatal("incomplete card list claimed known eligibility")
+	}
+}
+
 func TestResetCreditAutoUnknownOutcomeNeverReplays(t *testing.T) {
 	for _, status := range []int{200, 429, 503} {
 		t.Run(fmt.Sprint(status), func(t *testing.T) {
@@ -342,15 +377,11 @@ func TestResetCreditConfirmedWriteOnlyRetriesReadVerification(t *testing.T) {
 }
 
 func TestResetCreditAutoRefusesIneligibleOrChangedInputs(t *testing.T) {
-	for _, name := range []string{"applicable-zero", "applicable-unknown", "unused", "future", "expired", "unsupported", "disabled", "replaced", "manual-consume", "custom-adapter", "no-durable-state", "canceled"} {
+	for _, name := range []string{"unused", "future", "expired", "unsupported", "disabled", "replaced", "manual-consume", "custom-adapter", "no-durable-state", "canceled"} {
 		t.Run(name, func(t *testing.T) {
 			f := newResetCreditFixture(t)
 			f.state.cfg.ResetCreditsAutoUse = true
 			switch name {
-			case "applicable-zero":
-				f.applicable = 0
-			case "applicable-unknown":
-				f.applicable = nil
 			case "unused":
 				f.used = 0
 			case "future":

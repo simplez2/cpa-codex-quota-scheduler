@@ -467,11 +467,11 @@ func (s *schedulerRuntimeState) maybeAutoUseResetCredit(ctx context.Context, cfg
 		return state
 	}
 	state.AutoFailures = 0
-	if !quota.ResetCreditsApplicableKnown || quota.ResetCreditsApplicable <= 0 {
-		state.AutoReason = "not_applicable"
-		state.NextAt = resetCreditEligibilityRetry(credit, time.Now())
-		return state
-	}
+	// The usage endpoint's applicable_available_count can be zero while the
+	// native reset-credit list reports available, plan-supported cards. CPA's
+	// own reset action uses that list, not the usage hint, as its admission
+	// evidence. Keep the hint for diagnostics; do not turn it into a write veto.
+	// The exact earliest card is re-read below before durable reservation.
 	used := false
 	for _, window := range quota.Windows {
 		used = used || window.UsedPercent > 0
@@ -661,21 +661,24 @@ type resetCreditPanelRow struct {
 }
 
 type resetCreditPanelStatus struct {
-	Count           int                   `json:"count"`
-	CountKnown      bool                  `json:"count_known"`
-	Applicable      int                   `json:"applicable"`
-	ApplicableKnown bool                  `json:"applicable_known"`
-	ApplicableFresh bool                  `json:"applicable_fresh"`
-	ListFresh       bool                  `json:"list_fresh"`
-	Complete        bool                  `json:"complete"`
-	ObservedAt      string                `json:"observed_at,omitempty"`
-	Error           string                `json:"error,omitempty"`
-	Credits         []resetCreditPanelRow `json:"credits"`
-	AutoEnabled     bool                  `json:"auto_enabled"`
-	AutoBefore      string                `json:"auto_before"`
-	AutoReason      string                `json:"auto_reason"`
-	LastAction      string                `json:"last_action,omitempty"`
-	ActionAt        string                `json:"action_at,omitempty"`
+	Count                   int                   `json:"count"`
+	CountKnown              bool                  `json:"count_known"`
+	Applicable              int                   `json:"applicable"`
+	ApplicableKnown         bool                  `json:"applicable_known"`
+	ApplicableFresh         bool                  `json:"applicable_fresh"`
+	SupportedAvailable      int                   `json:"supported_available_count"`
+	SupportedAvailableKnown bool                  `json:"supported_available_known"`
+	SupportedAvailableFresh bool                  `json:"supported_available_fresh"`
+	ListFresh               bool                  `json:"list_fresh"`
+	Complete                bool                  `json:"complete"`
+	ObservedAt              string                `json:"observed_at,omitempty"`
+	Error                   string                `json:"error,omitempty"`
+	Credits                 []resetCreditPanelRow `json:"credits"`
+	AutoEnabled             bool                  `json:"auto_enabled"`
+	AutoBefore              string                `json:"auto_before"`
+	AutoReason              string                `json:"auto_reason"`
+	LastAction              string                `json:"last_action,omitempty"`
+	ActionAt                string                `json:"action_at,omitempty"`
 }
 
 func resetCreditStatus(state resetCreditState, q quotaSnapshot, cfg pluginConfig, now time.Time) resetCreditPanelStatus {
@@ -708,11 +711,16 @@ func resetCreditStatus(state resetCreditState, q quotaSnapshot, cfg pluginConfig
 		out.AutoReason = state.AutoReason
 	}
 	for _, c := range state.Credits {
+		if c.Supported && c.ExpiresAt.After(now) {
+			out.SupportedAvailable++
+		}
 		row := resetCreditPanelRow{ExpiresAt: c.ExpiresAt.Format(time.RFC3339), Supported: c.Supported}
 		if !c.GrantedAt.IsZero() {
 			row.GrantedAt = c.GrantedAt.Format(time.RFC3339)
 		}
 		out.Credits = append(out.Credits, row)
 	}
+	out.SupportedAvailableKnown = state.CountKnown && state.Complete
+	out.SupportedAvailableFresh = out.SupportedAvailableKnown && out.ListFresh
 	return out
 }
