@@ -115,6 +115,10 @@ model quota when enabled.
   Advertising `scheduler_continuity` in the plugin does not add it to an
   unchanged official host. The panel distinguishes configured settings from
   observed host callbacks.
+- For v8.0.52 use
+  [`CLIProxyAPI-v8.0.52-continuity.patch`](integration/CONTINUITY-v8.0.52.md)
+  against its pinned upstream revision and checksum. This retains the newer
+  upstream plugin capabilities.
 - For v8.0.44 use only
   [`CLIProxyAPI-v8.0.44-continuity.patch`](integration/CONTINUITY-v8.0.44.md)
   against the exact revision and SHA-256 in its manifest. The v8.0.4 and

@@ -5,7 +5,7 @@
 
 Standalone CPA plugin for balanced concurrent or serial Codex account selection, native quota polling,
 5h/weekly/monthly windows, persistent 429 quarantine and optional warmup.
-Source version: **0.3.38**. Published platform builds and checksums are available
+Source version: **0.3.39**. Published platform builds and checksums are available
 from [GitHub Releases](https://github.com/simplez2/cpa-codex-quota-scheduler/releases).
 See [CPA permissions and compatibility](CPA_PERMISSIONS.md) before installation.
 
@@ -554,6 +554,7 @@ upstream risk threshold or guarantee that an account will not be restricted.
 Transparent recovery of the same streaming request also requires the matching
 CPA host pre-output quota failover patch. Use the host patch and configuration
 for the exact CPA version: the
+[v8.0.52 integration](integration/CONTINUITY-v8.0.52.md),
 [v8.0.44 integration](integration/CONTINUITY-v8.0.44.md) and the older
 [v8.0.4 / v7.2.152 integrations](integration/README.md) have different bases and
 configuration keys. Verify the running host rather than treating installation
