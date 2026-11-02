@@ -51,8 +51,9 @@ func parseResetCreditCounts(raw json.RawMessage) resetCreditCounts {
 	return resetCreditCounts{n, a, known, applicableKnown}
 }
 
-// IDs are hashed immediately: consumption selects a credit on the upstream
-// side and accepts only redeem_request_id, not a client-selected credit ID.
+// IDs are hashed immediately. Automatic redemption sends only redeem_request_id
+// and lets the upstream select the credit. Manual CPA/Keeper pickers can use the
+// upstream's optional credit_id without exposing raw IDs in scheduler state.
 type resetCredit struct {
 	Key       string    `json:"key"`
 	GrantedAt time.Time `json:"granted_at"`

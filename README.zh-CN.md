@@ -38,6 +38,9 @@ CPA 原生插件，提供额度调度、会话粘性、凭据并发限制、额�
 
 ## 官方重置卡与到期自动使用
 
+CPA 与 Keeper 的手动选券需要管理页与 Keeper 后端配套更新，安装调度插件不会改变原生弹窗。
+可复现的单券选择补丁、构建基线及验收说明见 [手动选择重置券](integration/reset-credit-picker/README.zh-CN.md)。
+
 支持官方新字段 `rate_limit_reset_credits.available_count`，保留旧字段兼容。
 “官方可用次数”取自重置卡明细；“当前套餐可用重置卡”只统计未过期、明确支持当前套餐的卡。
 用量接口的 `applicable_available_count` 保留为原始诊断字段；它可能为 0，不能解释为禁止兑换。
