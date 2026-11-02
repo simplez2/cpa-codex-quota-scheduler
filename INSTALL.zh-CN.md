@@ -63,7 +63,8 @@ Windows 使用对应服务身份的 NTFS ACL。无需给插件 root、管理员�
 ## 宿主与升级
 
 凭据并发保护需要 CPA v8.0.4+。使用更旧宿主时，先关闭 `account_concurrency_enabled`。
-自动长等待必须另外应用准确匹配的宿主补丁；v8.0.44 见仓库
+自动长等待必须另外应用准确匹配的宿主补丁；v8.0.52 见仓库
+[新版集成说明](https://github.com/simplez2/cpa-codex-quota-scheduler/blob/main/integration/CONTINUITY-v8.0.52.md)，v8.0.44 见
 [集成说明](https://github.com/simplez2/cpa-codex-quota-scheduler/blob/main/integration/CONTINUITY-v8.0.44.md)。
 面板显示已配置并不证明宿主已实际调用该能力。
 

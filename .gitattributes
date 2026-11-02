@@ -11,3 +11,4 @@
 *.ps1 text eol=crlf
 # Unified diffs contain intentional context prefixes before tabs and blank lines.
 integration/*.patch text eol=lf -whitespace
+integration/reset-credit-picker/*.patch text eol=lf -whitespace

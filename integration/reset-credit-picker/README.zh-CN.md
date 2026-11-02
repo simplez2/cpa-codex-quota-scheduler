@@ -18,9 +18,14 @@ Keeper 和 CPA 提交前重新读取当前账号的明细；所选券失效、�
 | --- | --- | --- |
 | `keeper.patch` | [Willxup/cpa-usage-keeper](https://github.com/Willxup/cpa-usage-keeper) | `f53fec8d3f7c0f189cf046aeae807375fd9b23e4` |
 | `management.patch` | [router-for-me/Cli-Proxy-API-Management-Center](https://github.com/router-for-me/Cli-Proxy-API-Management-Center) | `f154fa9380825c4fe94bc577a9abaa7e505f8875` |
+| `keeper-v2.0.3.patch` | [Willxup/cpa-usage-keeper](https://github.com/Willxup/cpa-usage-keeper) | `9db74cfc380d11064af80cf1626efd6e3d068217` |
 
 在对应基线的干净工作区使用 `git apply --check`，再 `git apply`。
 Keeper 按自身 Dockerfile 构建；管理页使用上游锁定的 Bun 1.4.3，执行 `bun run verify`，发布单文件 `dist/index.html`。
+
+Keeper v2 使用单独的 `keeper-v2.0.3.patch`，保留新版 Claude grant 和组织选择链路。
+升级前备份 v1 数据库，并先用副本验证迁移；回退 v1 必须使用迁移前的数据库副本。
+Codex 提交失败时保留弹窗和所选券，展示错误并等待用户处理，不自动重复兑换。
 
 官方客户端的请求契约见
 [rate_limit_resets.rs](https://github.com/openai/codex/blob/1a604d58da344c84528fecd5b5154105f597d70b/codex-rs/backend-client/src/client/rate_limit_resets.rs)：

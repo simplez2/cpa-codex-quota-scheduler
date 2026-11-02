@@ -1,6 +1,6 @@
 # Codex 额度调度
 
-源码版本：**0.3.38**。
+源码版本：**0.3.39**。
 
 CPA 原生插件，提供额度调度、会话粘性、凭据并发限制、额度恢复等待和管理面板。
 使用 CPA 的原生账号清单与额度查询，不需要 Keeper、独立数据库或额外账号服务。
@@ -88,7 +88,7 @@ OAuth/JWT 到期不改写。详见 [CPA_PERMISSIONS.md](CPA_PERMISSIONS.md)。
 
 - 凭据并发保护需要 CPA v8.0.4+ 的请求 ID 与终态回调；旧宿主需要关闭该项。
 - 长时间自动等待需要匹配版本的宿主补丁。安装插件本身不会给原版 CPA 增加此能力。
-- v8.0.44 宿主见 [集成说明](integration/CONTINUITY-v8.0.44.md)；旧版本补丁不能混用。
+- v8.0.52 宿主见 [集成说明](integration/CONTINUITY-v8.0.52.md)，v8.0.44 见[对应说明](integration/CONTINUITY-v8.0.44.md)；各版本补丁不能混用。
 - Linux 包使用 Debian 12 glibc 基线；另外提供 Linux ARM64、macOS Apple Silicon 和 Windows x64。
 - CI 对 Linux、Windows、macOS 执行测试、竞态检查、静态检查、漏洞扫描和动态库构建。
   本地故障注入覆盖恢复、取消、超时、WebSocket、反风暴和 5h 优先级；它不等同于生产账号耗尽验收。

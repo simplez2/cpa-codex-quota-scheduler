@@ -2,7 +2,7 @@ import { resourceBase, readPanelKey, validKey, decodeStored, rememberPanelKey, r
 import { createSettingsEditor, weeklyAllocationLabel, continuitySummary } from './settings.mjs';
 import { concurrencyView, waitReasons, availableQuota } from './concurrency.mjs';
 import { weeklyBudgetPercentPerMinute, formatWeeklyBudgetRate } from './budget.mjs';
-import { quotaPriorityText, resetCreditsText, resetCreditDetails, observedResetsText, compareAccountPriorities } from './priority.mjs';
+import { quotaPriorityText, resetCreditsText, resetCreditView, observedResetsText, compareAccountPriorities } from './priority.mjs';
 import { poolWindowView } from './pool.mjs';
 import { createPanelMotion } from './motion.mjs';
 import { warmupRecords } from './warmup-history.mjs';
@@ -17,6 +17,7 @@ const upstreamPlans = {team:'Team Standard',self_serve_business_prolite:'Team Pr
 const reasons = {weekly_budget_rebalance:'按周日均预算重新平衡',weekly_remaining_rebalance:'按周余量重新平衡',manual:'手动选择',manual_selection:'手动选择',manual_cleared:'恢复自动调配',initial:'首次选择',active_missing:'当前账号已不可用',quota_exhausted:'额度已用尽',new_session_priority:'新会话按额度池和重置时间选择',five_hour_reset_priority:'优先消耗更早重置的5h额度'};
 const warmupStates = {confirmed:'已确认激活',pending_confirmation:'等待额度确认',attempted:'已尝试',blocked:'已停止重试',failed:'等待重试'};
 const epochAccountStates = {pending:'等待预热',natural:'真实调用已激活',warmed:'自动预热已完成',blocked:'需处理后重试'};
+const accountDisclosures = new Map();
 let state = null, key = '', manual = false, busy = false, timer = null, failures = 0, authEpoch = 0, operating = false;
 let feedbackTimer = null;
 let storedKey = readStoredKey();
@@ -255,9 +256,68 @@ function quotaCell(window, weekly) {
   if (window.limit_reached || !window.allowed) cell.append(element('div','subtext error','上游限制中'));
   return cell;
 }
+function disclosure(account, type, className) {
+  const details=element('details',className);
+  details.dataset.accountDisclosure=type;
+  details.open=accountDisclosures.get(account.auth_id)?.has(type)===true;
+  return details;
+}
+function disclosureChevron() {
+  const chevron=element('span','account-chevron','⌄');
+  chevron.setAttribute('aria-hidden','true');
+  return chevron;
+}
+function resetCards(account) {
+  const view=resetCreditView(account);
+  const box=element('section','account-reset');
+  box.setAttribute('aria-label','重置卡');
+  const details=disclosure(account,'credits','account-reset-details');
+  const summary=element('summary');
+  const stat=(label,value,cached)=>{
+    const node=element('span','reset-stat'+(value===null?' is-unknown':''));
+    node.append(element('span','reset-stat-label',label),element('strong','',value===null?'待查询':String(value)));
+    if(cached)node.append(element('span','reset-cache','缓存'));
+    return node;
+  };
+  summary.append(element('span','reset-title','重置卡'),stat('官方次数',view.official,view.officialCached),stat('本套餐可用',view.supported,view.supportedCached));
+  summary.title=resetCreditsText(account)+'；当前套餐可用数仅统计未过期且支持当前套餐的卡。展开查看完整到期明细。';
+  const content=element('div','reset-detail-content');
+  content.append(element('p','reset-detail-caption','到期时间 · GMT+8'+(view.listFresh?'':' · 缓存待核验')));
+  const list=element('ol','reset-expiry-list');
+  for(const credit of view.credits) {
+    const item=element('li',credit.expired?'is-expired':'');
+    const time=element('time','',credit.text);time.dateTime=credit.expiresAt;
+    const state=credit.expired?'已过期':credit.supported===false?'本套餐不支持':credit.supported===true?'支持当前套餐':'套餐支持待确认';
+    item.append(element('span','reset-credit-number','第 '+credit.ordinal+' 张'),time,element('span','reset-credit-state',state));
+    list.append(item);
+  }
+  if(list.children.length)content.append(list);
+  else content.append(element('p','subtext','尚无有效的卡片到期明细；未返回不等于没有重置卡。'));
+  if(view.supportedCached)content.append(element('p','subtext','当前套餐可用数来自缓存，实际使用前会重新核验。'));
+  content.append(element('p','subtext','本套餐可用只计入未过期且支持当前套餐的卡；使用时会重新核验。'));
+  const expiry=element('span','reset-next-expiry');
+  expiry.append(element('span','','最近到期 · GMT+8'));
+  if(view.nextExpiry) {
+    const time=element('time','',view.nextExpiryText+(view.listFresh?'':' · 缓存'));time.dateTime=view.nextExpiry;
+    expiry.append(time);
+  } else expiry.append(element('span','',view.credits.length?'暂无未过期的卡':'到期时间待查询'));
+  const automatic=element('span','reset-auto');
+  automatic.append(element('span','reset-auto-label','到期自动用卡'),element('strong','',view.automatic===null?'待确认':view.automatic?'开启':'关闭'));
+  if(view.automatic)automatic.append(element('span','reset-auto-schedule','提前 '+view.autoBefore+' · '+view.automaticText));
+  summary.append(expiry,automatic,disclosureChevron());
+  details.append(summary,content);box.append(details);
+  for(const line of view.notes)box.append(element('p','reset-note',line));
+  return box;
+}
 function renderAccounts() {
   const body = $('accounts-body');
-  const previous=new Map([...body.children].map(row=>[row.dataset.authId,[...row.querySelectorAll('.bar-fill')].map(bar=>bar.style.width)]));
+  const previous=new Map([...body.querySelectorAll('[data-account-row]')].map(row=>[row.dataset.authId,[...row.querySelectorAll('.bar-fill')].map(bar=>bar.style.width)]));
+  for(const row of body.querySelectorAll('[data-account-row]')) {
+    const disclosures=[...row.querySelectorAll('[data-account-disclosure][open]'),...row.nextElementSibling.querySelectorAll('[data-account-disclosure][open]')];
+    accountDisclosures.set(row.dataset.authId,new Set(disclosures.map(details=>details.dataset.accountDisclosure)));
+  }
+  const focused=document.activeElement?.closest('#accounts-body [data-account-disclosure] > summary');
+  const focusedAuth=focused?.closest('tr')?.dataset.authId,focusedType=focused?.parentElement?.dataset.accountDisclosure;
   body.replaceChildren();
   const search = $('search').value.toLowerCase().trim();
   const accounts = [...(state.snapshots || [])].sort(compareAccountPriorities);
@@ -266,9 +326,13 @@ function renderAccounts() {
     const active = state.scheduler_mode==='serial' && account.auth_id === state.serial_active_auth_id;
     const row = element('tr', active ? 'is-active' : '');
     row.dataset.authId=account.auth_id;
-    const info = element('td');
-    info.append(element('div','account-id',account.auth_id));
-    const meta = element('div','account-meta');
+    row.dataset.accountRow='';
+    const info = element('td','account-info');
+    const identity=disclosure(account,'identity','account-identity');
+    const identitySummary=element('summary');
+    identitySummary.title='展开账号识别与认证详情';
+    identitySummary.append(element('span','account-id',account.auth_id),disclosureChevron());
+    const meta = element('span','account-meta');
     const ban = banFor(account);
     if (active) meta.append(element('span','badge active','当前'));
     const banLabels = {cooldown:'冷却中',probe_ready:'待恢复探测',half_open:'恢复探测中',probation:'恢复观察中'};
@@ -279,26 +343,26 @@ function renderAccounts() {
     const planLabel = element('span','',account.plan_source==='default' && upstreamPlan ? upstreamPlan : configuredPlan);
     planLabel.title = account.upstream_plan_type ? '上游标签：'+account.upstream_plan_type+' · '+(account.upstream_plan_source==='cpa_usage'?'CPA 额度查询':'CPA 认证信息')+' · '+dateText(account.upstream_plan_observed_at) : '上游尚未返回可识别的套餐标签';
     meta.append(planLabel);
-    info.append(meta);
     const capacity = (account.five_hour_capacity_weight_prior || 1)+'x';
+    const capacityLabel=element('span','account-capacity',capacity);capacityLabel.title='5h 容量参考倍率';meta.append(capacityLabel);
+    identitySummary.append(meta);
     const planStatus = automatic ? '自动识别 · 容量参考 '+capacity : account.plan_source==='account_override' ? '手动覆盖 · 容量参考 '+capacity : '默认档位 '+configuredPlan+' · 容量参考 '+capacity;
-    info.append(element('span','subtext',planStatus+(automatic&&!account.upstream_plan_fresh?' · 缓存识别':'')));
-    const priority=element('span','subtext',quotaPriorityText(account));
+    const identityContent=element('div','account-identity-content');
+    identityContent.append(element('span','subtext',planStatus+(automatic&&!account.upstream_plan_fresh?' · 缓存识别':'')));
+    if (upstreamPlan && !automatic) identityContent.append(element('span','subtext','上游：'+upstreamPlan+(account.upstream_plan_fresh?'':'（缓存已过期）')));
+    identity.append(identitySummary,identityContent);info.append(identity);
+    const priority=element('span','account-priority',quotaPriorityText(account));
     priority.title='新会话和换号按额度池、已确认重置时间排序；同一优先组内再按周预算分配。已有会话优先保留绑定，忙碌、认证和硬额度限制仍会影响实际选择。';
     info.append(priority);
-    const resetCredits=element('span','subtext',resetCreditsText(account));
-    resetCredits.title='来自官方额度和重置卡明细查询；未返回不等于 0。自动使用由独立开关控制，默认关闭。'+(account.reset_credits_observed_at?' 观测时间：'+dateText(account.reset_credits_observed_at):'');
-    info.append(resetCredits);
-    for(const line of resetCreditDetails(account))info.append(element('span','subtext',line));
-    if (upstreamPlan && !automatic) info.append(element('span','subtext','上游：'+upstreamPlan+(account.upstream_plan_fresh?'':'（缓存已过期）')));
+    if(account.reset_credits_observed_at)identityContent.append(element('span','subtext','重置次数观测 '+dateText(account.reset_credits_observed_at)));
     if (ban) info.append(element('span','subtext','冷却到期 ' + dateText(ban.reset_at)));
     const pollError=state.quota_polls?.[account.auth_id]?.Error || '';
     if(pollError) info.append(element('span','subtext error',/401|403/.test(pollError)?'额度查询认证被上游拒绝，请检查凭据':'额度查询暂不可达，当前余量来自缓存；网络失败不代表额度耗尽'));
     if (account.auth_health) {
       const health=account.auth_health;
       const labels={expiry_conflict:'过期标记冲突 · 等待两次认证确认',token_expired:'凭据已过期 · 需要重新登录或更新',repaired:'已自动恢复过期标记',repair_disabled:'过期标记冲突 · 自动恢复已关闭',verification_failed:'认证验证失败或上游连接异常',credential_changed:'认证文件发生变化 · 等待重新验证',repair_deferred:'等待账号恢复后验证',repair_failed:'恢复未确认 · 稍后重新检查',repeated_expiry:'过期标记再次被写回 · 暂停重复修复',host_unavailable:'CPA 认证检查暂不可用',checked:'未发现过期阻断'};
-      info.append(element('span','subtext',labels[health.reason]||health.reason));
-      if(timestamp(health.repaired_at)) info.append(element('span','subtext','最近自动恢复 '+dateText(health.repaired_at)));
+      (health.reason==='checked'?identityContent:info).append(element('span','subtext'+(health.blocked?' error':''),labels[health.reason]||health.reason));
+      if(timestamp(health.repaired_at)) identityContent.append(element('span','subtext','最近自动恢复 '+dateText(health.repaired_at)));
     }
     if (account.reason && account.reason!=='eligible' && !account.auth_health?.blocked) {
       const labels={not_allowed:'上游暂不可用',limit_reached:'额度已耗尽',serial_threshold:'达到设定阈值',quota_unknown:'等待额度确认'};
@@ -307,7 +371,10 @@ function renderAccounts() {
     const fiveWindow=account.windows?.find(w => w.window === '5h');
     const fiveCell=quotaCell(fiveWindow,false);
     if(!fiveWindow){
-      fiveCell.replaceChildren(element('span','subtext',account.five_hour_limit_status==='not_reported'?'仅周限 · 官方当前未报告 5h 限额':'5h 状态待确认'),element('span','subtext',account.five_hour_limit_status==='not_reported'?'保留为后备额度':'缺少完整有效观测，不能推断无限额度'));
+      const confirmed=account.five_hour_limit_status==='not_reported';
+      const placeholder=element('div','quota-unreported');
+      placeholder.append(element('span','quota-value','—'),element('strong','',confirmed?'仅周限':'待确认'),element('span','subtext',confirmed?'官方当前未报告 5h 限额':'缺少完整有效观测，不能推断无限额度'));
+      fiveCell.replaceChildren(placeholder);
     }
     warmupWait(account,fiveCell);
     row.append(info,fiveCell,quotaCell(account.windows?.find(w => w.window === 'weekly'),true));
@@ -341,8 +408,18 @@ function renderAccounts() {
     if(state.scheduler_mode==='serial')operations.append(action(active&&state.serial_manual_selection?'已指定':'设为当前',()=>mutate('/serial-active','PUT',{auth_id:account.auth_id},'已指定当前账号；后续新请求按此选择调度。'),!usable(account)||(active&&state.serial_manual_selection)));
     if(ban)operations.append(action('解除冷却',()=>confirmOperation('解除此账号的冷却','将清除插件本地隔离和 CPA 运行时冷却，但不会重置上游额度。请确认已使用重置卡或账号已恢复。',()=>mutate('/unban','POST',{auth_id:account.auth_id},'已清除 CPA 运行时冷却，并安排立即额度探测。'))));
     operations.append(action('设置套餐',async()=>{await showView('allocation');$('account-plans')?.scrollIntoView({block:'center'});}));
-    row.append(operations);body.append(row);
+    row.append(operations);
+    const detailsRow=element('tr','account-detail-row'+(active?' is-active':''));
+    detailsRow.dataset.authId=account.auth_id;
+    const detailsCell=element('td');detailsCell.colSpan=7;detailsCell.append(resetCards(account));detailsRow.append(detailsCell);
+    body.append(row,detailsRow);
   }
+  if(focusedAuth&&focusedType) {
+    const rows=[...body.children].filter(node=>node.dataset.authId===focusedAuth);
+    const details=rows.flatMap(row=>[...row.querySelectorAll('[data-account-disclosure]')]).find(node=>node.dataset.accountDisclosure===focusedType);
+    details?.querySelector('summary')?.focus({preventScroll:true});
+  }
+  for(const authId of accountDisclosures.keys())if(!accounts.some(account=>account.auth_id===authId))accountDisclosures.delete(authId);
   motion.rows(body,previous);
   $('empty').hidden = visible.length > 0;
   $('empty').textContent = accounts.length ? '没有匹配的账号。' : '尚无额度快照。请在“连接与高级”检查 CPA 管理连接，并确认认证文件已启用。';
@@ -551,6 +628,7 @@ function render() {
 function notice(message) { $('notice').textContent = message; $('notice').hidden = !message; }
 function login(message) {
   authEpoch++; key = ''; state = null; manual = false;
+  accountDisclosures.clear();
   editor.reset();feedback('');$('operation-dialog').close();pendingOperation=null;$('bans-list').replaceChildren();
   $('accounts-body').replaceChildren(); $('warmups').replaceChildren();
   $('epoch-metrics')?.replaceChildren(); $('epoch-accounts')?.replaceChildren();

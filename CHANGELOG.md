@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.39 — 2026-11-03
+
+- Present reset credits in a full-width account summary with independent official
+  and plan-supported counts, the next expiry and automatic-use status. Keep
+  complete expiry details and credential identity details expandable; preserve
+  expansion and keyboard focus across refreshes and filtering.
+- Include reproducible continuity integration for CPA v8.0.52 and selected-credit
+  integration for Keeper v2.0.3, preserving the newer Claude grant flow.
+
 ## 0.3.38 — 2026-11-02
 
 - Match CPA's native reset eligibility: use fresh available, unexpired,
