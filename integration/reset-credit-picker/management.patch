@@ -1,0 +1,505 @@
+diff --git a/src/features/authFiles/components/AuthFileQuotaSection.tsx b/src/features/authFiles/components/AuthFileQuotaSection.tsx
+index 7fb45be..386dc47 100644
+--- a/src/features/authFiles/components/AuthFileQuotaSection.tsx
++++ b/src/features/authFiles/components/AuthFileQuotaSection.tsx
+@@ -6,15 +6,17 @@ import {
+   useNotificationStore,
+   useQuotaStore,
+ } from '@/stores';
+-import type { AuthFileItem, ClaudeQuotaState } from '@/types';
++import type { AuthFileItem, ClaudeQuotaState, CodexQuotaState } from '@/types';
+ import { getStatusFromError, resolveQuotaErrorMessage } from '@/utils/quota';
+ import { getQuotaCacheKey } from '@/utils/quota/identity';
++import { guardConfigConnection } from '@/services/api/configValue';
+ import { isRuntimeOnlyAuthFile, type QuotaProviderType } from '@/features/authFiles/constants';
+ import { Button } from '@/components/ui/Button';
+ import { IconRefreshCw } from '@/components/ui/icons';
+ import { bindQuotaClasses } from '@/features/quota/types';
+ import { QUOTA_ADAPTERS, type QuotaCardState } from '@/features/quota/providers';
+ import { hasClaudeUsageData } from '@/features/quota/providers/claude/data';
++import { createResetCreditConfirmation } from '@/features/quota/providers/codex/resetCreditConfirmation';
+ import styles from './AuthFileQuota.module.scss';
+ 
+ /** Bind the auth-file host's compact styles to the quota rendering contract. */
+@@ -120,16 +122,21 @@ export function AuthFileQuotaSection(props: AuthFileQuotaSectionProps) {
+     const resetQuota = adapter.resetQuota;
+     if (!resetQuota) return;
+ 
++    const selection = createResetCreditConfirmation(
++      file.name, (quota as CodexQuotaState | undefined)?.rateLimitResetCredits ?? [], t
++    );
++    const assertConnection = guardConfigConnection();
+     showConfirmation({
+       title: t('codex_quota.reset_confirm_title'),
+-      message: t('codex_quota.reset_confirm_message', { name: file.name }),
++      message: selection.message,
+       confirmText: t('codex_quota.reset_confirm_button'),
+       variant: 'primary',
+       onConfirm: async () => {
+         const cacheGeneration = captureQuotaCacheGeneration(file.name);
+         setResettingQuota(true);
+         try {
+-          const data = await resetQuota(file, t);
++          assertConnection();
++          const data = await resetQuota(file, t, selection.selectedCreditId());
+           commitIfQuotaCacheCurrent(cacheGeneration, () => {
+             updateQuotaState((prev) => ({
+               ...prev,
+diff --git a/src/features/quota/hooks/useQuotaActions.ts b/src/features/quota/hooks/useQuotaActions.ts
+index 3a63319..71a5a47 100644
+--- a/src/features/quota/hooks/useQuotaActions.ts
++++ b/src/features/quota/hooks/useQuotaActions.ts
+@@ -11,11 +11,13 @@ import {
+   commitIfQuotaCacheCurrent,
+   useNotificationStore,
+ } from '@/stores';
+-import type { AuthFileItem } from '@/types';
++import type { AuthFileItem, CodexQuotaState } from '@/types';
+ import { getStatusFromError } from '@/utils/quota';
+ import { getQuotaCacheKey } from '@/utils/quota/identity';
++import { guardConfigConnection } from '@/services/api/configValue';
+ import { enrichQuotaInBackground } from '../quotaEnrichment';
+ import { getQuotaMap, getQuotaSetter, type QuotaAdapter, type QuotaCardState } from '../providers';
++import { createResetCreditConfirmation } from '../providers/codex/resetCreditConfirmation';
+ 
+ const getQuotaState = (adapter: QuotaAdapter, file: AuthFileItem): QuotaCardState | undefined =>
+   getQuotaMap(adapter)[getQuotaCacheKey(file)];
+@@ -78,9 +80,15 @@ export function useQuotaActions(disableControls: boolean) {
+       if (getQuotaState(adapter, file)?.status === 'loading') return;
+       if (resettingQuotaName === cacheKey) return;
+ 
++      const selection = createResetCreditConfirmation(
++        file.name,
++        (getQuotaState(adapter, file) as CodexQuotaState | undefined)?.rateLimitResetCredits ?? [],
++        t
++      );
++      const assertConnection = guardConfigConnection();
+       showConfirmation({
+         title: t('codex_quota.reset_confirm_title'),
+-        message: t('codex_quota.reset_confirm_message', { name: file.name }),
++        message: selection.message,
+         confirmText: t('codex_quota.reset_confirm_button'),
+         variant: 'primary',
+         onConfirm: async () => {
+@@ -88,7 +96,8 @@ export function useQuotaActions(disableControls: boolean) {
+           const setQuota = getQuotaSetter(adapter);
+           setResettingQuotaName(cacheKey);
+           try {
+-            const data = await resetQuotaFn(file, t);
++            assertConnection();
++            const data = await resetQuotaFn(file, t, selection.selectedCreditId());
+             commitIfQuotaCacheCurrent(cacheGeneration, () => {
+               setQuota((prev) => ({
+                 ...prev,
+diff --git a/src/features/quota/providers/codex/ResetCreditPicker.module.scss b/src/features/quota/providers/codex/ResetCreditPicker.module.scss
+new file mode 100644
+index 0000000..bf79969
+--- /dev/null
++++ b/src/features/quota/providers/codex/ResetCreditPicker.module.scss
+@@ -0,0 +1,37 @@
++.choices {
++  min-width: 0;
++  margin: 0;
++  padding: 0;
++  border: 0;
++
++  legend { margin-bottom: 0.75rem; }
++}
++
++.list {
++  display: grid;
++  gap: 0.5rem;
++  max-height: 40vh;
++  overflow-y: auto;
++  padding: 3px;
++}
++
++.choice {
++  display: flex;
++  flex-wrap: wrap;
++  align-items: center;
++  gap: 0.5rem;
++  min-height: 44px;
++  padding: 0.5rem 0.75rem;
++  border: 1px solid var(--border-color);
++  border-radius: 8px;
++  cursor: pointer;
++
++  input { margin: 0; accent-color: var(--text-primary); }
++  strong { margin-left: auto; font-size: 0.85rem; overflow-wrap: anywhere; }
++  &:focus-within { outline: 2px solid var(--text-primary); outline-offset: 1px; }
++}
++
++.selected {
++  border-color: var(--text-primary);
++  background: var(--bg-secondary);
++}
+diff --git a/src/features/quota/providers/codex/ResetCreditPicker.tsx b/src/features/quota/providers/codex/ResetCreditPicker.tsx
+new file mode 100644
+index 0000000..a356782
+--- /dev/null
++++ b/src/features/quota/providers/codex/ResetCreditPicker.tsx
+@@ -0,0 +1,48 @@
++import { useId, useState } from 'react';
++import { useTranslation } from 'react-i18next';
++import { useNotificationStore } from '@/stores';
++import type { CodexResetCredit } from '@/utils/quota/resetCredits';
++import styles from './ResetCreditPicker.module.scss';
++
++const expiryFormatter = new Intl.DateTimeFormat('sv-SE', {
++  timeZone: 'Asia/Shanghai',
++  year: 'numeric', month: '2-digit', day: '2-digit',
++  hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
++});
++
++export function ResetCreditPicker({
++  name, credits, onSelect,
++}: {
++  name: string;
++  credits: CodexResetCredit[];
++  onSelect: (creditId: string) => void;
++}) {
++  const { t } = useTranslation();
++  const group = useId();
++  const [selected, setSelected] = useState(credits[0]?.id);
++  const loading = useNotificationStore((state) => state.confirmation.isLoading);
++
++  return (
++    <div>
++      <p>{t('codex_quota.reset_confirm_message', { name })}</p>
++      {credits.length > 0 ? (
++        <fieldset className={styles.choices} disabled={loading}>
++          <legend>{t('codex_quota.reset_credit_select_hint')}</legend>
++          <div className={styles.list}>
++            {credits.map((credit, index) => (
++              <label key={credit.id} className={`${styles.choice} ${selected === credit.id ? styles.selected : ''}`}>
++                <input
++                  type="radio" name={group} value={index} checked={selected === credit.id}
++                  autoFocus={index === 0}
++                  onChange={() => { setSelected(credit.id); onSelect(credit.id); }}
++                />
++                <span>{t('codex_quota.reset_credit_number', { index: index + 1 })}</span>
++                <strong>{expiryFormatter.format(new Date(credit.expiresAt))} (GMT+8)</strong>
++              </label>
++            ))}
++          </div>
++        </fieldset>
++      ) : <p role="status">{t('codex_quota.reset_credit_details_unavailable')}</p>}
++    </div>
++  );
++}
+diff --git a/src/features/quota/providers/codex/data.ts b/src/features/quota/providers/codex/data.ts
+index b237dff..2dc91d6 100644
+--- a/src/features/quota/providers/codex/data.ts
++++ b/src/features/quota/providers/codex/data.ts
+@@ -491,8 +491,10 @@ const createCodexRedeemRequestId = (): string => {
+ 
+ const consumeCodexRateLimitResetCredit = async (
+   file: AuthFileItem,
+-  t: TFunction
++  t: TFunction,
++  creditId?: string
+ ): Promise<string> => {
++  const assertConnection = guardConfigConnection();
+   const rawAuthIndex = file['auth_index'] ?? file.authIndex;
+   const authIndex = normalizeAuthIndex(rawAuthIndex);
+   if (!authIndex) {
+@@ -501,6 +503,15 @@ const consumeCodexRateLimitResetCredit = async (
+ 
+   const requestHeader = buildCodexRequestHeader(file);
+ 
++  if (creditId !== undefined) {
++    const details = await fetchCodexResetCredits(authIndex, requestHeader, t);
++    if (details.error || details.availableCount === 0 || !details.credits.some((credit) =>
++      credit.id === creditId && credit.status === 'available' && Date.parse(credit.expiresAt) > Date.now())) {
++      throw new Error(t('codex_quota.reset_credit_selection_unavailable'));
++    }
++  }
++
++  assertConnection();
+   const result = await apiCallApi.request({
+     authIndex,
+     method: 'POST',
+@@ -508,6 +519,7 @@ const consumeCodexRateLimitResetCredit = async (
+     header: requestHeader,
+     data: JSON.stringify({
+       redeem_request_id: createCodexRedeemRequestId(),
++      ...(creditId === undefined ? {} : { credit_id: creditId }),
+     }),
+   });
+ 
+@@ -521,9 +533,9 @@ const consumeCodexRateLimitResetCredit = async (
+   return authIndex;
+ };
+ 
+-const resetCodexQuota = async (file: AuthFileItem, t: TFunction): Promise<CodexQuotaData> => {
++const resetCodexQuota = async (file: AuthFileItem, t: TFunction, creditId?: string): Promise<CodexQuotaData> => {
+   const assertConnection = guardConfigConnection();
+-  const authIndex = await consumeCodexRateLimitResetCredit(file, t);
++  const authIndex = await consumeCodexRateLimitResetCredit(file, t, creditId);
+   try {
+     // Never clear a different connection's cooldown after awaiting redemption.
+     assertConnection();
+diff --git a/src/features/quota/providers/codex/resetCreditConfirmation.ts b/src/features/quota/providers/codex/resetCreditConfirmation.ts
+new file mode 100644
+index 0000000..f01f9cd
+--- /dev/null
++++ b/src/features/quota/providers/codex/resetCreditConfirmation.ts
+@@ -0,0 +1,32 @@
++import { createElement } from 'react';
++import type { TFunction } from 'i18next';
++import type { CodexResetCredit } from '@/utils/quota/resetCredits';
++import { ResetCreditPicker } from './ResetCreditPicker';
++
++export function createResetCreditConfirmation(
++  name: string,
++  allCredits: CodexResetCredit[],
++  t: TFunction
++) {
++  const seen = new Set<string>();
++  const credits = allCredits.filter((credit) => {
++    if (!credit.id || credit.status !== 'available' ||
++      !Number.isFinite(Date.parse(credit.expiresAt)) ||
++      Date.parse(credit.expiresAt) <= Date.now() || seen.has(credit.id)) return false;
++    seen.add(credit.id);
++    return true;
++  }).sort((left, right) => Date.parse(left.expiresAt) - Date.parse(right.expiresAt));
++  let selectedCreditId = credits[0]?.id;
++  return {
++    message: createElement(ResetCreditPicker, {
++      name, credits, onSelect: (creditId) => { selectedCreditId = creditId; },
++    }),
++    selectedCreditId: () => {
++      if (allCredits.length > 0 && !credits.some((credit) =>
++        credit.id === selectedCreditId && Date.parse(credit.expiresAt) > Date.now())) {
++        throw new Error(t('codex_quota.reset_credit_selection_unavailable'));
++      }
++      return selectedCreditId;
++    },
++  };
++}
+diff --git a/src/features/quota/providers/index.ts b/src/features/quota/providers/index.ts
+index 4b4b3a6..5140aa5 100644
+--- a/src/features/quota/providers/index.ts
++++ b/src/features/quota/providers/index.ts
+@@ -41,7 +41,7 @@ export interface QuotaAdapter {
+   filterFn: (file: AuthFileItem) => boolean;
+   fetchQuota: (file: AuthFileItem, t: TFunction) => Promise<unknown>;
+   enrichQuota?: (file: AuthFileItem, data: unknown, t: TFunction) => Promise<unknown>;
+-  resetQuota?: (file: AuthFileItem, t: TFunction) => Promise<unknown>;
++  resetQuota?: (file: AuthFileItem, t: TFunction, creditId?: string) => Promise<unknown>;
+   canResetQuota?: (quota: QuotaCardState) => boolean;
+   storeSelector: (state: QuotaStore) => Record<string, QuotaCardState>;
+   storeSetter: keyof QuotaStore;
+diff --git a/src/features/quota/providers/types.ts b/src/features/quota/providers/types.ts
+index 7b9ff2e..6473210 100644
+--- a/src/features/quota/providers/types.ts
++++ b/src/features/quota/providers/types.ts
+@@ -51,7 +51,7 @@ export interface QuotaProviderData<TState, TData> {
+   fetchQuota: (file: AuthFileItem, t: TFunction) => Promise<TData>;
+   /** Optional details loaded only after the primary quota has been committed. */
+   enrichQuota?: (file: AuthFileItem, data: TData, t: TFunction) => Promise<TData>;
+-  resetQuota?: (file: AuthFileItem, t: TFunction) => Promise<TData>;
++  resetQuota?: (file: AuthFileItem, t: TFunction, creditId?: string) => Promise<TData>;
+   canResetQuota?: (quota: TState) => boolean;
+   storeSelector: (state: QuotaStore) => Record<string, TState>;
+   storeSetter: keyof QuotaStore;
+diff --git a/src/i18n/locales/en.json b/src/i18n/locales/en.json
+index 4d97873..a11adb6 100644
+--- a/src/i18n/locales/en.json
++++ b/src/i18n/locales/en.json
+@@ -577,7 +577,10 @@
+     "plan_pro": "Pro 200",
+     "plan_prolite": "Pro 100",
+     "plan_promax": "Pro 500",
+-    "plan_business_premium": "Business Premium"
++    "plan_business_premium": "Business Premium",
++    "reset_credit_select_hint": "Select one credit; the earliest expiry is selected by default.",
++    "reset_credit_details_unavailable": "Individual credit details are unavailable. The server will choose the next available credit.",
++    "reset_credit_selection_unavailable": "The selected credit is no longer available. Refresh the quota before trying again."
+   },
+   "devin_quota": {
+     "daily": "Daily remaining",
+diff --git a/src/i18n/locales/ko.json b/src/i18n/locales/ko.json
+index 0342f37..f29f045 100644
+--- a/src/i18n/locales/ko.json
++++ b/src/i18n/locales/ko.json
+@@ -577,7 +577,10 @@
+     "plan_pro": "Pro 200",
+     "plan_prolite": "Pro 100",
+     "plan_promax": "Pro 500",
+-    "plan_business_premium": "Business Premium"
++    "plan_business_premium": "Business Premium",
++    "reset_credit_select_hint": "초기화 크레딧을 선택하세요. 가장 먼저 만료되는 크레딧이 기본 선택됩니다.",
++    "reset_credit_details_unavailable": "개별 크레딧 정보가 없습니다. 서버가 다음 사용 가능한 크레딧을 선택합니다.",
++    "reset_credit_selection_unavailable": "선택한 크레딧을 사용할 수 없습니다. 할당량을 새로 고친 후 다시 선택하세요."
+   },
+   "devin_quota": {
+     "daily": "일일 잔여 할당량",
+diff --git a/src/i18n/locales/ru.json b/src/i18n/locales/ru.json
+index 62f21a0..8ed9fd2 100644
+--- a/src/i18n/locales/ru.json
++++ b/src/i18n/locales/ru.json
+@@ -567,7 +567,10 @@
+     "plan_pro": "Pro 200",
+     "plan_prolite": "Pro 100",
+     "plan_promax": "Pro 500",
+-    "plan_business_premium": "Business Premium"
++    "plan_business_premium": "Business Premium",
++    "reset_credit_select_hint": "Выберите купон. По умолчанию выбран купон с ближайшим сроком.",
++    "reset_credit_details_unavailable": "Данные купонов недоступны. Сервер выберет следующий доступный купон.",
++    "reset_credit_selection_unavailable": "Выбранный купон больше недоступен. Обновите квоту и выберите снова."
+   },
+   "devin_quota": {
+     "daily": "Остаток на день",
+diff --git a/src/i18n/locales/tr.json b/src/i18n/locales/tr.json
+index c64a7fc..c22e718 100644
+--- a/src/i18n/locales/tr.json
++++ b/src/i18n/locales/tr.json
+@@ -577,7 +577,10 @@
+     "plan_pro": "Pro 200",
+     "plan_prolite": "Pro 100",
+     "plan_promax": "Pro 500",
+-    "plan_business_premium": "Business Premium"
++    "plan_business_premium": "Business Premium",
++    "reset_credit_select_hint": "Bir kredi seçin. Süresi en önce dolan kredi varsayılan seçilir.",
++    "reset_credit_details_unavailable": "Kredi ayrıntıları alınamadı. Sunucu kullanılabilir sonraki krediyi seçer.",
++    "reset_credit_selection_unavailable": "Seçilen kredi artık kullanılamıyor. Kotayı yenileyip tekrar seçin."
+   },
+   "devin_quota": {
+     "daily": "Günlük Kalan",
+diff --git a/src/i18n/locales/vi.json b/src/i18n/locales/vi.json
+index d7663a3..ce1efd1 100644
+--- a/src/i18n/locales/vi.json
++++ b/src/i18n/locales/vi.json
+@@ -577,7 +577,10 @@
+     "plan_promax": "Pro 500",
+     "credit_balance_label": "Số dư Credit",
+     "credit_unlimited": "Không giới hạn",
+-    "plan_business_premium": "Business Premium"
++    "plan_business_premium": "Business Premium",
++    "reset_credit_select_hint": "Chọn một lượt đặt lại; mặc định chọn lượt hết hạn sớm nhất.",
++    "reset_credit_details_unavailable": "Không có chi tiết từng lượt. Máy chủ sẽ chọn lượt khả dụng tiếp theo.",
++    "reset_credit_selection_unavailable": "Lượt đã chọn không còn khả dụng. Hãy làm mới hạn mức rồi chọn lại."
+   },
+   "kimi_quota": {
+     "plan_label": "Gói",
+diff --git a/src/i18n/locales/zh-CN.json b/src/i18n/locales/zh-CN.json
+index 6e76801..4f5b4ea 100644
+--- a/src/i18n/locales/zh-CN.json
++++ b/src/i18n/locales/zh-CN.json
+@@ -554,7 +554,6 @@
+     "reset_confirm_button": "确认重置",
+     "reset_not_confirmed": "未确认额度重置成功，请刷新额度后再决定是否重试。",
+     "reset_cooldown_failed": "额度已重置，但代理冷却清除失败。请在原连接的认证文件页面使用“清除冷却”，不要再次消耗重置卡。",
+-
+     "reset_success": "已重置 \"{{name}}\" 的 Codex 额度",
+     "reset_failed": "重置 \"{{name}}\" 的 Codex 额度失败：{{message}}",
+     "plan_plus": "Plus",
+@@ -563,7 +562,10 @@
+     "plan_pro": "Pro 200",
+     "plan_prolite": "Pro 100",
+     "plan_promax": "Pro 500",
+-    "plan_business_premium": "Business Premium"
++    "plan_business_premium": "Business Premium",
++    "reset_credit_select_hint": "点击一张重置券选择，默认选中最早到期的一张。",
++    "reset_credit_details_unavailable": "未取得单券明细，使用时由上游选择下一张可用券。",
++    "reset_credit_selection_unavailable": "所选重置券已不可用，请刷新额度后重新选择。"
+   },
+   "devin_quota": {
+     "daily": "每日剩余额度",
+diff --git a/src/i18n/locales/zh-TW.json b/src/i18n/locales/zh-TW.json
+index 9d60d8d..25ad75f 100644
+--- a/src/i18n/locales/zh-TW.json
++++ b/src/i18n/locales/zh-TW.json
+@@ -554,7 +554,6 @@
+     "reset_confirm_button": "確認重置",
+     "reset_not_confirmed": "尚未確認額度重置成功，請重新整理額度後再決定是否重試。",
+     "reset_cooldown_failed": "額度已重置，但代理冷卻清除失敗。請在原連線的認證檔案頁面使用「清除冷卻」，不要再次消耗重置卡。",
+-
+     "reset_success": "已重置「{{name}}」的 Codex 配額",
+     "reset_failed": "重置「{{name}}」的 Codex 配額失敗：{{message}}",
+     "plan_plus": "Plus",
+@@ -563,7 +562,10 @@
+     "plan_pro": "Pro 200",
+     "plan_prolite": "Pro 100",
+     "plan_promax": "Pro 500",
+-    "plan_business_premium": "Business Premium"
++    "plan_business_premium": "Business Premium",
++    "reset_credit_select_hint": "點擊一張重置券選擇，預設選中最早到期的一張。",
++    "reset_credit_details_unavailable": "未取得單券明細，使用時由上游選擇下一張可用券。",
++    "reset_credit_selection_unavailable": "所選重置券已不可用，請重新整理額度後重新選擇。"
+   },
+   "devin_quota": {
+     "daily": "每日剩餘額度",
+diff --git a/src/utils/quota/resetCredits.ts b/src/utils/quota/resetCredits.ts
+index 48d8004..02b4c49 100644
+--- a/src/utils/quota/resetCredits.ts
++++ b/src/utils/quota/resetCredits.ts
+@@ -48,6 +48,7 @@ const normalizeCredit = (value: unknown): CodexResetCredit | null => {
+   if (normalizeStringValue(record.status) !== 'available') {
+     return null;
+   }
++  if ((record.is_supported_by_plan ?? record.isSupportedByPlan) === false) return null;
+ 
+   const expiresAt = normalizeStringValue(record.expires_at ?? record.expiresAt);
+   if (!expiresAt) return null;
+diff --git a/tests/authFileCooldowns.test.ts b/tests/authFileCooldowns.test.ts
+index 58d2915..911b9ff 100644
+--- a/tests/authFileCooldowns.test.ts
++++ b/tests/authFileCooldowns.test.ts
+@@ -225,7 +225,10 @@ describe('cooldown section rendering', () => {
+ 
+     const available = render(snapshot, { onReset: () => {} });
+     expect(available).toContain(i18n.t('auth_files.cooldown_reset_button'));
+-    expect(available).toContain(i18n.t('auth_files.cooldown_reset_hint'));
++    const expectedHintAttribute = renderToStaticMarkup(
++      createElement('span', { title: i18n.t('auth_files.cooldown_reset_hint') })
++    ).match(/title="[^"]*"/)?.[0];
++    expect(available).toContain(expectedHintAttribute!);
+     expect(available).not.toContain('disabled=""');
+ 
+     const pending = render(snapshot, { onReset: () => {}, resetting: true });
+diff --git a/tests/selectedResetCredit.test.ts b/tests/selectedResetCredit.test.ts
+new file mode 100644
+index 0000000..dee6bc3
+--- /dev/null
++++ b/tests/selectedResetCredit.test.ts
+@@ -0,0 +1,37 @@
++import { afterEach, expect, test } from 'bun:test';
++import type { TFunction } from 'i18next';
++import { CODEX_CONFIG } from '@/features/quota/providers/codex/data';
++import { apiCallApi, authFilesApi, type ApiCallRequest, type ApiCallResult } from '@/services/api';
++
++const originalRequest = apiCallApi.request;
++const originalReset = authFilesApi.resetCooldown;
++const t = ((key: string) => key) as TFunction;
++const result = (body: unknown): ApiCallResult => ({ statusCode: 200, header: {}, body, bodyText: JSON.stringify(body) });
++afterEach(() => { apiCallApi.request = originalRequest; authFilesApi.resetCooldown = originalReset; });
++
++test('submits selected credit_id after a fresh account-specific detail read', async () => {
++  const calls: ApiCallRequest[] = [];
++  apiCallApi.request = async (request) => {
++    calls.push(request);
++    if (request.method === 'POST') return result({ code: 'reset' });
++    if (request.url.endsWith('/rate-limit-reset-credits')) return result({ available_count: 2, credits: [
++      { id: 'first', reset_type: 'codex_rate_limits', status: 'available', expires_at: '2099-01-01T00:00:00Z' },
++      { id: 'second', reset_type: 'codex_rate_limits', status: 'available', expires_at: '2099-02-01T00:00:00Z' },
++    ] });
++    return result({ plan_type: 'team', rate_limit: {} });
++  };
++  authFilesApi.resetCooldown = async () => ({ status: 'ok', auth_index: 'account' });
++  await CODEX_CONFIG.resetQuota!({ name: 'account.json', auth_index: 'account' }, t, 'second');
++  const writes = calls.filter((call) => call.method === 'POST');
++  expect(writes).toHaveLength(1);
++  expect(JSON.parse(writes[0]!.data!)).toMatchObject({ credit_id: 'second' });
++  expect(calls[0]!.method).toBe('GET');
++  expect(calls[0]!.authIndex).toBe('account');
++});
++
++test('stale selected credit fails without a redemption request', async () => {
++  const calls: ApiCallRequest[] = [];
++  apiCallApi.request = async (request) => { calls.push(request); return result({ available_count: 1, credits: [] }); };
++  await expect(CODEX_CONFIG.resetQuota!({ name: 'account.json', auth_index: 'account' }, t, 'missing')).rejects.toThrow();
++  expect(calls.some((call) => call.method === 'POST')).toBe(false);
++});

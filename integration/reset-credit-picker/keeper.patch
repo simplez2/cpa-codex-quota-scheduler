@@ -1,0 +1,593 @@
+diff --git a/internal/api/quota.go b/internal/api/quota.go
+index ea432a0..1a4c598 100644
+--- a/internal/api/quota.go
++++ b/internal/api/quota.go
+@@ -264,7 +264,8 @@ func registerQuotaRoutes(router gin.IRoutes, provider QuotaProvider) {
+ 		}
+ 
+ 		var request struct {
+-			AuthIndex string `json:"auth_index"`
++			AuthIndex string  `json:"auth_index"`
++			CreditID  *string `json:"credit_id,omitempty"`
+ 		}
+ 		if err := c.ShouldBindJSON(&request); err != nil {
+ 			c.JSON(http.StatusBadRequest, gin.H{"error": "auth_index is required"})
+@@ -276,7 +277,7 @@ func registerQuotaRoutes(router gin.IRoutes, provider QuotaProvider) {
+ 			return
+ 		}
+ 
+-		response, err := provider.Reset(c.Request.Context(), quota.ResetRequest{AuthIndex: authIndex})
++		response, err := provider.Reset(c.Request.Context(), quota.ResetRequest{AuthIndex: authIndex, CreditID: request.CreditID})
+ 		if err != nil {
+ 			switch {
+ 			case errors.Is(err, quota.ErrValidation):
+diff --git a/internal/api/quota_test.go b/internal/api/quota_test.go
+index 47edb8f..797ecef 100644
+--- a/internal/api/quota_test.go
++++ b/internal/api/quota_test.go
+@@ -430,6 +430,19 @@ func TestQuotaResetReturnsResetResponse(t *testing.T) {
+ 	}
+ }
+ 
++func TestQuotaResetPreservesSelectedCredit(t *testing.T) {
++	provider := &quotaProviderStub{resetResponse: quota.ResetResponse{AuthIndex: "account", Code: "reset", WindowsReset: 2}}
++	router := NewRouter(nil, nil, nil, nil, AuthConfig{}, nil, "", OptionalProviders{Quota: provider})
++	req := httptest.NewRequest(http.MethodPost, "/api/v1/quota/reset", strings.NewReader(`{"auth_index":"account","credit_id":"selected-second"}`))
++	req.Header.Set(requestIntentHeaderName, requestIntentHeaderValueFetch)
++	req.Header.Set("Content-Type", "application/json")
++	resp := httptest.NewRecorder()
++	router.ServeHTTP(resp, req)
++	if resp.Code != http.StatusOK || provider.resetRequest.CreditID == nil || *provider.resetRequest.CreditID != "selected-second" {
++		t.Fatalf("lost selection: status=%d request=%+v", resp.Code, provider.resetRequest)
++	}
++}
++
+ func TestQuotaResetRejectsEmptyAuthIndex(t *testing.T) {
+ 	provider := &quotaProviderStub{}
+ 	router := NewRouter(nil, nil, nil, nil, AuthConfig{}, nil, "", OptionalProviders{Quota: provider})
+diff --git a/internal/quota/codex.go b/internal/quota/codex.go
+index ae253bf..fed52eb 100644
+--- a/internal/quota/codex.go
++++ b/internal/quota/codex.go
+@@ -2,7 +2,9 @@ package quota
+ 
+ import (
+ 	"context"
++	"fmt"
+ 	"strings"
++	"time"
+ 
+ 	"cpa-usage-keeper/internal/cpa/dto/apicall"
+ 	"cpa-usage-keeper/internal/entities"
+@@ -65,18 +67,45 @@ func optionalAccountID(value *string) string {
+ }
+ 
+ func (p codexProvider) Reset(ctx context.Context, input ProviderInput) (ProviderResetOutput, error) {
++	var selectedCreditID string
++	if input.ResetCreditID != nil {
++		selectedCreditID = strings.TrimSpace(*input.ResetCreditID)
++		if selectedCreditID == "" || len(selectedCreditID) > 512 || strings.ContainsAny(selectedCreditID, "\r\n\x00") {
++			return ProviderResetOutput{}, fmt.Errorf("%w: invalid selected reset credit", ErrValidation)
++		}
++		// A stale or cross-account selection must never silently consume a different credit.
++		details, err := p.ListResetCredits(ctx, input)
++		if err != nil {
++			return ProviderResetOutput{}, err
++		}
++		available := false
++		for _, credit := range details.Credits {
++			expires, err := time.Parse(time.RFC3339Nano, credit.ExpiresAt)
++			if credit.ID == selectedCreditID && credit.Status == "available" && err == nil && expires.After(time.Now()) {
++				available = true
++				break
++			}
++		}
++		if !available || (details.AvailableCount != nil && *details.AvailableCount <= 0) {
++			return ProviderResetOutput{}, fmt.Errorf("%w: selected reset credit is unavailable; refresh before trying again", ErrValidation)
++		}
++	}
+ 	headers := p.requestHeaders(input.Identity)
+ 	// reset 与普通限额刷新共用同一份 auth header，但调用官方 consume 端点消费一次 reset credit。
+ 	redeemRequestID, err := newRedeemRequestID()
+ 	if err != nil {
+ 		return ProviderResetOutput{}, err
+ 	}
++	data := map[string]string{"redeem_request_id": redeemRequestID}
++	if input.ResetCreditID != nil {
++		data["credit_id"] = selectedCreditID
++	}
+ 	request := apicall.Request{
+ 		AuthIndex: input.Identity.Identity,
+ 		Method:    "POST",
+ 		URL:       CodexRateLimitResetCreditsConsumeURL,
+ 		Header:    headers,
+-		Data:      map[string]string{"redeem_request_id": redeemRequestID},
++		Data:      data,
+ 	}
+ 	response, err := p.caller.CallManagementAPI(ctx, request)
+ 	if err != nil {
+diff --git a/internal/quota/payloads.go b/internal/quota/payloads.go
+index 4847d95..14d0934 100644
+--- a/internal/quota/payloads.go
++++ b/internal/quota/payloads.go
+@@ -495,6 +495,9 @@ func parseCodexResetCreditsResponse(response *apicall.Response) (ProviderResetCr
+ 		if creditObject == nil || stringField(creditObject, "reset_type", "resetType") != "codex_rate_limits" || stringField(creditObject, "status") != "available" {
+ 			continue
+ 		}
++		if supported := boolPtrField(creditObject, "is_supported_by_plan", "isSupportedByPlan"); supported != nil && !*supported {
++			continue
++		}
+ 		expiresAt := stringField(creditObject, "expires_at", "expiresAt")
+ 		if expiresAt == "" {
+ 			continue
+diff --git a/internal/quota/reset.go b/internal/quota/reset.go
+index 6facc0a..dde9b89 100644
+--- a/internal/quota/reset.go
++++ b/internal/quota/reset.go
+@@ -13,7 +13,8 @@ import (
+ )
+ 
+ type ResetRequest struct {
+-	AuthIndex string `json:"auth_index"`
++	AuthIndex string  `json:"auth_index"`
++	CreditID  *string `json:"credit_id,omitempty"`
+ }
+ 
+ type ResetResponse struct {
+@@ -97,7 +98,7 @@ func (s *Service) Reset(ctx context.Context, request ResetRequest) (ResetRespons
+ 	if !ok {
+ 		return ResetResponse{}, fmt.Errorf("%w: %s", ErrUnsupportedType, normalizeIdentityType(identity.Provider))
+ 	}
+-	output, err := resetter.Reset(ctx, ProviderInput{Identity: identity})
++	output, err := resetter.Reset(ctx, ProviderInput{Identity: identity, ResetCreditID: request.CreditID})
+ 	if err != nil {
+ 		return ResetResponse{}, err
+ 	}
+diff --git a/internal/quota/test/selected_reset_credit_test.go b/internal/quota/test/selected_reset_credit_test.go
+new file mode 100644
+index 0000000..0f63fa5
+--- /dev/null
++++ b/internal/quota/test/selected_reset_credit_test.go
+@@ -0,0 +1,50 @@
++package test
++
++import (
++	"context"
++	"encoding/json"
++	"testing"
++
++	"cpa-usage-keeper/internal/cpa/dto/apicall"
++	"cpa-usage-keeper/internal/entities"
++	"cpa-usage-keeper/internal/quota"
++)
++
++func TestSelectedResetCreditIsVerifiedAndForwarded(t *testing.T) {
++	selected := "credit-second"
++	list := `{"available_count":2,"credits":[{"id":"credit-first","reset_type":"codex_rate_limits","status":"available","expires_at":"2099-01-01T00:00:00Z"},{"id":"credit-second","reset_type":"codex_rate_limits","status":"available","expires_at":"2099-02-01T00:00:00Z"}]}`
++	caller := &recordingManagementCaller{responses: []*apicall.Response{
++		{StatusCode: 200, BodyText: list, Body: json.RawMessage(list)},
++		{StatusCode: 200, BodyText: `{"code":"reset","windows_reset":2}`, Body: json.RawMessage(`{"code":"reset","windows_reset":2}`)},
++	}}
++	provider := quota.NewCodexProvider(caller, quota.DefaultProviderConfigs().Codex).(quota.ProviderResetter)
++	_, err := provider.Reset(context.Background(), quota.ProviderInput{Identity: entities.UsageIdentity{Identity: "selected-account"}, ResetCreditID: &selected})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(caller.requests) != 2 || caller.requests[0].Method != "GET" || caller.requests[1].Method != "POST" {
++		t.Fatalf("unexpected calls: %+v", caller.requests)
++	}
++	data := caller.requests[1].Data.(map[string]string)
++	if data["credit_id"] != selected || data["redeem_request_id"] == "" {
++		t.Fatalf("selection was not forwarded: %+v", data)
++	}
++}
++
++func TestStaleOrInvalidSelectionNeverConsumesAnotherCredit(t *testing.T) {
++	for _, selected := range []string{"missing-credit", "credit-expired", "", "bad\ncredit"} {
++		t.Run(selected, func(t *testing.T) {
++			list := `{"available_count":1,"credits":[{"id":"credit-other","reset_type":"codex_rate_limits","status":"available","expires_at":"2099-01-01T00:00:00Z"},{"id":"credit-expired","reset_type":"codex_rate_limits","status":"available","expires_at":"2000-01-01T00:00:00Z"}]}`
++			caller := &recordingManagementCaller{responses: []*apicall.Response{{StatusCode: 200, BodyText: list, Body: json.RawMessage(list)}}}
++			provider := quota.NewCodexProvider(caller, quota.DefaultProviderConfigs().Codex).(quota.ProviderResetter)
++			if _, err := provider.Reset(context.Background(), quota.ProviderInput{Identity: entities.UsageIdentity{Identity: "account"}, ResetCreditID: &selected}); err == nil {
++				t.Fatal("expected rejected selection")
++			}
++			for _, request := range caller.requests {
++				if request.Method == "POST" {
++					t.Fatal("invalid selection consumed a credit")
++				}
++			}
++		})
++	}
++}
+diff --git a/internal/quota/types.go b/internal/quota/types.go
+index 7bd9020..0ab22d9 100644
+--- a/internal/quota/types.go
++++ b/internal/quota/types.go
+@@ -12,7 +12,8 @@ type ManagementAPICaller interface {
+ }
+ 
+ type ProviderInput struct {
+-	Identity entities.UsageIdentity
++	Identity      entities.UsageIdentity
++	ResetCreditID *string
+ }
+ 
+ type ProviderOutput struct {
+diff --git a/web/src/components/usage/credentials/AuthFileCredentialsSection.tsx b/web/src/components/usage/credentials/AuthFileCredentialsSection.tsx
+index 556099c..0451945 100644
+--- a/web/src/components/usage/credentials/AuthFileCredentialsSection.tsx
++++ b/web/src/components/usage/credentials/AuthFileCredentialsSection.tsx
+@@ -17,6 +17,7 @@ import { CredentialHealthPanel } from './CredentialHealthPanel'
+ import { CredentialSubscriptionBadge } from './CredentialSubscriptionBadge'
+ import { CredentialPriorityBadge, CredentialRowShell, CredentialSectionShell, CredentialTableHeader, CredentialsPagination, MetricPill, RequestMetric, TonePercent, cacheReadRateTone, capitalize, credentialToneClassName, formatCredentialNumber, successRateTone } from './CredentialSectionShell'
+ import { ProviderBrandIcon } from '@/components/ProviderBrandIcon'
++import { selectableResetCredits } from './resetCreditSelection'
+ 
+ type Translate = (key: string, options?: Record<string, string>) => string
+ type InspectionIndicatorTone = 'idle' | 'running' | 'completed'
+@@ -110,7 +111,7 @@ interface AuthFileCredentialsSectionProps {
+   onSortChange: (sort: UsageIdentityPageSort) => void
+   onRefreshQuota: () => Promise<void>
+   onRefreshQuotaForAuthIndex: (authIndex: string) => Promise<void>
+-  onResetQuotaForAuthIndex: (authIndex: string) => Promise<void>
++  onResetQuotaForAuthIndex: (authIndex: string, creditId?: string) => Promise<void>
+   aliasSavingId?: string
+   onSaveAlias?: (id: string, alias: string) => Promise<void>
+   onOpenDetails?: (row: AuthFileCredentialRow) => void
+@@ -340,7 +341,7 @@ export function AuthFileCredentialsSection({ rows, total, page, totalPages, page
+                       resetCredits={resetCredits}
+                       disabled={!canResetQuota}
+                       loading={row.quotaResetting === true}
+-                      onConfirm={() => onResetQuotaForAuthIndex(row.identity.identity)}
++                      onConfirm={(creditId) => onResetQuotaForAuthIndex(row.identity.identity, creditId)}
+                     />
+                   )}
+                   <button
+@@ -428,7 +429,7 @@ export function QuotaResetAction({
+   disabled: boolean
+   loading: boolean
+   fetchResetCredits?: (authIndex: string, signal?: AbortSignal) => Promise<UsageQuotaResetCreditsResponse>
+-  onConfirm: () => Promise<void>
++  onConfirm: (creditId?: string) => Promise<void>
+ }) {
+   const { t } = useTranslation()
+   const [open, setOpen] = useState(false)
+@@ -436,6 +437,8 @@ export function QuotaResetAction({
+   const [resetCreditsDetails, setResetCreditsDetails] = useState<UsageQuotaResetCreditsResponse | null>(null)
+   const [resetCreditsLoading, setResetCreditsLoading] = useState(false)
+   const [resetCreditsFailed, setResetCreditsFailed] = useState(false)
++  const [selectedCreditId, setSelectedCreditId] = useState<string | undefined>()
++  const [submissionError, setSubmissionError] = useState('')
+   const tooltipId = useId()
+   const actionRef = useRef<HTMLDivElement | null>(null)
+   const buttonRef = useRef<HTMLButtonElement | null>(null)
+@@ -497,6 +500,7 @@ export function QuotaResetAction({
+       .then((response) => {
+         if (active) {
+           setResetCreditsDetails(response)
++          setSelectedCreditId(selectableResetCredits(response.credits)[0]?.id)
+         }
+       })
+       .catch(() => {
+@@ -547,8 +551,15 @@ export function QuotaResetAction({
+   }, [open])
+ 
+   const handleConfirm = async () => {
+-    await onConfirm()
+-    setOpen(false)
++    if (confirmDisabled) return
++    setSubmissionError('')
++    try {
++      await onConfirm(selectedCreditId)
++      setOpen(false)
++      buttonRef.current?.focus({ preventScroll: true })
++    } catch {
++      setSubmissionError(t('usage_stats.credentials_quota_reset_failed'))
++    }
+   }
+ 
+   const handleToggleOpen = () => {
+@@ -558,6 +569,8 @@ export function QuotaResetAction({
+     }
+     updatePopoverPosition()
+     setResetCreditsDetails(null)
++    setSelectedCreditId(undefined)
++    setSubmissionError('')
+     setResetCreditsFailed(false)
+     setResetCreditsLoading(true)
+     setOpen(true)
+@@ -575,7 +588,9 @@ export function QuotaResetAction({
+     (resetCreditsDetails.availableCount === null && resetCreditsDetails.credits.length === 0)
+     || (resetCreditsDetails.availableCount !== null && resetCreditsDetails.availableCount > resetCreditsDetails.credits.length)
+   )
+-  const confirmDisabled = loading || resetCreditsLoading || resetCreditsExplicitlyUnavailable
++  const selectableCredits = selectableResetCredits(resetCreditsDetails?.credits ?? [])
++  const invalidSelection = Boolean(resetCreditsDetails?.credits.length) && !selectableCredits.some((credit) => credit.id === selectedCreditId)
++  const confirmDisabled = loading || resetCreditsLoading || resetCreditsExplicitlyUnavailable || invalidSelection
+ 
+   return (
+     <div ref={actionRef} className={styles.credentialQuotaResetAction}>
+@@ -623,14 +638,18 @@ export function QuotaResetAction({
+               </div>
+             )}
+             {!resetCreditsLoading && resetCreditsDetails && resetCreditsDetails.credits.length > 0 && (
+-              <div className={styles.credentialQuotaResetExpiryList}>
+-                {resetCreditsDetails.credits.map((credit, index) => (
+-                  <div key={credit.id || `${credit.expiresAt}-${index}`} className={styles.credentialQuotaResetExpiryRow}>
+-                    <span>{t('usage_stats.credentials_quota_reset_expiry_item', { index: index + 1 })}</span>
+-                    <strong>{formatResetCreditExpiry(credit.expiresAt)}</strong>
+-                  </div>
+-                ))}
+-              </div>
++              <fieldset className={styles.credentialQuotaResetChoices}>
++                <legend>{t('usage_stats.credentials_quota_reset_select_hint')}</legend>
++                <div className={styles.credentialQuotaResetExpiryList}>
++                  {selectableCredits.map((credit, index) => (
++                    <label key={credit.id} className={`${styles.credentialQuotaResetExpiryRow} ${selectedCreditId === credit.id ? styles.credentialQuotaResetExpirySelected : ''}`.trim()}>
++                      <input type="radio" name={`${tooltipId}-credit`} value={index} checked={selectedCreditId === credit.id} disabled={loading} onChange={() => setSelectedCreditId(credit.id)} />
++                      <span>{t('usage_stats.credentials_quota_reset_expiry_item', { index: index + 1 })}</span>
++                      <strong>{formatResetCreditExpiry(credit.expiresAt)}</strong>
++                    </label>
++                  ))}
++                </div>
++              </fieldset>
+             )}
+             {!resetCreditsLoading && resetCreditsExplicitlyUnavailable && (
+               <p className={styles.credentialQuotaResetExpiryStatus}>{t('usage_stats.credentials_quota_reset_expiry_empty')}</p>
+@@ -641,6 +660,7 @@ export function QuotaResetAction({
+               </p>
+             )}
+           </div>
++          {submissionError && <p role="alert" className={styles.credentialQuotaResetExpiryWarning}>{submissionError}</p>}
+           <div className={styles.credentialQuotaResetActions}>
+             <button type="button" className={styles.credentialQuotaResetCancelButton} onClick={() => setOpen(false)} disabled={loading}>
+               {t('common.cancel')}
+diff --git a/web/src/components/usage/credentials/CredentialSections.module.scss b/web/src/components/usage/credentials/CredentialSections.module.scss
+index 0ba61c1..28e8198 100644
+--- a/web/src/components/usage/credentials/CredentialSections.module.scss
++++ b/web/src/components/usage/credentials/CredentialSections.module.scss
+@@ -2518,6 +2518,18 @@ $credential-name-column-width: $credential-name-content-width + $credential-prov
+   color: var(--text-tertiary);
+   font-size: 11px;
+   line-height: 1.35;
++  cursor: pointer;
++
++  input {
++    flex-shrink: 0;
++    margin: 0;
++    accent-color: var(--primary-color);
++  }
++
++  &:focus-within {
++    outline: 2px solid var(--primary-color);
++    outline-offset: 2px;
++  }
+ 
+   strong {
+     min-width: 0;
+@@ -2528,6 +2540,25 @@ $credential-name-column-width: $credential-name-content-width + $credential-prov
+   }
+ }
+ 
++.credentialQuotaResetChoices {
++  min-width: 0;
++  margin: 0;
++  padding: 0;
++  border: 0;
++
++  legend {
++    margin-bottom: 6px;
++    color: var(--text-secondary);
++    font-size: 11px;
++  }
++}
++
++.credentialQuotaResetExpirySelected {
++  border-color: var(--primary-color);
++  background: color-mix(in srgb, var(--primary-color) 14%, var(--bg-secondary));
++  color: var(--text-primary);
++}
++
+ .credentialQuotaResetExpiryWarning {
+   padding: 7px 8px;
+   border: 1px solid var(--warning-border);
+diff --git a/web/src/components/usage/credentials/resetCreditSelection.ts b/web/src/components/usage/credentials/resetCreditSelection.ts
+new file mode 100644
+index 0000000..1a9de86
+--- /dev/null
++++ b/web/src/components/usage/credentials/resetCreditSelection.ts
+@@ -0,0 +1,10 @@
++import type { UsageQuotaResetCredit } from '@/lib/types'
++
++export function selectableResetCredits(credits: UsageQuotaResetCredit[], now = Date.now()): UsageQuotaResetCredit[] {
++  const seen = new Set<string>()
++  return credits.filter((credit) => {
++    if (!credit.id || credit.status !== 'available' || !Number.isFinite(Date.parse(credit.expiresAt)) || Date.parse(credit.expiresAt) <= now || seen.has(credit.id)) return false
++    seen.add(credit.id)
++    return true
++  }).sort((left, right) => Date.parse(left.expiresAt) - Date.parse(right.expiresAt))
++}
+diff --git a/web/src/components/usage/credentials/test/QuotaResetAction.test.tsx b/web/src/components/usage/credentials/test/QuotaResetAction.test.tsx
+index 3b48fd4..92809d7 100644
+--- a/web/src/components/usage/credentials/test/QuotaResetAction.test.tsx
++++ b/web/src/components/usage/credentials/test/QuotaResetAction.test.tsx
+@@ -29,6 +29,25 @@ describe('QuotaResetAction reset credit details', () => {
+   let container: HTMLDivElement
+   let root: Root
+ 
++  it('allows choosing the second credit and submits that exact selection', async () => {
++    const onConfirm = vi.fn(async () => undefined)
++    await act(async () => {
++      root.render(<QuotaResetAction authIndex="codex-auth" resetCredits={2} disabled={false} loading={false}
++        fetchResetCredits={async () => ({ authIndex: 'codex-auth', availableCount: 2, credits: [
++          { id: 'second', status: 'available', expiresAt: '2099-02-01T00:00:00Z' },
++          { id: 'first', status: 'available', expiresAt: '2099-01-01T00:00:00Z' },
++        ] })} onConfirm={onConfirm} />)
++    })
++    await act(async () => container.querySelector<HTMLButtonElement>('button[aria-haspopup="dialog"]')!.click())
++    const radios = container.querySelectorAll<HTMLInputElement>('input[type="radio"]')
++    expect(radios).toHaveLength(2)
++    expect(radios[0]?.checked).toBe(true)
++    await act(async () => radios[1]!.click())
++    expect(radios[1]?.checked).toBe(true)
++    await act(async () => Array.from(container.querySelectorAll<HTMLButtonElement>('button')).at(-1)!.click())
++    expect(onConfirm).toHaveBeenCalledExactlyOnceWith('second')
++  })
++
+   beforeEach(() => {
+     container = document.createElement('div')
+     document.body.appendChild(container)
+@@ -85,8 +104,8 @@ describe('QuotaResetAction reset credit details', () => {
+         authIndex: 'codex-auth',
+         availableCount: 2,
+         credits: [
+-          { id: 'credit-1', status: 'available', expiresAt: '2026-07-20T00:00:00Z' },
+-          { id: 'credit-2', status: 'available', expiresAt: '2026-07-21T00:00:00Z' },
++          { id: 'credit-1', status: 'available', expiresAt: '2099-07-20T00:00:00Z' },
++          { id: 'credit-2', status: 'available', expiresAt: '2099-07-21T00:00:00Z' },
+         ],
+       })
+       await request.promise
+@@ -94,7 +113,7 @@ describe('QuotaResetAction reset credit details', () => {
+ 
+     expect(container.textContent).toContain('usage_stats.credentials_quota_reset_expiry_title')
+     expect(container.textContent).toContain('usage_stats.credentials_quota_reset_expiry_item:1')
+-    expect(container.textContent).toContain('2026-07-20 08:00:00')
++    expect(container.textContent).toContain('2099-07-20 08:00:00')
+     expect(Array.from(container.querySelectorAll<HTMLButtonElement>('button')).at(-1)?.disabled).toBe(false)
+   })
+ 
+@@ -125,7 +144,7 @@ describe('QuotaResetAction reset credit details', () => {
+     await renderOpenAction(async () => ({
+       authIndex: 'codex-auth',
+       availableCount: null,
+-      credits: [{ id: 'credit-1', status: 'available', expiresAt: '2026-07-20T00:00:00Z' }],
++      credits: [{ id: 'credit-1', status: 'available', expiresAt: '2099-07-20T00:00:00Z' }],
+     }))
+ 
+     const dialog = container.querySelector<HTMLElement>('[role="dialog"]')
+@@ -156,10 +175,10 @@ describe('QuotaResetAction reset credit details', () => {
+     await renderOpenAction(async () => ({
+       authIndex: 'codex-auth',
+       availableCount: 3,
+-      credits: [{ id: 'credit-1', status: 'available', expiresAt: '2026-07-20T00:00:00Z' }],
++      credits: [{ id: 'credit-1', status: 'available', expiresAt: '2099-07-20T00:00:00Z' }],
+     }))
+ 
+-    expect(container.textContent).toContain('2026-07-20 08:00:00')
++    expect(container.textContent).toContain('2099-07-20 08:00:00')
+     expect(container.textContent).toContain('usage_stats.credentials_quota_reset_expiry_failed')
+     expect(Array.from(container.querySelectorAll<HTMLButtonElement>('button')).at(-1)?.disabled).toBe(false)
+   })
+diff --git a/web/src/components/usage/credentials/useCredentialsTabData.ts b/web/src/components/usage/credentials/useCredentialsTabData.ts
+index 83dc69e..1fda648 100644
+--- a/web/src/components/usage/credentials/useCredentialsTabData.ts
++++ b/web/src/components/usage/credentials/useCredentialsTabData.ts
+@@ -71,7 +71,7 @@ export interface CredentialsTabData {
+   resetUsageIdentityStats: (id: string) => Promise<UsageIdentity>
+   refreshQuotaForCurrentAuthFilePage: () => Promise<void>
+   refreshQuotaForAuthIndex: (authIndex: string) => Promise<void>
+-  resetQuotaForAuthIndex: (authIndex: string) => Promise<void>
++  resetQuotaForAuthIndex: (authIndex: string, creditId?: string) => Promise<void>
+   refreshQuotaInspectionStatus: () => Promise<void>
+   startQuotaInspection: () => Promise<void>
+ }
+@@ -140,7 +140,7 @@ export function useCredentialsTabData({ enabledAuthFiles, enabledAiProviders, on
+     }
+   }, [credentialPages, onAuthRequired, onNotice])
+ 
+-  const resetQuotaForAuthIndex = useCallback(async (authIndex: string) => {
++  const resetQuotaForAuthIndex = useCallback(async (authIndex: string, creditId?: string) => {
+     setQuotaResetStateByAuthIndex((current) => ({
+       ...current,
+       [authIndex]: { quotaResetting: true },
+@@ -149,20 +149,16 @@ export function useCredentialsTabData({ enabledAuthFiles, enabledAiProviders, on
+       const outcome = await runQuotaResetForAuthIndex(authIndex, {
+         resetUsageQuota,
+         refreshQuotaForAuthIndex,
+-      })
+-      setQuotaResetStateByAuthIndex((current) => ({
+-        ...current,
+-        [authIndex]: { quotaResetting: false },
+-      }))
++      }, creditId)
+       if (outcome.kind === 'error') {
+         onNotice?.('error', outcome.message)
++        throw new Error(outcome.message)
+       }
+-    } catch {
++    } finally {
+       setQuotaResetStateByAuthIndex((current) => ({
+         ...current,
+         [authIndex]: { quotaResetting: false },
+       }))
+-      onNotice?.('error', quotaResetDisplayError())
+     }
+   }, [onNotice, refreshQuotaForAuthIndex])
+ 
+@@ -224,13 +220,15 @@ export type QuotaResetOutcome =
+ export async function runQuotaResetForAuthIndex(
+   authIndex: string,
+   deps: {
+-    resetUsageQuota: (authIndex: string) => Promise<unknown>
++    resetUsageQuota: (authIndex: string, signal?: AbortSignal, creditId?: string) => Promise<unknown>
+     refreshQuotaForAuthIndex: (authIndex: string) => Promise<void>
+   },
++  creditId?: string,
+ ): Promise<QuotaResetOutcome> {
+   try {
+     // reset 只负责消费官方次数；失败时不写行内限额缓存，也不触发刷新任务。
+-    await deps.resetUsageQuota(authIndex)
++    if (creditId === undefined) await deps.resetUsageQuota(authIndex)
++    else await deps.resetUsageQuota(authIndex, undefined, creditId)
+   } catch {
+     return {
+       kind: 'error',
+diff --git a/web/src/i18n/index.ts b/web/src/i18n/index.ts
+index fd16ecc..b40af90 100644
+--- a/web/src/i18n/index.ts
++++ b/web/src/i18n/index.ts
+@@ -459,6 +459,7 @@ const resources = {
+         credentials_quota_reset_confirm: 'Reset',
+         credentials_quota_reset_failed: 'Quota reset failed. Please try again later.',
+         credentials_quota_reset_expiry_title: 'Manual reset expiry (GMT+8)',
++        credentials_quota_reset_select_hint: 'Select one credit; the earliest expiry is selected by default.',
+         credentials_quota_reset_expiry_loading: 'Loading expiry times...',
+         credentials_quota_reset_expiry_item: 'Reset {{index}}',
+         credentials_quota_reset_expiry_empty: 'No manual resets are currently available.',
+@@ -1327,6 +1328,7 @@ const resources = {
+         credentials_quota_reset_confirm: '确认重置',
+         credentials_quota_reset_failed: '重置限额失败，请稍后重试。',
+         credentials_quota_reset_expiry_title: '主动重置过期时间（GMT+8）',
++        credentials_quota_reset_select_hint: '点击一张重置券选择，默认选中最早到期的一张。',
+         credentials_quota_reset_expiry_loading: '正在获取过期时间…',
+         credentials_quota_reset_expiry_item: '第 {{index}} 次',
+         credentials_quota_reset_expiry_empty: '当前没有可用重置次数。',
+@@ -2195,6 +2197,7 @@ const resources = {
+         credentials_quota_reset_confirm: '確認重置',
+         credentials_quota_reset_failed: '重置限額失敗，請稍後重試。',
+         credentials_quota_reset_expiry_title: '主動重置過期時間（GMT+8）',
++        credentials_quota_reset_select_hint: '點擊一張重置券選擇，預設選中最早到期的一張。',
+         credentials_quota_reset_expiry_loading: '正在取得到期時間…',
+         credentials_quota_reset_expiry_item: '第 {{index}} 次',
+         credentials_quota_reset_expiry_empty: '目前沒有可用重置次數。',
+diff --git a/web/src/lib/api.ts b/web/src/lib/api.ts
+index c64a533..7bdc816 100644
+--- a/web/src/lib/api.ts
++++ b/web/src/lib/api.ts
+@@ -738,13 +738,13 @@ export async function startUsageQuotaInspection(signal?: AbortSignal): Promise<U
+ }
+ 
+ 
+-export async function resetUsageQuota(authIndex: string, signal?: AbortSignal): Promise<UsageQuotaResetResponse> {
++export async function resetUsageQuota(authIndex: string, signal?: AbortSignal, creditId?: string): Promise<UsageQuotaResetResponse> {
+   const response = await apiFetch(apiPath('/quota/reset'), {
+     method: 'POST',
+     headers: {
+       'Content-Type': 'application/json',
+     },
+-    body: JSON.stringify({ auth_index: authIndex }),
++    body: JSON.stringify({ auth_index: authIndex, ...(creditId === undefined ? {} : { credit_id: creditId }) }),
+     signal,
+   })
+   if (!response.ok) {
