@@ -42,6 +42,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install WebSocket acceptance dependency
+        if: matrix.kind == 'cpa'
+        run: python3 -m pip install websocket-client==1.8.0
+
       - name: Prepare compatible source
         id: source
         env:

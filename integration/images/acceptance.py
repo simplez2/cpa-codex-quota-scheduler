@@ -4,6 +4,7 @@ import hashlib
 import json
 from pathlib import Path
 import subprocess
+import sys
 import urllib.request
 import zipfile
 import io
@@ -39,7 +40,7 @@ def main(image, output):
     binary.chmod(0o755)
     for fixture in ["acceptance", "priority", "anti_storm", "reset_credits"]:
         subprocess.run([
-            "python3", str(ROOT / "integration/continuity" / (fixture + ".py")),
+            sys.executable, str(ROOT / "integration/continuity" / (fixture + ".py")),
             "--cpa", str(binary), "--plugin", str(plugin),
             "--output", str(output / (fixture + ".json")),
         ], check=True)
