@@ -68,7 +68,7 @@ def prepare(kind, destination, requested_cpa):
         text = text.replace("ARG VERSION=dev", validation + "ARG VERSION=dev", 1)
     else:
         text = text.replace("RUN npm run build", "RUN npm run typecheck && npm run lint && npm test && npm run build", 1)
-        text = text.replace("ARG VERSION=dev", "ENV GOMAXPROCS=2 GOFLAGS=-p=2\nRUN go test ./... && go vet ./...\nARG VERSION=dev", 1)
+        text = text.replace("ARG VERSION=dev", "COPY Dockerfile ./\nCOPY .github/ ./.github/\nENV GOMAXPROCS=2 GOFLAGS=-p=2\nRUN go test ./... && go vet ./...\nARG VERSION=dev", 1)
     runtime_license = f"COPY LICENSE /usr/share/doc/{'cli-proxy-api' if kind == 'cpa' else 'cpa-usage-keeper'}/LICENSE\n"
     marker = 'CMD ["./CLIProxyAPI"]' if kind == "cpa" else 'ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]'
     if marker not in text:
