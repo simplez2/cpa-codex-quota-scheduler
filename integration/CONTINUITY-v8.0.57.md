@@ -13,5 +13,10 @@ The publishing workflow requires the affected Go suites, race checks, vet and
 synthetic original-request recovery, scheduling, concurrency and reset-credit
 acceptance before updating the image tag.
 
+The patch also removes an unused copied sync.Once from an upstream test and
+uses an explicit cancellation signal in the HTTP-interrupt test. The latter
+waits for the asynchronous upstream cancellation before asserting it, retaining
+the cancellation assertion and same-socket follow-up request.
+
 See [1Panel usage](images/README.zh-CN.md) and the existing
 [continuity contract](CONTINUITY-v8.0.44.md).

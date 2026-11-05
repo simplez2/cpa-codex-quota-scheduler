@@ -68,6 +68,11 @@ Windows 使用对应服务身份的 NTFS ACL。无需给插件 root、管理员�
 [集成说明](https://github.com/simplez2/cpa-codex-quota-scheduler/blob/main/integration/CONTINUITY-v8.0.44.md)。
 面板显示已配置并不证明宿主已实际调用该能力。
 
+在 1Panel 管理现有定制部署时，CPA 使用 `ghcr.io/simplez2/cli-proxy-api:latest`，
+Keeper 使用 `ghcr.io/simplez2/cpa-usage-keeper-reset:latest`。在“容器 → 升级”勾选
+“强制拉取镜像”后确认即可。CPA 当前兼容集成基于 v8.0.57，发布前运行插件和原请求恢复验收。
+多网络部署还需保留宿主的网络恢复适配，见 [1Panel 说明](integration/images/README.zh-CN.md)。
+
 升级前保存当前动态库、配置及持久化状态。先暂停新请求并等待在途请求结束，再使用 CPA
 支持的插件更新或重载方式；Windows 中被加载的 DLL 不能直接覆盖。升级后核对插件版本、
 状态目录、实际并发计数和一个真实流式请求，再恢复全部入口。保留原动态库以便回退。

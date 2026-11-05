@@ -1,0 +1,21 @@
+[Unit]
+Description=Restore CPA and Keeper networks after 1Panel upgrades
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/cpa-1panel/network_guard.py --config /opt/cpa-1panel/networks.json
+Restart=always
+RestartSec=2
+User=root
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX
+
+[Install]
+WantedBy=multi-user.target
