@@ -75,6 +75,9 @@ def prepare(kind, destination, requested_cpa):
         raise ValueError("Runtime Dockerfile layout changed")
     text = text.replace(marker, runtime_license + marker, 1)
     dockerfile.write_text(text, encoding="utf-8", newline="\n")
+    ignore = destination / ".dockerignore"
+    existing = ignore.read_text(encoding="utf-8") if ignore.exists() else ""
+    ignore.write_text(existing.rstrip() + "\n!LICENSE\n", encoding="utf-8", newline="\n")
     output = {"version": version, "commit": commit, "source": str(destination)}
     if os.environ.get("GITHUB_OUTPUT"):
         with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
