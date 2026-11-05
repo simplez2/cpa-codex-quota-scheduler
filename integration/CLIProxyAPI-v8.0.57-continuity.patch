@@ -44,6 +44,19 @@ index 00000000..e75ffc49
 +		t.Fatalf("unsafe metadata survived: %s", client.raw)
 +	}
 +}
+diff --git a/internal/pluginhost/host_test.go b/internal/pluginhost/host_test.go
+index 8b8fcd27..64ac6cee 100644
+--- a/internal/pluginhost/host_test.go
++++ b/internal/pluginhost/host_test.go
+@@ -1633,8 +1633,6 @@ func TestHostApplyConfigWaitsForBlockedQuiesceBeforeCanceledRollbackAndReplay(t
+ 			events.add("old.quiesce.finish")
+ 			return marshalRPCResult(rpcEmptyResponse{})
+ 		case pluginabi.MethodPluginReconfigure:
+-			var reconfigureOnce sync.Once
+-			_ = reconfigureOnce
+ 			select {
+ 			case <-reconfigureStarted:
+ 			default:
 diff --git a/internal/pluginhost/rpc_client.go b/internal/pluginhost/rpc_client.go
 index 332674bf..da91ea72 100644
 --- a/internal/pluginhost/rpc_client.go
