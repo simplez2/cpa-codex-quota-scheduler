@@ -26,10 +26,10 @@ if not re.search(rf"^## {re.escape(version)} — \d{{4}}-\d{{2}}-\d{{2}}$",
 if not (root / "SERIAL_CONFIG.example.yaml").read_text(encoding="utf-8").startswith(
         f"# Standalone CPA quota scheduler v{version}."):
     raise SystemExit("example config version does not match pluginVersion")
-for name in ("host-patch.json", "continuity-host-patch.json", "continuity-host-patch-v8.0.44.json", "continuity-host-patch-v8.0.52.json"):
+for name in ("host-patch.json", "continuity-host-patch.json", "continuity-host-patch-v8.0.44.json", "continuity-host-patch-v8.0.52.json", "continuity-host-patch-v8.0.57.json"):
     manifest = json.loads((root / "integration" / name).read_text(encoding="utf-8"))
     patch = root / "integration" / manifest.get(
         "patch_file", "CLIProxyAPI-v7.2.152-quota-failover.patch")
     if hashlib.sha256(patch.read_bytes()).hexdigest() != manifest["patch_sha256"]:
         raise SystemExit(f"host patch checksum mismatch: {name}")
-print(f"Release metadata and four host patch checksums verified: {version}")
+print(f"Release metadata and five host patch checksums verified: {version}")

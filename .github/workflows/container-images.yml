@@ -1,0 +1,95 @@
+name: Publish 1Panel latest images
+
+on:
+  push:
+    branches: [main, codex/cpa-latest-1panel]
+    paths:
+      - .github/workflows/container-images.yml
+      - integration/images/**
+      - integration/CLIProxyAPI-v8.0.57-continuity.patch
+      - integration/continuity-host-patch-v8.0.57.json
+      - integration/reset-credit-picker/keeper-v2.0.3.patch
+  workflow_dispatch:
+    inputs:
+      cpa_version:
+        description: Stable CPA tag or latest
+        default: latest
+        type: string
+  schedule:
+    - cron: '17 */6 * * *'
+
+concurrency:
+  group: onepanel-latest-images
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    name: Build and publish ${{ matrix.kind }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - kind: cpa
+            package: cli-proxy-api
+          - kind: keeper
+            package: cpa-usage-keeper-reset
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install WebSocket acceptance dependency
+        if: matrix.kind == 'cpa'
+        run: python3 -m pip install websocket-client==1.8.0
+
+      - name: Prepare compatible source
+        id: source
+        env:
+          CPA_VERSION: ${{ inputs.cpa_version || 'latest' }}
+        run: python3 integration/images/prepare.py '${{ matrix.kind }}' '${{ runner.temp }}/source-${{ matrix.kind }}' --cpa-version "$CPA_VERSION"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and validate image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ steps.source.outputs.source }}
+          load: true
+          tags: local/onepanel-${{ matrix.kind }}:tested
+          build-args: |
+            VERSION=${{ steps.source.outputs.version }}
+            COMMIT=${{ steps.source.outputs.commit }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.source.outputs.version }}
+            org.opencontainers.image.revision=${{ steps.source.outputs.commit }}
+          cache-from: type=gha,scope=onepanel-${{ matrix.kind }}
+          cache-to: type=gha,mode=max,scope=onepanel-${{ matrix.kind }}
+
+      - name: Verify CPA recovery and scheduling with released plugin
+        if: matrix.kind == 'cpa'
+        run: python3 integration/images/acceptance.py --image local/onepanel-cpa:tested --output '${{ runner.temp }}/acceptance'
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish latest
+        env:
+          PACKAGE: ${{ matrix.package }}
+          OWNER: ${{ github.repository_owner }}
+          KIND: ${{ matrix.kind }}
+        run: |
+          target="ghcr.io/${OWNER,,}/$PACKAGE:latest"
+          docker tag "local/onepanel-$KIND:tested" "$target"
+          docker push "$target"

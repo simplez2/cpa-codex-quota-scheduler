@@ -1,5 +1,9 @@
 # CPA host quota failover
 
+For CPA v8.0.57 and 1Panel `latest` image upgrades, see
+[the current integration](CONTINUITY-v8.0.57.md) and
+[the 1Panel instructions](images/README.zh-CN.md).
+
 For official CPA v8.0.44, use the separately ported
 [v8.0.44 continuity integration](CONTINUITY-v8.0.44.md). Its base revision
 and patch digest are recorded in `continuity-host-patch-v8.0.44.json`.
