@@ -105,6 +105,7 @@ type schedulerRuntimeState struct {
 	warmupMu                    sync.Mutex
 	warmupRunning               bool
 	warmups                     map[string]warmupEntry
+	warmupResetChecks           map[string]warmupResetCheck
 	warmupHistory               []warmupEntry
 	warmupAttempts              []warmupAttempt
 	warmupCandidatesLast        int
@@ -243,6 +244,7 @@ func configureSchedulerRuntime(raw []byte) {
 	schedulerRuntime.stopping = false
 	schedulerRuntime.detached = false
 	schedulerRuntime.warmups = make(map[string]warmupEntry)
+	schedulerRuntime.warmupResetChecks = make(map[string]warmupResetCheck)
 	schedulerRuntime.warmupHistory = nil
 	schedulerRuntime.warmupAttempts = nil
 	schedulerRuntime.warmupCandidatesLast = 0

@@ -169,7 +169,7 @@ func warmupEntryNewer(incoming, current warmupEntry) bool {
 
 func warmupEntryRevisionTime(entry warmupEntry) time.Time {
 	latest := entry.AttemptedAt
-	for _, candidate := range []time.Time{entry.CompletedAt, entry.ActivatedAt, entry.OutcomeAt} {
+	for _, candidate := range []time.Time{entry.CompletedAt, entry.ActivatedAt, entry.OutcomeAt, entry.ResetConfirmedAt} {
 		if candidate.After(latest) {
 			latest = candidate
 		}

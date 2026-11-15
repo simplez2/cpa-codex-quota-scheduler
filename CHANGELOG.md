@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.40 — 2026-11-16
+
+- Recover an individual credential's unstarted quota cycle from an obsolete
+  successful warmup receipt, without requiring a pool-wide reset quorum. Require
+  two spaced native observations with moving full-window anchors; preserve recent
+  activations, uncertain outcomes, failures, credential identity and daily budgets.
+- Persist the reset confirmation so hot reloads and older cross-generation outcome
+  journals cannot restore obsolete warmup suppression. One activation still covers
+  both weekly and five-hour windows.
+- Actually dispatch due warmup preflight observations before a successful idle
+  polling cooldown or header-cache deferral, retaining upstream failure backoff.
+
 ## 0.3.39 — 2026-11-03
 
 - Present reset credits in a full-width account summary with independent official

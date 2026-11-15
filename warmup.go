@@ -23,22 +23,23 @@ import (
 // no token or response body, only the auth/window bookkeeping needed to avoid
 // repeating the request after a CPA restart.
 type warmupEntry struct {
-	AuthID         string    `json:"auth_id"`
-	AuthIndex      string    `json:"auth_index,omitempty"`
-	Window         string    `json:"window"`
-	AttemptedAt    time.Time `json:"attempted_at"`
-	OutcomeAt      time.Time `json:"outcome_at,omitempty"`
-	Failures       int       `json:"failures,omitempty"`
-	CompletedAt    time.Time `json:"completed_at,omitempty"`
-	ActivatedAt    time.Time `json:"activated_at,omitempty"`
-	ResetAt        time.Time `json:"reset_at,omitempty"`
-	SuppressUntil  time.Time `json:"suppress_until,omitempty"`
-	Status         int       `json:"status,omitempty"`
-	Error          string    `json:"error,omitempty"`
-	DispatchState  string    `json:"dispatch_state,omitempty"`
-	Blocked        bool      `json:"blocked,omitempty"`
-	EpochID        string    `json:"epoch_id,omitempty"`
-	CoveredWindows []string  `json:"covered_windows,omitempty"`
+	AuthID           string    `json:"auth_id"`
+	AuthIndex        string    `json:"auth_index,omitempty"`
+	Window           string    `json:"window"`
+	AttemptedAt      time.Time `json:"attempted_at"`
+	OutcomeAt        time.Time `json:"outcome_at,omitempty"`
+	ResetConfirmedAt time.Time `json:"reset_confirmed_at,omitempty"`
+	Failures         int       `json:"failures,omitempty"`
+	CompletedAt      time.Time `json:"completed_at,omitempty"`
+	ActivatedAt      time.Time `json:"activated_at,omitempty"`
+	ResetAt          time.Time `json:"reset_at,omitempty"`
+	SuppressUntil    time.Time `json:"suppress_until,omitempty"`
+	Status           int       `json:"status,omitempty"`
+	Error            string    `json:"error,omitempty"`
+	DispatchState    string    `json:"dispatch_state,omitempty"`
+	Blocked          bool      `json:"blocked,omitempty"`
+	EpochID          string    `json:"epoch_id,omitempty"`
+	CoveredWindows   []string  `json:"covered_windows,omitempty"`
 }
 
 type warmupCandidate struct {
@@ -467,6 +468,9 @@ func warmupEntrySuppressesNow(entry warmupEntry, now time.Time, retryAfter time.
 	if entry.Blocked {
 		return true
 	}
+	if warmupEntryResetConfirmed(entry) {
+		return false
+	}
 	if !entry.SuppressUntil.IsZero() && now.Before(entry.SuppressUntil) {
 		return true
 	}
@@ -676,6 +680,9 @@ func (s *schedulerRuntimeState) nextWarmupCandidateForGenerationLocked(candidate
 func staleWarmupState(entry warmupEntry, candidate warmupCandidate, now time.Time, retryAfter time.Duration) bool {
 	if entry.Blocked {
 		return false
+	}
+	if warmupEntryResetConfirmed(entry) {
+		return true
 	}
 	if candidate.EpochID != "" && entry.EpochID != "" && candidate.EpochID != entry.EpochID {
 		return true

@@ -420,13 +420,14 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 		}
 		s.mu.Lock()
 		poll := s.quotaPolls[id]
-		if now.Before(poll.NextAt) && !(strings.HasPrefix(reason, "epoch_") && poll.Failures == 0) {
+		preflight := (strings.HasPrefix(reason, "epoch_") || reason == "warmup") && poll.Failures == 0 && poll.Error == ""
+		if now.Before(poll.NextAt) && !preflight {
 			s.mu.Unlock()
 			continue
 		}
 		interval := s.quotaPollIntervalLocked(id, activeID, now)
 		previousPoll := poll
-		if !strings.HasPrefix(reason, "epoch_") {
+		if !preflight {
 			if deferUntil := quotaHeaderCacheDeadline(s.quotas[id], poll, cfg, interval, now); deferUntil.After(now) {
 				poll.NextAt = deferUntil
 				s.quotaPolls[id] = poll
@@ -501,6 +502,7 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 		var epochTransition quotaEpochTransition
 		var settlementSnapshot quotaSnapshot
 		var observeSettlement bool
+		var nativeSnapshot quotaSnapshot
 		if fetchErr != nil {
 			s.quotaRunway.ForgetAuth(id)
 			s.rotationRunway.ForgetAuth(id)
@@ -554,6 +556,7 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 			}
 			s.recovery.observe(snapshot, time.Now(), cfg.StaleAfter)
 			s.quotaNative[id] = snapshot
+			nativeSnapshot = snapshot
 			if creditState, ok := s.resetCredits[id]; ok && snapshot.ResetCreditsKnown && creditState.CountKnown && snapshot.ResetCredits != creditState.Count && snapshot.ResetCreditsObservedAt.After(creditState.ObservedAt) {
 				creditState.NextAt = time.Time{}
 				s.resetCredits[id] = creditState
@@ -574,6 +577,9 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 			reservations.ObserveQuota(id, settlementSnapshot, time.Now())
 		}
 		s.applyQuotaEpochTransition(epochTransition)
+		if fetchErr == nil {
+			s.reconcileWarmupReset(nativeSnapshot, time.Now())
+		}
 		s.reconcileAuthExpiry(batchCtx, cfg, auth, document, documentErr, snapshot, fetchErr, now, callHost, saveNativeAuthExpiry)
 		if batchCtx.Err() != nil {
 			break

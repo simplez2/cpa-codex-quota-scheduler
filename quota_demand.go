@@ -191,7 +191,7 @@ func (s *schedulerRuntimeState) quotaProbeReason(id string, now time.Time) strin
 // Budget, suppression, timing and quota evidence must all agree before an
 // activation may request a fresher observation. This never sends model text.
 func (s *schedulerRuntimeState) warmupQuotaProbeDue(id string, cfg pluginConfig, q quotaSnapshot, p quotaPollState, phase fiveHourPhaseState, now time.Time) bool {
-	if !cfg.WarmupEnabled || !warmupQuotaHasHeadroom(q, cfg) || warmupSnapshotFresh(q, now, cfg.StaleAfter) {
+	if !cfg.WarmupEnabled || !warmupQuotaHasHeadroom(q, cfg) {
 		return false
 	}
 	if _, banned := banStore.lookup(id); banned {
@@ -199,6 +199,14 @@ func (s *schedulerRuntimeState) warmupQuotaProbeDue(id string, cfg pluginConfig,
 	}
 	s.warmupMu.Lock()
 	defer s.warmupMu.Unlock()
+	// Read-only per-credential reset confirmation is independent of model-call
+	// budgets and the pool-wide reset quorum. Failed quota reads retain backoff.
+	if s.warmupResetProbeDueLocked(q, p, cfg, now) {
+		return true
+	}
+	if warmupSnapshotFresh(q, now, cfg.StaleAfter) {
+		return false
+	}
 	if s.warmupRunning || s.warmupTrafficStatusLocked(cfg, now).HoldReason != "" || s.warmupTrafficStatusLocked(cfg, now, id).HoldReason != "" {
 		return false
 	}
