@@ -73,7 +73,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.26.10"
+          go-version: "1.26.11"
           cache: true
 
       # Debian 12's glibc baseline keeps the Linux asset loadable on CPA hosts
@@ -85,7 +85,7 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
         run: |
           docker run --rm -v "$PWD:/work" -w /work -e CGO_ENABLED=1 -e GOOS -e GOARCH \
-            golang:1.26.10-bookworm go build -buildvcs=false -buildmode=c-shared -o codex-quota-scheduler.so .
+            golang:1.26.11-bookworm go build -buildvcs=false -buildmode=c-shared -o codex-quota-scheduler.so .
         shell: bash
 
       - name: Build native dynamic library

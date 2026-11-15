@@ -11,6 +11,12 @@
   both weekly and five-hour windows.
 - Actually dispatch due warmup preflight observations before a successful idle
   polling cooldown or header-cache deferral, retaining upstream failure backoff.
+- Build release assets with Go 1.26.11, including the standard-library security
+  fix required by the vulnerability scan.
+- Refresh the maintained 1Panel image integration to CPA v8.0.73. Native duplex
+  quota error frames now consult the existing alternative-credential replay
+  guard after response.created, instead of bypassing recovery and leaking 429.
+  Keep genuine pool exhaustion and request errors visible.
 
 ## 0.3.39 — 2026-11-03
 

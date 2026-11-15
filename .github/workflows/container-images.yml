@@ -8,6 +8,8 @@ on:
       - integration/images/**
       - integration/CLIProxyAPI-v8.0.57-continuity.patch
       - integration/continuity-host-patch-v8.0.57.json
+      - integration/CLIProxyAPI-v8.0.73-continuity.patch
+      - integration/continuity-host-patch-v8.0.73.json
       - integration/reset-credit-picker/keeper-v2.0.3.patch
   workflow_dispatch:
     inputs:
