@@ -19,8 +19,8 @@ def download(url):
 
 def main(image, output):
     output.mkdir(parents=True, exist_ok=True)
-    release = "https://github.com/simplez2/cpa-codex-quota-scheduler/releases/download/v0.3.39/"
-    archive = "codex-quota-scheduler_0.3.39_linux_amd64.zip"
+    release = "https://github.com/simplez2/cpa-codex-quota-scheduler/releases/download/v0.3.41/"
+    archive = "codex-quota-scheduler_0.3.41_linux_amd64.zip"
     manifest = json.loads(download(release + "release-verification.json"))
     asset = next(item for item in manifest["assets"] if item["name"] == archive)
     blob = download(release + archive)

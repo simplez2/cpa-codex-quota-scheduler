@@ -409,6 +409,13 @@ plugins:
                     expected = "not_reported" if a["key"] == UPSTREAM_KEYS[1] else "limited"
                     if snapshot.get("five_hour_limit_status") != expected:
                         return False
+                    # A retired startup generation can have observed the
+                    # fixture's refill while this runtime still holds the
+                    # earlier expired weekly row. Seed the request only after
+                    # the actual weekly-only credential is usable here.
+                    if a["key"] == UPSTREAM_KEYS[1] and (
+                            not snapshot.get("eligible") or snapshot.get("active_windows", 0) < 1):
+                        return False
                 if self.fixture.case == "retry429" and not snapshot.get("eligible"):
                     return False
             return status
