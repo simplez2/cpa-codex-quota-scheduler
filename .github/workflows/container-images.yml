@@ -56,6 +56,7 @@ jobs:
         id: source
         env:
           CPA_VERSION: ${{ inputs.cpa_version || 'latest' }}
+          GH_TOKEN: ${{ github.token }}
         run: python3 integration/images/prepare.py '${{ matrix.kind }}' '${{ runner.temp }}/source-${{ matrix.kind }}' --cpa-version "$CPA_VERSION"
 
       - uses: docker/setup-buildx-action@v3

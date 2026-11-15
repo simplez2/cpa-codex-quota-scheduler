@@ -17,9 +17,13 @@ def run(*args, cwd=None):
 
 
 def latest_cpa():
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": "cpa-1panel-images"}
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    if token:
+        headers["Authorization"] = "Bearer " + token
     request = urllib.request.Request(
         "https://api.github.com/repos/router-for-me/CLIProxyAPI/releases/latest",
-        headers={"Accept": "application/vnd.github+json", "User-Agent": "cpa-1panel-images"},
+        headers=headers,
     )
     with urllib.request.urlopen(request, timeout=30) as response:
         release = json.load(response)
