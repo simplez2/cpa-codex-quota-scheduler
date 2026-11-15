@@ -4,5 +4,5 @@
   "upstream_commit": "43806c865da7d47f9252316e95e315ad9f885b84",
   "go_version": "1.26.11",
   "patch_file": "CLIProxyAPI-v8.0.73-continuity.patch",
-  "patch_sha256": "0bc1aa0adb27dee69c0272e7c15fc44fa6e1a27f6eeceb5bbaf60d926aace208"
+  "patch_sha256": "cd6903e3a812508fa41ee7abf4f16096fdc901ea9a3d62a222762dabf9a0fc8c"
 }

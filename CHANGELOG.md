@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.41 — 2026-11-16
+
+- Restrict native duplex replay recovery to upstream quota/cooldown errors.
+  Keep client access-limit 429 events on the existing connection and preserve
+  per-turn authorization checks. The maintained CPA image must pass both quota
+  replay and client-authorization regression tests before publishing.
+
 ## 0.3.40 — 2026-11-16
 
 - Recover an individual credential's unstarted quota cycle from an obsolete

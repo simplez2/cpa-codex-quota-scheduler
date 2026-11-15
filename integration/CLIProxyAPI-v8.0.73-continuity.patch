@@ -306,10 +306,10 @@ index 0dd4aea..f87ca06 100644
  		return
 diff --git a/sdk/api/handlers/openai/openai_responses_quota_replay_test.go b/sdk/api/handlers/openai/openai_responses_quota_replay_test.go
 new file mode 100644
-index 0000000..1562a6b
+index 0000000..1f609eb
 --- /dev/null
 +++ b/sdk/api/handlers/openai/openai_responses_quota_replay_test.go
-@@ -0,0 +1,90 @@
+@@ -0,0 +1,91 @@
 +package openai
 +
 +import (
@@ -337,6 +337,7 @@ index 0000000..1562a6b
 +		{"quota_with_alternative", `{"type":"error","status":429,"error":{"type":"usage_limit_reached","message":"exhausted"}}`, true, true},
 +		{"quota_without_alternative", `{"type":"error","status":429,"error":{"type":"usage_limit_reached","message":"exhausted"}}`, true, false},
 +		{"request_error", `{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"invalid"}}`, false, false},
++		{"client_access_limit", `{"type":"error","status":429,"error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"client limit"}}`, false, false},
 +	} {
 +		t.Run(tc.name, func(t *testing.T) {
 +			done := make(chan error, 1)
@@ -469,7 +470,7 @@ index 125f204..29f212b 100644
  			// Plugin/alternate routes bypass auth selection. Keep canonical HTTP-mode
  			// state instead of inheriting the previous pinned websocket mode.
 diff --git a/sdk/api/handlers/openai/openai_responses_websocket_forward.go b/sdk/api/handlers/openai/openai_responses_websocket_forward.go
-index 8e5a60f..253f4ad 100644
+index 8e5a60f..5e10b3c 100644
 --- a/sdk/api/handlers/openai/openai_responses_websocket_forward.go
 +++ b/sdk/api/handlers/openai/openai_responses_websocket_forward.go
 @@ -247,6 +247,14 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
@@ -480,7 +481,7 @@ index 8e5a60f..253f4ad 100644
 +					frameErr := responsesWebsocketErrorMessageFromPayload(payloads[i])
 +					// A depleted credential cannot recover on this socket. Consult the
 +					// alternative-target replay guard even after response.created.
-+					if frameErr != nil && (responsesWebsocketErrorStatus(frameErr) == http.StatusTooManyRequests || isResponsesWebsocketQuotaOrCooldownError(frameErr.Error)) {
++					if frameErr != nil && isResponsesWebsocketQuotaOrCooldownError(frameErr.Error) {
 +						preserveErrorEvent = false
 +					}
 +				}
