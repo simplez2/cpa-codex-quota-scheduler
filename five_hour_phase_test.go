@@ -21,6 +21,10 @@ func TestPhaseCapabilityRequiresDelayedRequestAndDormantEvidence(t *testing.T) {
 			s := schedulerRuntimeState{cfg: defaultPluginConfig()}
 			reset := now.Add(-time.Hour)
 			first := phaseSnapshot("a", reset.Add(-time.Hour), reset, 15)
+			// Keep the same weekly cycle while the synthetic 5h observations
+			// cross UTC midnight; truncating each timestamp changes the fixture.
+			weeklyReset := now.Add(6 * 24 * time.Hour)
+			first.Windows[1].ResetAt = weeklyReset
 			s.observeFiveHourPhaseLocked(first, reset.Add(-time.Hour))
 			activation := reset.Add(40 * time.Minute)
 			if mode != "no_dormant_evidence" {
@@ -29,6 +33,7 @@ func TestPhaseCapabilityRequiresDelayedRequestAndDormantEvidence(t *testing.T) {
 					dormantAt = activation.Add(-10 * time.Minute)
 				}
 				dormant := phaseSnapshot("a", dormantAt, dormantAt.Add(5*time.Hour), 0)
+				dormant.Windows[1].ResetAt = weeklyReset
 				s.observeFiveHourPhaseLocked(dormant, activation)
 			}
 			s.noteFiveHourActivationLocked("a", "a", activation)
@@ -37,6 +42,7 @@ func TestPhaseCapabilityRequiresDelayedRequestAndDormantEvidence(t *testing.T) {
 				nextReset = reset.Add(5 * time.Hour)
 			}
 			next := phaseSnapshot("a", activation.Add(time.Minute), nextReset, 1)
+			next.Windows[1].ResetAt = weeklyReset
 			s.observeFiveHourPhaseLocked(next, activation.Add(time.Minute))
 			phase := s.fiveHourPhases["a"]
 			expected := mode

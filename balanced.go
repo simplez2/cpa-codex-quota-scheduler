@@ -170,6 +170,10 @@ func (s *schedulerRuntimeState) balancedPick(req pluginapi.SchedulerPickRequest,
 		if !choice.Eligible && choice.Reason != "serial_threshold" {
 			continue
 		}
+		if weeklyHandoffBlocked(choice, s.cfg, now) && !(s.cfg.SerialSoftContinuation && bound &&
+			candidate.ID == binding.AuthID && (binding.AuthIndex == "" || binding.AuthIndex == snapshot.AuthIndex)) {
+			continue
+		}
 		// A live conversation stays on an available account even if another
 		// plan or weekly budget scores better. Hard quota and CPA's filtered
 		// candidates remain authoritative; soft tiers only place new sessions.
@@ -202,6 +206,7 @@ func (s *schedulerRuntimeState) balancedPick(req pluginapi.SchedulerPickRequest,
 		account.prune(now)
 	}
 	selected := ""
+	adqRejected := false
 	reservation := adqReservation{}
 	remaining := choices
 	for len(remaining) > 0 {
@@ -230,6 +235,7 @@ func (s *schedulerRuntimeState) balancedPick(req pluginapi.SchedulerPickRequest,
 				s.balancedSessionHits++
 			}
 		} else if adqHandled {
+			adqRejected = true
 			// Complete telemetry with a hard gate/collision is an admission failure,
 			// not permission to bypass reservations through the legacy fallback.
 			remaining = rest
@@ -263,6 +269,9 @@ func (s *schedulerRuntimeState) balancedPick(req pluginapi.SchedulerPickRequest,
 		break
 	}
 	if selected == "" {
+		if adqRejected {
+			return pluginapi.SchedulerPickResponse{Handled: true, Reject: true, RejectCode: "quota_reservation_unavailable", RejectReason: "No Codex credential has enough unreserved quota for this request"}
+		}
 		return pluginapi.SchedulerPickResponse{}
 	}
 	account := s.balancedAccounts[selected]

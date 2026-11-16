@@ -139,6 +139,16 @@ func (s *schedulerRuntimeState) adqPolicyLocked() adqPolicy {
 	// The legacy panel reserve_5h_percent is a serial handoff setting. ADQ
 	// never silently converts it into a 5h quota reserve.
 	policy.FiveHourSafetyMargin = 0
+	if !s.cfg.SerialSoftContinuation {
+		mode, threshold := serialWindowHandoffPolicy(s.cfg, "weekly")
+		if mode != "429_only" {
+			reserve := 100 - threshold
+			if mode == "reserve_aware" {
+				reserve = max(reserve, s.cfg.ReserveWeeklyPercent)
+			}
+			policy.WeeklySafetyMargin = max(policy.WeeklySafetyMargin, reserve/100)
+		}
+	}
 	policy.SettlementTimeout = adqSettlementTTL(s.cfg.QuotaRefreshCooldown)
 	return policy
 }
@@ -363,6 +373,9 @@ func (s *schedulerRuntimeState) adqInputForChoiceLocked(choice serialCandidate, 
 	status := strings.ToLower(strings.TrimSpace(choice.Candidate.Status))
 	healthy := status == "" || status == "active" || status == "error"
 	if choice.Reason == "not_allowed" || choice.Reason == "limit_reached" {
+		healthy = false
+	}
+	if weeklyHandoffBlocked(choice, s.cfg, now) && !s.cfg.SerialSoftContinuation {
 		healthy = false
 	}
 	return adqAccountInput{

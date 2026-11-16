@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.42 — 2026-11-16
+
+- Enforce the configured weekly handoff across balanced last-resort selection,
+  serial recovery fallback, concurrency admission, and native scheduler fallback.
+  A weekly balance at the default 2% boundary cannot be spent merely because
+  every other eligible credential is exhausted. Explicit existing-session soft
+  continuation remains configurable; new sessions cannot inherit that exception.
+- Include configured weekly headroom in ADQ atomic reservations, reject a request
+  when every candidate lacks unreserved capacity, and align ADQ pool diagnostics
+  with the configured weekly gate. Five-hour zero-reserve behavior is unchanged.
+- Stabilize the phase-detection test's weekly anchor across UTC midnight.
+
 ## 0.3.41 — 2026-11-16
 
 - Restrict native duplex replay recovery to upstream quota/cooldown errors.

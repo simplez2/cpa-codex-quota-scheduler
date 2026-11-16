@@ -251,6 +251,11 @@ func TestBalancedWeeklyAllocationPoliciesApplyToADQAndFallback(t *testing.T) {
 				wantA := 210.0 // 40/1 : 80/7 = 7:2
 				if policy == "weekly_remaining" {
 					wantA = 90 // 40 : 80 = 1:2
+					if adq {
+						// Atomic admission protects the configured weekly handoff,
+						// so fair share uses spendable 38 : 78, not raw balances.
+						wantA = rounds * 38.0 / (38 + 78)
+					}
 				}
 				if got := s.balancedAccounts["a"].Picks; math.Abs(float64(got)-wantA) > 1 {
 					t.Fatalf("wrong distribution: a=%d b=%d want a=%.0f", got, s.balancedAccounts["b"].Picks, wantA)
@@ -305,7 +310,7 @@ func TestBalancedADQRejectionDoesNotMintCreditOrBypassReservations(t *testing.T)
 		s.quotas[id].Windows[0].UsedPercent = 99.9999
 	}
 	for i := 0; i < 5; i++ {
-		if pick := s.balancedPick(req, now.Add(time.Duration(i)*time.Millisecond)); pick.Handled {
+		if pick := s.balancedPick(req, now.Add(time.Duration(i)*time.Millisecond)); pick.AuthID != "" || !pick.Reject {
 			t.Fatalf("reservation failure used unreserved fallback: %+v", pick)
 		}
 	}

@@ -153,6 +153,20 @@ func serialWindowQuotaReason(window quotaWindow, cfg pluginConfig) string {
 	return "eligible"
 }
 
+// A configured weekly handoff is an admission boundary, including the balanced
+// last-resort tier. The separate reserve preference can still rank eligible
+// accounts without granting permission to cross this boundary.
+func weeklyHandoffBlocked(choice serialCandidate, cfg pluginConfig, now time.Time) bool {
+	for _, window := range choice.Snapshot.Windows {
+		if normalizeWindowClass(window.Class) == "weekly" &&
+			(window.ResetAt.IsZero() || window.ResetAt.After(now)) &&
+			serialWindowQuotaReason(window, cfg) == "serial_threshold" {
+			return true
+		}
+	}
+	return false
+}
+
 func inspectSerialCandidate(candidate pluginapi.SchedulerAuthCandidate, snapshot quotaSnapshot, found bool, cfg pluginConfig, now time.Time) serialCandidate {
 	choice := serialCandidate{
 		Candidate:   candidate,
@@ -544,7 +558,9 @@ func (s *schedulerRuntimeState) serialRequestLocalPickLocked(
 		if choice.Eligible {
 			choices = append(choices, choice)
 		} else if choice.Reason == "serial_threshold" {
-			thresholdChoices = append(thresholdChoices, choice)
+			if !weeklyHandoffBlocked(choice, cfg, now) {
+				thresholdChoices = append(thresholdChoices, choice)
+			}
 		}
 	}
 	if len(choices) == 0 {

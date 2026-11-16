@@ -422,6 +422,9 @@ func (s *schedulerRuntimeState) concurrencySchedulable(req pluginapi.SchedulerPi
 			snapshot, found := s.lookupQuotaLocked(candidate.ID, candidateAuthIndex(candidate))
 			snapshot = s.serialConservativeQuotaLocked(snapshot, now)
 			choice := inspectSerialCandidate(candidate, snapshot, found, cfg, now)
+			if weeklyHandoffBlocked(choice, cfg, now) && !cfg.SerialSoftContinuation {
+				continue
+			}
 			if !choice.Eligible && !(mode == "balanced" && choice.Reason == "serial_threshold") {
 				continue
 			}
