@@ -79,6 +79,28 @@ func weeklyOnlyCatchup(choice serialCandidate, cfg pluginConfig, now time.Time) 
 	return known && horizon <= cfg.WeeklyCatchupWindow
 }
 
+const balancedWeeklyHandbackGrace = 5 * time.Minute
+
+// Give a hot weekly fallback one short handback window after 5h becomes
+// selectable. New sessions, parent-only affinity, and old idle bindings do not
+// earn this grace. Only an accepted continuation starts the fixed deadline.
+func balancedWeeklyHandbackDeadline(binding balancedSessionBinding, choice serialCandidate, cfg pluginConfig, now time.Time) time.Time {
+	if !balancedResetWeighted(cfg) || binding.AuthID != choice.Candidate.ID || binding.AuthIndex == "" ||
+		binding.AuthIndex != choice.Snapshot.AuthIndex || now.Sub(binding.LastUsedAt) >= balancedWeeklyHandbackGrace ||
+		!choice.Eligible || !choice.WeeklyKnown || choice.WeeklyProtected || choice.FiveHourKnown ||
+		choice.WindowClass != "weekly" || !quotaSnapshotFresh(choice.Snapshot, now, cfg.StaleAfter) ||
+		poolFiveHourLimitStatus(quotaSnapshot{}, choice.Snapshot, now, cfg.StaleAfter) != "not_reported" {
+		return time.Time{}
+	}
+	if binding.WeeklyHandbackBy.IsZero() {
+		return now.Add(balancedWeeklyHandbackGrace)
+	}
+	if now.Before(binding.WeeklyHandbackBy) {
+		return binding.WeeklyHandbackBy
+	}
+	return time.Time{}
+}
+
 // Weights distribute estimated work for new sessions. Both reset boosts are
 // bounded at 2x, so a near reset improves priority without monopolizing the
 // entire eligible pool or replacing the observed remaining quota fraction.

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.45 — 2026-11-18
+
+- In reset-weighted balanced mode, give active weekly fallback conversations a
+  fixed five-minute grace period on their first deferred handback to usable 5h
+  credentials. Keep the existing catch-up share and new-session priority.
+  Deferral requires fresh weekly-only telemetry, a free slot, and an atomic
+  weekly reservation. Report deferrals in scheduler status.
+- Apply the affinity validated by the balanced selector during quota reservation,
+  without recreating a binding the selector dropped.
+
 ## 0.3.44 — 2026-11-18
 
 - Refresh confirmed weekly-only catch-up candidates on real routing or usage

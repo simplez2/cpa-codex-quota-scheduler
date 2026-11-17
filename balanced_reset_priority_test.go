@@ -151,3 +151,112 @@ func TestBalancedCatchupSessionAffinitySurvivesNewFiveHourCandidates(t *testing.
 		t.Fatalf("panel cannot validate catch-up settings: %v %v", changes, fields)
 	}
 }
+
+func warmWeeklyFallbackFixture(t *testing.T) (*schedulerRuntimeState, pluginapi.SchedulerPickRequest, time.Time) {
+	t.Helper()
+	s, req, now := weightedResetFixture(t, true)
+	s.cfg.StickySeconds = 14400
+	s.cfg.StaleAfter = 15 * time.Minute
+	s.cfg.ReserveWeeklyPercent = 2
+	q := s.quotas["weekly-backup"]
+	q.Windows[0].ResetAt = now.Add(72 * time.Hour)
+	s.quotas[q.AuthID], s.quotaNative[q.AuthID] = q, q
+	backupOnly := withBalancedSession(req, "weekly-fallback")
+	backupOnly.Candidates = backupOnly.Candidates[:1]
+	if got := s.balancedPick(backupOnly, now); got.AuthID != q.AuthID {
+		t.Fatalf("could not place fallback session: %+v", got)
+	}
+	return s, withBalancedSession(req, "weekly-fallback"), now
+}
+
+func TestBalancedWarmWeeklyHandbackDefersOnlyActiveFallbackAndDoesNotSlide(t *testing.T) {
+	resetBanStoreForTest()
+	defer resetBanStoreForTest()
+	s, req, now := warmWeeklyFallbackFixture(t)
+	firstReturn := now.Add(time.Minute)
+	key := schedulerSessionHash(req)
+
+	fresh := withBalancedSession(req, "new-conversation")
+	if got := s.balancedPick(fresh, firstReturn); got.AuthID == "" || got.AuthID == "weekly-backup" {
+		t.Fatalf("warm handback diverted a new conversation from 5h: %+v", got)
+	}
+	child := withBalancedSession(req, "child")
+	child.Options.Metadata["parent_session_id"] = "weekly-fallback"
+	if got := s.balancedPick(child, firstReturn); got.AuthID == "" || got.AuthID == "weekly-backup" {
+		t.Fatalf("a child inherited the backup's warm handback: %+v", got)
+	}
+	for _, offset := range []time.Duration{0, 3 * time.Minute, 4 * time.Minute} {
+		at := firstReturn.Add(offset)
+		if got := s.balancedPick(req, at); got.AuthID != "weekly-backup" {
+			t.Fatalf("warm continuation at %v was moved: %+v", offset, got)
+		}
+		decision := s.adqLastDecision
+		if decision.ReservationFiveHour != 0 || decision.ReservationWeekly <= 0 {
+			t.Fatalf("warm continuation did not go through weekly-only reservation: %+v", decision)
+		}
+		want := firstReturn.Add(balancedWeeklyHandbackGrace)
+		if deadline := s.balancedSessions[key].WeeklyHandbackBy; !deadline.Equal(want) {
+			t.Fatalf("continuation slid its handback deadline: got %v want %v", deadline, want)
+		}
+	}
+	if s.balancedWeeklyDeferrals != 3 {
+		t.Fatalf("deferral counter=%d", s.balancedWeeklyDeferrals)
+	}
+	if got := s.balancedPick(req, firstReturn.Add(balancedWeeklyHandbackGrace)); got.AuthID == "" || got.AuthID == "weekly-backup" {
+		t.Fatalf("backup continued after the deadline: %+v", got)
+	}
+	if binding := s.balancedSessions[key]; !binding.WeeklyHandbackBy.IsZero() || s.balancedSessionSwitches != 1 {
+		t.Fatalf("handback left an old deadline or rebound repeatedly: %+v", binding)
+	}
+}
+
+func TestBalancedWarmWeeklyHandbackNeverOverridesQuotaEvidence(t *testing.T) {
+	for _, why := range []string{"stale", "reserve", "unreservable", "idle", "busy", "index_replaced"} {
+		t.Run(why, func(t *testing.T) {
+			resetBanStoreForTest()
+			defer resetBanStoreForTest()
+			s, req, now := warmWeeklyFallbackFixture(t)
+			at := now.Add(time.Minute)
+			q := s.quotas["weekly-backup"]
+			switch why {
+			case "stale":
+				q.FiveHourLimitObservedAt = now.Add(-2 * s.cfg.StaleAfter)
+			case "reserve":
+				q.Windows[0].UsedPercent = 98
+			case "unreservable":
+				q.Windows[0].UsedPercent = 97.999
+			case "idle":
+				at = now.Add(balancedWeeklyHandbackGrace)
+			case "busy":
+				// The normal queue removes a busy weekly backup when other 5h
+				// options are available. Handback cannot reinstate that candidate.
+				if got := s.concurrencyPreferred(req, s.cfg, at); got != "" {
+					t.Fatalf("optional backup handback queued ahead of 5h: %q", got)
+				}
+				req.Candidates = req.Candidates[1:]
+			case "index_replaced":
+				q.AuthIndex = "new-index"
+			}
+			s.quotas[q.AuthID], s.quotaNative[q.AuthID] = q, q
+			got := s.balancedPick(req, at)
+			if got.AuthID == "" || got.AuthID == q.AuthID || s.balancedWeeklyDeferrals != 0 {
+				t.Fatalf("route bypassed %s: %+v, deferrals %d", why, got, s.balancedWeeklyDeferrals)
+			}
+		})
+	}
+}
+
+func TestBalancedADQDoesNotResurrectAffinityForReplacedCredential(t *testing.T) {
+	resetBanStoreForTest()
+	defer resetBanStoreForTest()
+	now := time.Now()
+	s, req := balancedFixture(now)
+	s.cfg.BalancedPriorityPolicy = "reset_weighted"
+	s.adqPolicy, s.adqReservations = defaultADQPolicy(), newADQReservationBook()
+	s.balancedAccounts = map[string]*balancedAccount{"b": {Credit: 1, LastSeen: now}}
+	req = withBalancedSession(req, "same-session")
+	s.bindBalancedSessionLocked(schedulerSessionHash(req), "a", "retired-index", now)
+	if got := s.balancedPick(req, now); got.AuthID != "b" {
+		t.Fatalf("ADQ restored the binding for a replaced credential: %+v", got)
+	}
+}

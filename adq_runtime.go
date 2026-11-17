@@ -468,7 +468,9 @@ func (s *schedulerRuntimeState) adqRouteChoicesWithAllocationLocked(req pluginap
 			session = schedulerSessionHash(req)
 		}
 		stickyID := strings.TrimSpace(stickyAuthID)
-		if stickyID == "" && session != "" {
+		// Balanced selection has already checked the binding's credential index
+		// and decided whether priority requires yielding. Do not restore it here.
+		if stickyID == "" && session != "" && !balanced {
 			if binding, ok := s.balancedSessions[session]; ok {
 				stickyID = strings.TrimSpace(binding.AuthID)
 			}

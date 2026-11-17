@@ -13,9 +13,10 @@ import (
 const balancedSessionLimit = 8192
 
 type balancedSessionBinding struct {
-	AuthID     string    `json:"auth_id"`
-	AuthIndex  string    `json:"auth_index,omitempty"`
-	LastUsedAt time.Time `json:"last_used_at"`
+	AuthID           string    `json:"auth_id"`
+	AuthIndex        string    `json:"auth_index,omitempty"`
+	LastUsedAt       time.Time `json:"last_used_at"`
+	WeeklyHandbackBy time.Time `json:"weekly_handback_by,omitzero"`
 }
 
 // Use CPA's reconciled identity first. It covers body-based conversations and
@@ -153,7 +154,11 @@ func (s *schedulerRuntimeState) bindBalancedSessionLocked(key, authID, authIndex
 	if valid && previous.AuthID != authID {
 		s.balancedSessionSwitches++
 	}
-	s.balancedSessions[key] = balancedSessionBinding{AuthID: authID, AuthIndex: authIndex, LastUsedAt: now}
+	if changed {
+		previous = balancedSessionBinding{AuthID: authID, AuthIndex: authIndex}
+	}
+	previous.LastUsedAt = now
+	s.balancedSessions[key] = previous
 	return changed
 }
 

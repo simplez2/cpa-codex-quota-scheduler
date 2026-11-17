@@ -5,14 +5,15 @@
 
 Standalone CPA plugin for balanced concurrent or serial Codex account selection, native quota polling,
 5h/weekly/monthly windows, persistent 429 quarantine and optional warmup.
-Source version: **0.3.44**. Published platform builds and checksums are available
+Source version: **0.3.45**. Published platform builds and checksums are available
 from [GitHub Releases](https://github.com/simplez2/cpa-codex-quota-scheduler/releases).
 See [CPA permissions and compatibility](CPA_PERMISSIONS.md) before installation.
 
 New sessions prefer usable 5h quota, then confirmed weekly-only backups. Within
 the same pool, an earlier confirmed reset has higher priority. Existing eligible
 sessions keep their credential affinity within the 5h pool. A weekly-only backup
-binding yields when higher-priority 5h quota becomes usable again. Local generation counts never invent
+binding yields when higher-priority 5h quota becomes usable again. Reset weighting
+gives active fallback conversations a short grace period before handback. Local generation counts never invent
 official reset credits or quota refills. See [the scheduling contract](README.zh-CN.md#调度规则).
 
 Every platform archive includes the MIT license, attribution, installation and
@@ -304,7 +305,12 @@ on requests and matched completions; a tracked in-flight generation does not
 expire as idle. Set it to 0 to disable affinity. Better relative quota, plan
 weights, or temporary budget rankings within the same quota pool never preempt
 an active conversation. A weekly-only fallback binding yields to usable 5h
-quota according to `window_order`. A
+quota according to `window_order`. With `reset_weighted`, an existing fallback
+conversation that was active within the last five minutes can stay on its
+confirmed eligible weekly credential for up to five minutes from its first
+deferred handback. Later turns do not extend this deadline. The continuation
+still needs a free slot and an atomic weekly reservation. New sessions keep the
+existing 5h priority and weekly catch-up share. A
 configured quota switch threshold, hard quota limit, quarantine/429, unavailable
 credential or incompatible model allows failover and rebind the conversation to its replacement. Explicit account
 pins remain isolated from ordinary conversation bindings. An already emitted

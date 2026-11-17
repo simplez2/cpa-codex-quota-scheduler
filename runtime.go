@@ -138,6 +138,7 @@ type schedulerRuntimeState struct {
 	balancedSessionPrunedAt time.Time
 	balancedSessionHits     uint64
 	balancedSessionSwitches uint64
+	balancedWeeklyDeferrals uint64
 	balancedUnkeyedRequests uint64
 
 	// ADQ-PBS state is kept separate from the legacy credit scheduler so a
@@ -227,6 +228,7 @@ func configureSchedulerRuntime(raw []byte) {
 	schedulerRuntime.balancedSessionPrunedAt = time.Time{}
 	schedulerRuntime.balancedSessionHits = 0
 	schedulerRuntime.balancedSessionSwitches = 0
+	schedulerRuntime.balancedWeeklyDeferrals = 0
 	schedulerRuntime.balancedUnkeyedRequests = 0
 	schedulerRuntime.adqPolicy = defaultADQPolicy()
 	schedulerRuntime.adqReservations = newADQReservationBook()
@@ -1720,6 +1722,7 @@ type runtimeStatus struct {
 	BalancedStickyBindings        int                              `json:"balanced_sticky_bindings"`
 	BalancedSessionHits           uint64                           `json:"balanced_session_hits"`
 	BalancedSessionSwitches       uint64                           `json:"balanced_session_switches"`
+	BalancedWeeklyDeferrals       uint64                           `json:"balanced_weekly_handoff_deferrals"`
 	BalancedUnkeyedRequests       uint64                           `json:"balanced_unkeyed_requests"`
 	StickySeconds                 int                              `json:"sticky_seconds"`
 	BalancedAccounts              map[string]balancedAccountStatus `json:"balanced_accounts,omitempty"`
@@ -2220,6 +2223,7 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 	}
 	balancedStickyCount := len(s.snapshotBalancedSessionsLocked(now))
 	balancedHits, balancedSwitches, balancedUnkeyed := s.balancedSessionHits, s.balancedSessionSwitches, s.balancedUnkeyedRequests
+	balancedWeeklyDeferrals := s.balancedWeeklyDeferrals
 	bindings := make(map[string]stickyBinding, len(s.stickyBindings))
 	for key, binding := range s.stickyBindings {
 		bindings[key] = binding
@@ -2714,6 +2718,7 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 		BalancedStickyBindings:        balancedStickyCount,
 		BalancedSessionHits:           balancedHits,
 		BalancedSessionSwitches:       balancedSwitches,
+		BalancedWeeklyDeferrals:       balancedWeeklyDeferrals,
 		BalancedUnkeyedRequests:       balancedUnkeyed,
 		StickySeconds:                 cfg.StickySeconds,
 		SessionSwitches:               sessionSwitches,

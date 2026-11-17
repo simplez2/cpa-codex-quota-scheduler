@@ -163,6 +163,7 @@ func (s *schedulerRuntimeState) balancedPick(req pluginapi.SchedulerPickRequest,
 	}
 	s.pruneBalancedSessionsLocked(now)
 	binding, bound := s.balancedSessionLocked(session, now)
+	directBinding := bound
 	if !bound && parent != "" {
 		binding, bound = s.balancedSessionLocked(parent, now)
 	}
@@ -219,11 +220,26 @@ func (s *schedulerRuntimeState) balancedPick(req pluginapi.SchedulerPickRequest,
 	selected := ""
 	adqRejected := false
 	reservation := adqReservation{}
+	var handbackDeadline time.Time
 	remaining := choices
 	for len(remaining) > 0 {
 		group, rest := nextQuotaPriorityGroup(remaining, s.cfg, now)
 		groupSticky := sticky
 		if groupSticky != nil && quotaAffinityMustYield(*groupSticky, group, s.cfg) {
+			if directBinding {
+				deadline := balancedWeeklyHandbackDeadline(binding, *groupSticky, s.cfg, now)
+				if !deadline.IsZero() {
+					// Admit this continuation on its own weekly reservation. Do not
+					// put a non-catch-up backup into the new-session allocation tier.
+					id, reserved, ok := s.adqRouteChoicesLocked(req, []serialCandidate{*groupSticky}, cost, now, session, groupSticky.Candidate.ID)
+					if ok {
+						selected, reservation, handbackDeadline = id, reserved, deadline
+						s.balancedSessionHits++
+						s.balancedWeeklyDeferrals++
+						break
+					}
+				}
+			}
 			groupSticky = nil
 		}
 		if groupSticky != nil {
@@ -311,6 +327,12 @@ func (s *schedulerRuntimeState) balancedPick(req pluginapi.SchedulerPickRequest,
 			}
 		}
 		bindingChanged = s.bindBalancedSessionLocked(session, selected, index, now)
+		if !handbackDeadline.IsZero() && s.balancedSessions[session].WeeklyHandbackBy.IsZero() {
+			current := s.balancedSessions[session]
+			current.WeeklyHandbackBy = handbackDeadline
+			s.balancedSessions[session] = current
+			bindingChanged = true
+		}
 	} else if pinned == "" {
 		s.balancedUnkeyedRequests++
 	}
