@@ -7,9 +7,8 @@ import (
 	"github.com/simplez2/cpa-codex-quota-scheduler/cpasdk/pluginapi"
 )
 
-// Quota priority is shared by all selectors. A weekly budget can distribute
-// equal-deadline work, but cannot spend a weekly-only backup ahead of usable 5h
-// quota or make an expiring window wait behind a later reset.
+// Strict ordering is retained for serial/legacy selectors. Balanced mode can
+// opt into bounded reset weights and limited weekly-only catch-up allocation.
 type quotaSelectionPriority struct {
 	Tier            int
 	Window          string
@@ -17,6 +16,8 @@ type quotaSelectionPriority struct {
 	DeadlineKind    int // confirmed reset, dormant placeholder, unknown reset
 	ResetAt         time.Time
 	WeeklyProtected bool
+	Weighted        bool
+	WeeklyCatchup   bool
 }
 
 func quotaPriorityFor(choice serialCandidate, cfg pluginConfig, now time.Time) quotaSelectionPriority {
@@ -42,11 +43,16 @@ func quotaPriorityFor(choice serialCandidate, cfg pluginConfig, now time.Time) q
 			p.DeadlineKind, p.ResetAt = 0, window.ResetAt
 		}
 	}
+	p.Weighted = balancedResetWeighted(cfg)
+	p.WeeklyCatchup = weeklyOnlyCatchup(choice, cfg, now)
+	if p.WeeklyCatchup {
+		p.WindowRank = windowRankInOrder("5h", cfg.WindowOrder)
+	}
 	return p
 }
 
 func compareQuotaPriority(a, b quotaSelectionPriority) int {
-	for _, pair := range [][2]int{{a.Tier, b.Tier}, {a.WindowRank, b.WindowRank}, {a.DeadlineKind, b.DeadlineKind}} {
+	for _, pair := range [][2]int{{a.Tier, b.Tier}, {a.WindowRank, b.WindowRank}} {
 		if pair[0] < pair[1] {
 			return -1
 		}
@@ -54,7 +60,19 @@ func compareQuotaPriority(a, b quotaSelectionPriority) int {
 			return 1
 		}
 	}
-	if !a.ResetAt.Equal(b.ResetAt) {
+	if a.Weighted != b.Weighted {
+		if !a.Weighted {
+			return -1
+		}
+		return 1
+	}
+	if !a.Weighted && a.DeadlineKind != b.DeadlineKind {
+		if a.DeadlineKind < b.DeadlineKind {
+			return -1
+		}
+		return 1
+	}
+	if !a.Weighted && !a.ResetAt.Equal(b.ResetAt) {
 		if a.ResetAt.Before(b.ResetAt) {
 			return -1
 		}
@@ -73,7 +91,7 @@ func compareQuotaPriority(a, b quotaSelectionPriority) int {
 // using a weekly-only backup must yield when usable, higher-priority 5h quota
 // returns. A plan name alone never establishes either quota class.
 func quotaAffinityMustYield(current serialCandidate, choices []serialCandidate, cfg pluginConfig) bool {
-	if !current.QuotaKnown || current.FiveHourKnown {
+	if !current.QuotaKnown || current.FiveHourKnown || (balancedResetWeighted(cfg) && current.Priority.WeeklyCatchup) {
 		return false
 	}
 	for _, choice := range choices {
@@ -144,6 +162,13 @@ func quotaPriorityStatus(choice serialCandidate, cfg pluginConfig, now time.Time
 		out.Reason = "quota_unknown"
 	case !choice.Eligible:
 		out.Reason = choice.Reason
+	case p.WeeklyCatchup:
+		out.Reason = "weekly_only_catchup"
+	case p.Weighted && p.Window == "5h":
+		out.Reason = "five_hour_weighted"
+		if horizon, known := weeklyResetHorizon(choice, cfg, now); known && horizon <= cfg.WeeklyCatchupWindow && serialBudgetEnabled(cfg) {
+			out.Reason = "five_hour_weekly_catchup"
+		}
 	case p.Window == "5h" && p.DeadlineKind == 0:
 		out.Reason = "five_hour_reset_first"
 	case p.Window == "5h" && p.DeadlineKind == 1:

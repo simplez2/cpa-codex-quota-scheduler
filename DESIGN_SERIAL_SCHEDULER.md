@@ -2,6 +2,18 @@
 
 ## Goal
 
+Balanced mode additionally supports `balanced_priority_policy: reset_weighted`.
+It shares estimated work across eligible 5h credentials using remaining quota,
+plan capacity and bounded reset urgency. Sustainable allocation increases weekly
+reset urgency gradually within `weekly_catchup_window` (48h), capped at 2x;
+5h deadline urgency is also capped at 2x. Confirmed weekly-only credentials may
+join this pool near weekly reset with a combined new-session target share of
+`weekly_only_catchup_share_percent` (15%). They remain full backups when no 5h
+candidate admits work. These are allocation weights, not guaranteed traffic
+percentages or permission to cross quota gates. Eligible catch-up conversations
+keep their binding. Strict deadline ordering remains the compatibility default
+and continues to apply to serial/legacy modes.
+
 Keep a committed primary for unkeyed requests and independent bindings for identified conversations. Spend usable 5h quota before weekly-only backups, and earlier confirmed reset deadlines before later ones. Weekly allocation weights apply within equal-priority groups. Preserve eligible conversations and in-flight streams, and bound switch/query overhead. The default allocation policy is `sustainable`; default 5h handoff is `429_only`. `weekly_remaining` retains raw-percentage tie-breaking within the same priority group.
 
 ## Persisted state

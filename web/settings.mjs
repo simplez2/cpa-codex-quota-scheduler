@@ -15,7 +15,10 @@ export function continuitySummary(status) {
   return action+(reason?' · '+reason:'');
 }
 export const fields = [
-  ['scheduler_mode','调度模式','allocation','select','新会话先用有5h额度的凭据，已启动且越早重置越优先；仅周限凭据作为后备。同一优先组内，串行选优先凭据，均衡并发按权重分配。已有会话保持绑定，达到设定阈值或凭据不可用时才换号。观察对比仅记录另一种算法的选择，实际仍走传统调度。', [['balanced','均衡并发（会话粘性）'],['serial','串行调配'],['legacy','传统调度'],['shadow','观察对比'],['enforce','动态节奏控制']]],
+	['balanced_priority_policy','均衡优先级策略','allocation','select','仅均衡模式生效。重置加权在可用 5h 账号之间分配预计消耗，周重置临近时适度加权；严格顺序保留原有按额度池和最早重置先用的规则。已有可用会话保持绑定。', [['strict_deadline','严格按重置顺序'],['reset_weighted','均衡分配与周重置补耗']]],
+	['weekly_catchup_window','周重置前补耗窗口','allocation','duration','重置加权模式生效。默认 48 小时，可设 1 至 168 小时；按确认的周重置时间计算，不使用令牌过期时间。5h 账号的周重置加权最高 2 倍。'],
+	['weekly_only_catchup_share_percent','周线号补耗目标份额','allocation','number','默认 15%，可设 0 至 40%。有可用 5h 额度时，所有临近周重置的周线号合计占新会话预计消耗的目标份额；0 关闭补耗。已有会话和实际请求消耗会影响最终流量占比。5h 额度不足时仍可完整兜底。',0,40,1],
+  ['scheduler_mode','调度模式','allocation','select','5h 账号为主力、仅周限账号为后备。均衡模式可选重置加权：在 5h 账号间均衡分配，周线号临近周重置时少量补耗；严格顺序和串行模式按额度池、重置先后选号。已有会话保持绑定，达到设定阈值或凭据不可用时才换号。观察对比仅记录另一种算法的选择，实际仍走传统调度。', [['balanced','均衡并发（会话粘性）'],['serial','串行调配'],['legacy','传统调度'],['shadow','观察对比'],['enforce','动态节奏控制']]],
   ['account_concurrency_enabled','限制每凭据并发','allocation','boolean','默认开启。真实请求、重试和预热共用每个 CPA 凭据的槽位；长请求保留槽位直到 CPA 确认结束。保存后立即生效。'],
   ['account_max_concurrency','每凭据最大并发','allocation','number','1 至 64，默认 2。不同 CPA 凭据独立计数，即使属于同一个账号；调低上限不会中断已开始的请求。',1,64,1],
   ['account_concurrency_wait','并发满时最长等待','allocation','duration','0 至 30 秒，默认 10 秒。两种模式的已绑定会话均等待原凭据；新会话可使用符合额度条件的空闲凭据。超时返回 503；不会突破上限。'],
@@ -23,7 +26,7 @@ export const fields = [
   ['continuity_pacing','5h 额度将尽时提前放缓','allocation','boolean','按已确认的 5h 余量与消耗速度推算，在用尽前分散请求。仅周限账号可用时继续执行。未知额度不会视为无限，手动排除统计不会解除账号限制。'],
   ['continuity_max_wait','额度恢复最长等待','allocation','duration','1 秒至 24 小时，默认 6 小时，包含放缓等待。客户端、反向代理的连接与总时长限制也必须允许该等待。'],
   ['continuity_poll_interval','等待期间重新检查间隔','allocation','duration','1 秒至 5 分钟，默认 30 秒。重新检查缓存与当前候选；额度查询仍遵守已有刷新、失败退避和 Retry-After。'],
-  ['serial_allocation_policy','周额度分配方式','allocation','select','串行和均衡并发均生效，但只在相同额度池及重置优先组内分配，不能让仅周限凭据抢占可用5h额度。日均预算按各凭据周余量 ÷ 距重置分钟数 × 1440 计算，显示单位为 % / 天；调度保持分钟精度，不足一分钟按一分钟计算；剩余比例只按周余量分配。已有会话保持绑定，排名变化只影响新会话或达到切换条件的会话。', [['sustainable','按距重置时间的日均预算'],['weekly_remaining','按周剩余比例']]],
+  ['serial_allocation_policy','周额度分配方式','allocation','select','串行和均衡并发均生效。严格顺序按日均预算或周余量在同组内分配；均衡重置加权按周余量分配预计消耗，日均预算选项额外给予临近周重置最高 2 倍的权重。诊断预算仍按周余量 ÷ 距重置分钟数计算。已有会话保持绑定，排名变化只影响新会话或达到切换条件的会话。', [['sustainable','按距重置时间的日均预算'],['weekly_remaining','按周剩余比例']]],
   ['quota_default_plan','无法识别时的默认套餐','allocation','select','优先自动识别 CPA 返回的套餐；只有标签缺失、未知或缓存过期时使用此默认值。倍率是容量参考。',plans],
   ['serial_budget_rebalance_percent','无会话请求的预算再平衡阈值','allocation','number','仅影响未携带会话标识的串行请求；已有会话不会因为预算排名变化而换号。0 关闭主动再平衡，其他值仍需两次独立额度确认。',0,100,1],
   ['serial_weekly_rebalance_min_hold','无会话请求再平衡前至少持有','allocation','duration','1 分钟至 24 小时。额度耗尽或 429 不受此等待限制。'],

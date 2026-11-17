@@ -1,5 +1,18 @@
 # CPA host quota failover
 
+CPA v8.0.76 uses `CLIProxyAPI-v8.0.76-continuity.patch` and its matching
+`continuity-host-patch-v8.0.76.json` manifest. The patch bridges the released
+scheduler's nested continuity RPC contract to the official hook, retains the
+configured legacy recovery budget, and routes nested WebSocket quota failures
+through the existing replay guard. The official flat continuity contract keeps
+its original bounds. Production credentials and scheduler settings stay intact.
+
+`images/model_catalog_overlay.py` merges verified Codex additions into fresh
+upstream catalogs. Upstream model entries take precedence; explicit
+`runtime_headers` compatibility overrides remain effective when an upstream
+entry arrives. This supports GPT-6.2 clients whose old `Version` header otherwise
+causes an upstream model-not-found response and a prolonged model cooldown.
+
 For CPA v8.0.57 and 1Panel `latest` image upgrades, see
 [the current integration](CONTINUITY-v8.0.57.md) and
 [the 1Panel instructions](images/README.zh-CN.md).

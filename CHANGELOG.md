@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.43 — 2026-11-18
+
+- Add opt-in balanced reset weighting: share work across usable 5h credentials
+  with bounded urgency as weekly reset approaches, rather than restricting all
+  allocation to the earliest 5h deadline. Credential expiry does not affect this.
+- Allow confirmed weekly-only credentials to participate at a limited combined
+  new-session target share in the final 48h before weekly reset (15% by default).
+  Preserve full backup use when 5h candidates cannot admit work, existing session
+  affinity, atomic reservations and configured weekly handoff boundaries.
+- Expose the policy, catch-up horizon and target share in the panel. Retain strict
+  deadline ordering as the compatibility default for existing configurations.
+
 ## 0.3.42 — 2026-11-16
 
 - Enforce the configured weekly handoff across balanced last-resort selection,

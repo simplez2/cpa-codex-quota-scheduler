@@ -1,4 +1,4 @@
-# Standalone CPA quota scheduler v0.3.42.
+# Standalone CPA quota scheduler v0.3.43.
 plugins:
   enabled: true
   configs:
@@ -21,6 +21,12 @@ plugins:
       # Set balanced for weighted distribution within the same pool/deadline group.
       # This can also be selected in the Codex 额度调度 panel without editing YAML.
       serial_allocation_policy: sustainable
+      # Opt into reset_weighted with scheduler_mode: balanced for fair sharing.
+      # Strict ordering remains the compatibility default.
+      balanced_priority_policy: strict_deadline
+      weekly_catchup_window: 48h
+      # Combined new-session target while usable 5h exists; not a traffic cap.
+      weekly_only_catchup_share_percent: 15
       # Relative improvement in weekly budget per day; two fresh observations and hold still apply.
       serial_budget_rebalance_percent: 20
       serial_soft_continuation: false

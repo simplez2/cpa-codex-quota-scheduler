@@ -36,7 +36,7 @@ def prepare(kind, destination, requested_cpa):
     if destination.exists():
         raise ValueError("Build destination already exists")
     if kind == "cpa":
-        manifest = json.loads((ROOT / "integration/continuity-host-patch-v8.0.73.json").read_text())
+        manifest = json.loads((ROOT / "integration/continuity-host-patch-v8.0.76.json").read_text())
         tag = latest_cpa() if requested_cpa == "latest" else requested_cpa
         repository = "https://github.com/router-for-me/CLIProxyAPI.git"
         patch = ROOT / "integration" / manifest["patch_file"]

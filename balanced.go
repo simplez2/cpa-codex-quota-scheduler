@@ -47,6 +47,9 @@ func balancedWeight(choice serialCandidate, cfg pluginConfig, now time.Time) flo
 }
 
 func balancedWeightWithQuota(choice serialCandidate, cfg pluginConfig, now time.Time, fiveRemaining, weeklyRemaining float64) float64 {
+	if balancedResetWeighted(cfg) {
+		return balancedResetWeight(choice, cfg, now, fiveRemaining, weeklyRemaining)
+	}
 	_, capacity, _ := resolvedQuotaPlan(cfg, choice.Candidate.ID, choice.Snapshot, now)
 	fiveFactor, weeklyFactor := 1.0, 1.0
 	if choice.FiveHourKnown {
@@ -80,6 +83,7 @@ func balancedWeightWithQuota(choice serialCandidate, cfg pluginConfig, now time.
 // commits these credits; collision retries cannot mint additional credit.
 func (s *schedulerRuntimeState) balancedADQAllocationLocked(choices []serialCandidate, inputs []adqAccountInput, cost float64, now time.Time, policy adqPolicy) (map[string]adqAllocationScore, map[string]float64) {
 	weights := make(map[string]float64, len(inputs))
+	weeklyOnly := make(map[string]bool)
 	total := 0.0
 	for i, input := range inputs {
 		metrics := adqAssessAccount(input, policy, now)
@@ -95,6 +99,12 @@ func (s *schedulerRuntimeState) balancedADQAllocationLocked(choices []serialCand
 		}
 		weight := balancedWeightWithQuota(choices[i], s.cfg, now, five, weekly)
 		weights[input.ID] = weight
+		if metrics.WeeklyOnly {
+			weeklyOnly[input.ID] = true
+		}
+	}
+	capBalancedCatchupWeights(weights, weeklyOnly, s.cfg)
+	for _, weight := range weights {
 		total += weight
 	}
 	scores := make(map[string]adqAllocationScore, len(weights))
@@ -244,8 +254,17 @@ func (s *schedulerRuntimeState) balancedPick(req pluginapi.SchedulerPickRequest,
 			}
 			continue
 		} else {
+			weights, weeklyOnly := map[string]float64{}, map[string]bool{}
+			for _, choice := range group {
+				weights[choice.Candidate.ID] = balancedWeight(choice, s.cfg, now)
+				if !choice.FiveHourKnown && choice.QuotaKnown {
+					weeklyOnly[choice.Candidate.ID] = true
+				}
+			}
+			capBalancedCatchupWeights(weights, weeklyOnly, s.cfg)
 			total := 0.0
 			for _, choice := range group {
+				s.balancedAccounts[choice.Candidate.ID].Weight = weights[choice.Candidate.ID]
 				total += s.balancedAccounts[choice.Candidate.ID].Weight
 			}
 			bestScore := math.Inf(-1)

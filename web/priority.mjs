@@ -2,6 +2,9 @@ export function quotaPriorityText(account) {
   const p = account?.selection_priority;
   if (!p) return '优先级待确认';
   const labels = {
+	  five_hour_weighted:'5h 主力 · 均衡分配',
+	  five_hour_weekly_catchup:'5h 主力 · 周重置临近加权',
+	  weekly_only_catchup:'仅周限 · 临近重置少量补耗',
     five_hour_reset_first:'5h 优先 · 临近重置先用',
     five_hour_dormant:'5h 后续 · 周期尚未启动',
     five_hour_reset_unknown:'5h 优先 · 重置时间待确认',

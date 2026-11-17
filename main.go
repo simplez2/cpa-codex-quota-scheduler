@@ -106,7 +106,7 @@ import (
 
 const (
 	pluginName    = "codex-quota-scheduler"
-	pluginVersion = "0.3.42"
+	pluginVersion = "0.3.43"
 
 	// providerCodex is the CPA provider key for OpenAI Codex (ChatGPT backend).
 	providerCodex = "codex"
@@ -680,6 +680,9 @@ func pluginRegistration() registration {
 				{Name: "serial_5h_switch_percent", Type: pluginapi.ConfigFieldTypeNumber, Description: "Custom 5h used-percent handoff threshold when serial_5h_handoff_mode is custom_threshold. Defaults to the global serial_switch_percent when omitted."},
 				{Name: "serial_prefer_active_cycle", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Prefer an already-started quota cycle when choosing the next serial auth."},
 				{Name: "serial_allocation_policy", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"sustainable", "weekly_remaining"}, Description: "Weekly allocation policy for both serial and balanced modes. sustainable uses remaining weekly quota divided by time until reset; weekly_remaining uses remaining weekly fraction. Balanced weights also include plan capacity and 5h headroom; existing session affinity remains authoritative."},
+				{Name: "balanced_priority_policy", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"strict_deadline", "reset_weighted"}, Description: "Balanced mode only: strict_deadline retains pool/deadline groups; reset_weighted shares work across usable 5h credentials with bounded reset urgency, allowing limited weekly-only catch-up near weekly reset. Existing session affinity and quota gates remain authoritative."},
+				{Name: "weekly_catchup_window", Type: pluginapi.ConfigFieldTypeString, Description: "Weekly reset catch-up horizon for reset_weighted mode, between 1h and 168h; default 48h. Only confirmed future weekly resets receive urgency."},
+				{Name: "weekly_only_catchup_share_percent", Type: pluginapi.ConfigFieldTypeNumber, Description: "Combined weekly-only target share of new-session allocation during catch-up while 5h quota is usable, between 0 and 40 percent; default 15. Zero disables catch-up. Full weekly-only fallback remains available when 5h quota cannot admit requests. Existing conversations and variable costs can change actual traffic share."},
 				{Name: "serial_budget_rebalance_percent", Type: pluginapi.ConfigFieldTypeNumber, Description: "Relative weekly budget advantage before proactive sustainable handoff (default 20 percent, 0 disables); requires independent evidence and minimum hold."},
 				{Name: "serial_soft_continuation", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Legacy session continuation past a soft threshold; defaults false so subsequent session requests follow the replacement."},
 				{Name: "quota_default_plan", Type: pluginapi.ConfigFieldTypeString, Description: "Fallback capacity prior when native plan detection is unavailable: team_standard (default), plus, pro_5x, pro_20x or team_premium. Explicit quota_account_plans overrides take precedence over detection. Priors are not guaranteed weekly limits."},

@@ -1,0 +1,632 @@
+diff --git a/internal/pluginhost/continuity_legacy_test.go b/internal/pluginhost/continuity_legacy_test.go
+new file mode 100644
+index 0000000..35a9629
+--- /dev/null
++++ b/internal/pluginhost/continuity_legacy_test.go
+@@ -0,0 +1,44 @@
++package pluginhost
++
++import (
++	"context"
++	"testing"
++
++	"github.com/MoeForge/moego/json"
++	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
++)
++
++type legacyContinuityCapture struct{ raw []byte }
++
++func (c *legacyContinuityCapture) Call(_ context.Context, _ string, raw []byte) ([]byte, error) {
++	c.raw = append([]byte(nil), raw...)
++	return []byte(`{"ok":true,"result":{"action":"wait","reason":"five_hour_exhausted","retry_after_ms":30000,"max_wait_ms":21600000}}`), nil
++}
++func (*legacyContinuityCapture) Shutdown() {}
++
++func TestLegacyContinuityRPCPreservesScopedIdentityAndWait(t *testing.T) {
++	client := &legacyContinuityCapture{}
++	adapter := &rpcPluginAdapter{client: client}
++	resp, err := adapter.Continuity(context.Background(), pluginapi.SchedulerContinuityRequest{
++		RequestID: "seed", Provider: "codex", Providers: []string{"codex"}, Model: "gpt-6.2-sol", Phase: "pre_output_429",
++		Options:    pluginapi.SchedulerOptions{Metadata: map[string]any{"request_lifecycle_id": "seed", "drop": make(chan struct{})}},
++		Candidates: []pluginapi.SchedulerContinuityCandidate{{ID: "credential", AuthIndex: "index", Provider: "codex"}},
++	})
++	if err != nil || !resp.Legacy || resp.Decision != pluginapi.SchedulerContinuityWait || resp.WaitBudgetMs != 21600000 || resp.PollIntervalMs != 30000 {
++		t.Fatalf("response=%+v err=%v", resp, err)
++	}
++	var wire struct {
++		Model    string                         `json:"model"`
++		Pick     pluginapi.SchedulerPickRequest `json:"pick"`
++		Previous bool                           `json:"previous_attempt_rejected_429"`
++	}
++	if err = json.Unmarshal(client.raw, &wire); err != nil {
++		t.Fatal(err)
++	}
++	if wire.Model != "gpt-6.2-sol" || wire.Pick.Model != wire.Model || !wire.Previous || len(wire.Pick.Candidates) != 1 || wire.Pick.Candidates[0].Metadata["auth_index"] != "index" {
++		t.Fatalf("wire=%s", client.raw)
++	}
++	if _, exists := wire.Pick.Options.Metadata["drop"]; exists {
++		t.Fatal("unsafe metadata reached the legacy envelope")
++	}
++}
+diff --git a/internal/pluginhost/host_test.go b/internal/pluginhost/host_test.go
+index 1844939..37d7dec 100644
+--- a/internal/pluginhost/host_test.go
++++ b/internal/pluginhost/host_test.go
+@@ -1633,8 +1633,6 @@ func TestHostApplyConfigWaitsForBlockedQuiesceBeforeCanceledRollbackAndReplay(t
+ 			events.add("old.quiesce.finish")
+ 			return marshalRPCResult(rpcEmptyResponse{})
+ 		case pluginabi.MethodPluginReconfigure:
+-			var reconfigureOnce sync.Once
+-			_ = reconfigureOnce
+ 			select {
+ 			case <-reconfigureStarted:
+ 			default:
+diff --git a/internal/pluginhost/rpc_client.go b/internal/pluginhost/rpc_client.go
+index a98dc97..0eed802 100644
+--- a/internal/pluginhost/rpc_client.go
++++ b/internal/pluginhost/rpc_client.go
+@@ -519,7 +519,26 @@ func (a *rpcPluginAdapter) Pick(ctx context.Context, req pluginapi.SchedulerPick
+ }
+ 
+ func (a *rpcPluginAdapter) Continuity(ctx context.Context, req pluginapi.SchedulerContinuityRequest) (pluginapi.SchedulerContinuityResponse, error) {
+-	return callPlugin[pluginapi.SchedulerContinuityResponse](ctx, a.client, pluginabi.MethodSchedulerContinuity, req)
++	// Keep the official flat contract and add the legacy nested pick envelope.
++	// Both shapes carry the same sanitized candidate and request identities.
++	req = sanitizePluginRequest(req).(pluginapi.SchedulerContinuityRequest)
++	pick := pluginapi.SchedulerPickRequest{
++		Plugin: req.Plugin, Provider: req.Provider, Providers: req.Providers,
++		Model: req.Model, Stream: req.Stream, Options: req.Options,
++	}
++	for _, candidate := range req.Candidates {
++		pick.Candidates = append(pick.Candidates, pluginapi.SchedulerAuthCandidate{
++			ID: candidate.ID, Provider: candidate.Provider, Priority: candidate.Priority,
++			Status: candidate.Status, Attributes: candidate.Attributes,
++			Metadata: map[string]any{"auth_index": candidate.AuthIndex},
++		})
++	}
++	wire := struct {
++		pluginapi.SchedulerContinuityRequest
++		Pick                       pluginapi.SchedulerPickRequest `json:"pick"`
++		PreviousAttemptRejected429 bool                           `json:"previous_attempt_rejected_429,omitempty"`
++	}{req, pick, req.Phase == "pre_output_429"}
++	return callPlugin[pluginapi.SchedulerContinuityResponse](ctx, a.client, pluginabi.MethodSchedulerContinuity, wire)
+ }
+ 
+ func (a *rpcPluginAdapter) RouteModel(ctx context.Context, req pluginapi.ModelRouteRequest) (pluginapi.ModelRouteResponse, error) {
+diff --git a/internal/pluginhost/scheduler.go b/internal/pluginhost/scheduler.go
+index c6e1595..962fbf4 100644
+--- a/internal/pluginhost/scheduler.go
++++ b/internal/pluginhost/scheduler.go
+@@ -50,6 +50,12 @@ func (h *Host) HasSchedulerContinuity() bool {
+ 	return h.schedulerContinuityRecord() != nil
+ }
+ 
++// RequiresPreAdmissionContinuity preserves pacing for the released quota scheduler.
++func (h *Host) RequiresPreAdmissionContinuity() bool {
++	record := h.schedulerContinuityRecord()
++	return record != nil && record.id == "codex-quota-scheduler"
++}
++
+ // EvaluateSchedulerContinuity invokes the active scheduler plugin's Continuity callback.
+ func (h *Host) EvaluateSchedulerContinuity(ctx context.Context, req pluginapi.SchedulerContinuityRequest) (pluginapi.SchedulerContinuityResponse, bool, error) {
+ 	record := h.schedulerContinuityRecord()
+diff --git a/sdk/api/handlers/openai/openai_responses_quota_replay_test.go b/sdk/api/handlers/openai/openai_responses_quota_replay_test.go
+new file mode 100644
+index 0000000..343eb4d
+--- /dev/null
++++ b/sdk/api/handlers/openai/openai_responses_quota_replay_test.go
+@@ -0,0 +1,99 @@
++package openai
++
++import (
++	"errors"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/gin-gonic/gin"
++	"github.com/gorilla/websocket"
++	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
++)
++
++// A native duplex quota frame must consult the same replay guard as an error
++// returned by the executor. response.created does not make quota recoverable on
++// the exhausted socket. The caller still decides whether an alternative exists.
++func TestForwardResponsesWebsocketDuplexQuotaConsultsReplayGuard(t *testing.T) {
++	gin.SetMode(gin.TestMode)
++	for _, tc := range []struct {
++		name, payload      string
++		quota, alternative bool
++	}{
++		{"quota_with_alternative", `{"type":"error","status":429,"error":{"type":"usage_limit_reached","message":"exhausted"}}`, true, true},
++		{"quota_without_alternative", `{"type":"error","status":429,"error":{"type":"usage_limit_reached","message":"exhausted"}}`, true, false},
++		{"cooldown_with_alternative", `{"type":"error","status":429,"error":{"code":"model_cooldown","message":"cooldown"}}`, true, true},
++		{"response_failed_with_alternative", `{"type":"response.failed","response":{"error":{"type":"usage_limit_reached","status_code":429,"message":"exhausted"}}}`, true, true},
++		{"response_failed_without_alternative", `{"type":"response.failed","response":{"error":{"type":"usage_limit_reached","status_code":429,"message":"exhausted"}}}`, true, false},
++		{"response_failed_nested_status", `{"type":"response.failed","response":{"error":{"type":"usage_limit_reached","status":429,"message":"exhausted"}}}`, true, true},
++		{"response_failed_request_error", `{"type":"response.failed","response":{"error":{"type":"invalid_request_error","status_code":400,"message":"invalid"}}}`, false, false},
++		{"request_error", `{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"invalid"}}`, false, false},
++		{"client_access_limit", `{"type":"error","status":429,"error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"client limit"}}`, false, false},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			done := make(chan error, 1)
++			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				conn, err := responsesWebsocketUpgrader.Upgrade(w, r, nil)
++				if err != nil {
++					done <- err
++					return
++				}
++				defer conn.Close()
++				c, _ := gin.CreateTestContext(httptest.NewRecorder())
++				c.Request = r
++				data := make(chan []byte, 2)
++				data <- []byte(`{"type":"response.created","response":{"id":"r-quota"}}`)
++				data <- []byte(tc.payload)
++				close(data)
++				errs := make(chan *interfaces.ErrorMessage)
++				close(errs)
++				consulted := false
++				_, _, _, errMsg, errForward := (*OpenAIResponsesAPIHandler)(nil).forwardResponsesWebsocket(c,
++					newResponsesWebsocketWriter(conn), func(...interface{}) {}, data, errs, newInMemoryWebsocketTimelineLog(), "quota-test",
++					responsesWebsocketForwardOptions{duplexStream: func() bool { return true }, suppressError: func(msg *interfaces.ErrorMessage) bool {
++						consulted = true
++						if responsesWebsocketErrorStatus(msg) != http.StatusTooManyRequests {
++							return false
++						}
++						return tc.alternative
++					}})
++				if consulted != tc.quota {
++					done <- errors.New("native quota frame bypassed replay guard or request error invoked it")
++					return
++				}
++				if tc.quota && errMsg == nil {
++					done <- errors.New("quota frame lost terminal error")
++					return
++				}
++				if tc.alternative && errForward != nil {
++					done <- errForward
++					return
++				}
++				done <- nil
++			}))
++			defer server.Close()
++			conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http"), nil)
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer conn.Close()
++			conn.SetReadDeadline(time.Now().Add(3 * time.Second))
++			_, _, err = conn.ReadMessage()
++			if err != nil {
++				t.Fatal(err)
++			}
++			_, frame, secondErr := conn.ReadMessage()
++			if tc.alternative && secondErr == nil {
++				t.Fatalf("quota leaked despite alternative: %s", frame)
++			}
++			if !tc.alternative && secondErr != nil {
++				t.Fatalf("terminal/request error was hidden: %v", secondErr)
++			}
++			if err = <-done; err != nil {
++				t.Fatal(err)
++			}
++		})
++	}
++}
+diff --git a/sdk/api/handlers/openai/openai_responses_websocket_forward.go b/sdk/api/handlers/openai/openai_responses_websocket_forward.go
+index fc43e8e..1a68724 100644
+--- a/sdk/api/handlers/openai/openai_responses_websocket_forward.go
++++ b/sdk/api/handlers/openai/openai_responses_websocket_forward.go
+@@ -259,8 +259,10 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
+ 				// StreamChunk.Err still arrives through errs and closes the socket.
+ 				// Known credential quota/cooldown errors are not recoverable on the
+ 				// same socket and must still consult the replay guard.
+-				if eventType == wsEventTypeError {
+-					errMsg := responsesWebsocketErrorMessageFromPayload(payloads[i])
++				frameErr := responsesWebsocketErrorMessageFromPayload(payloads[i])
++				failedQuota := eventType == "response.failed" && isResponsesWebsocketQuotaOrCooldownError(frameErr.Error)
++				if eventType == wsEventTypeError || failedQuota {
++					errMsg := frameErr
+ 					preserveErrorEvent := responseStarted && opts.duplexStream != nil && opts.duplexStream() &&
+ 						(errMsg == nil || !isResponsesWebsocketQuotaOrCooldownError(errMsg.Error))
+ 					if preserveErrorEvent {
+diff --git a/sdk/api/handlers/openai/openai_responses_websocket_timeline.go b/sdk/api/handlers/openai/openai_responses_websocket_timeline.go
+index ef2fc84..3880243 100644
+--- a/sdk/api/handlers/openai/openai_responses_websocket_timeline.go
++++ b/sdk/api/handlers/openai/openai_responses_websocket_timeline.go
+@@ -259,6 +259,14 @@ func responsesWebsocketErrorMessageFromPayload(payload []byte) *interfaces.Error
+ 	if status <= 0 {
+ 		status = int(ojson.GetBytesNoCopy(payload, "status_code").Int())
+ 	}
++	if status <= 0 {
++		for _, path := range []string{"error.status", "error.status_code", "response.error.status", "response.error.status_code"} {
++			if nested := int(ojson.GetBytesNoCopy(payload, path).Int()); nested > 0 {
++				status = nested
++				break
++			}
++		}
++	}
+ 	if status <= 0 {
+ 		status = http.StatusInternalServerError
+ 	}
+diff --git a/sdk/cliproxy/auth/conductor_continuity.go b/sdk/cliproxy/auth/conductor_continuity.go
+index df5f9cf..5d88342 100644
+--- a/sdk/cliproxy/auth/conductor_continuity.go
++++ b/sdk/cliproxy/auth/conductor_continuity.go
+@@ -164,6 +164,7 @@ const (
+ type continuitySessionContextKey struct{}
+ 
+ type continuitySession struct {
++	legacy                bool
+ 	requestIDMu           sync.Mutex
+ 	requestID             string
+ 	traceID               string
+@@ -361,6 +362,25 @@ func (m *Manager) canRunCodexContinuity(ctx context.Context, providers []string)
+ 	return continuity, true
+ }
+ 
++func (m *Manager) runLegacyPreAdmissionContinuity(ctx context.Context, session *continuitySession, providers []string, model string, opts cliproxyexecutor.Options, defaultRequestRetry int) error {
++	continuity, enabled := m.canRunCodexContinuity(ctx, providers)
++	if !enabled || session.priorAttemptSeen {
++		return nil
++	}
++	preAdmission, ok := continuity.(interface{ RequiresPreAdmissionContinuity() bool })
++	if !ok || !preAdmission.RequiresPreAdmissionContinuity() {
++		return nil
++	}
++	_, err := m.runCodexContinuityGate(ctx, session, "pre_admission", providers, model, opts, 0, false, defaultRequestRetry)
++	if err != nil {
++		return err
++	}
++	if session.budgetExhausted {
++		return markContinuityTerminatedError(&Error{Code: "scheduler_continuity_timeout", Message: "scheduler continuity wait expired", HTTPStatus: http.StatusServiceUnavailable})
++	}
++	return nil
++}
++
+ func providersIncludeCodex(providers []string) bool {
+ 	for _, provider := range providers {
+ 		if canonicalSchedulingProvider(provider) == "codex" {
+@@ -528,7 +548,7 @@ func (m *Manager) runCodexContinuityGate(
+ 			return continuityOutcomeDisabled, nil
+ 		}
+ 
+-		candidates := m.buildCodexContinuityCandidates(ctx, providers, model, opts, retryRound, applyRetryRoundExclusions, defaultRequestRetry, now)
++		candidates := m.buildCodexContinuityCandidates(ctx, providers, model, opts, retryRound, applyRetryRoundExclusions && !session.legacy, defaultRequestRetry, now)
+ 		if len(candidates) == 0 {
+ 			if pollAttempt > 0 || phase == "pre_output_429" {
+ 				session.terminated = true
+@@ -567,6 +587,9 @@ func (m *Manager) runCodexContinuityGate(
+ 			session.terminated = true
+ 			return continuityOutcomeDisabled, nil
+ 		}
++		if resp.Legacy {
++			session.legacy = true
++		}
+ 		now = clock.Now()
+ 		if !session.deadline.IsZero() && !now.Before(session.deadline) {
+ 			session.budgetExhausted = true
+@@ -586,11 +609,11 @@ func (m *Manager) runCodexContinuityGate(
+ 					session.terminated = true
+ 					return continuityOutcomeDisabled, nil
+ 				}
+-				budget := clampContinuityWaitBudget(resp.WaitBudgetMs)
++				budget := continuityResponseWaitBudget(resp)
+ 				session.startedAt = now
+ 				session.deadline = session.startedAt.Add(budget)
+ 			} else if resp.WaitBudgetMs > 0 {
+-				proposed := session.startedAt.Add(clampContinuityWaitBudget(resp.WaitBudgetMs))
++				proposed := session.startedAt.Add(continuityResponseWaitBudget(resp))
+ 				if proposed.Before(session.deadline) {
+ 					session.deadline = proposed
+ 				}
+@@ -601,7 +624,7 @@ func (m *Manager) runCodexContinuityGate(
+ 				session.terminated = true
+ 				return continuityOutcomeDisabled, nil
+ 			}
+-			pollInterval := clampContinuityPollInterval(resp.PollIntervalMs)
++			pollInterval := continuityResponsePollInterval(resp)
+ 			if pollInterval > remaining {
+ 				pollInterval = remaining
+ 			}
+@@ -614,7 +637,9 @@ func (m *Manager) runCodexContinuityGate(
+ 			}
+ 			session.waitedLastGate = true
+ 		default:
+-			session.terminated = true
++			if !resp.Legacy {
++				session.terminated = true
++			}
+ 			return continuityOutcomeDisabled, nil
+ 		}
+ 	}
+@@ -645,6 +670,36 @@ func clampContinuityWaitBudget(ms int64) time.Duration {
+ 	return d
+ }
+ 
++func continuityResponseWaitBudget(resp pluginapi.SchedulerContinuityResponse) time.Duration {
++	if !resp.Legacy {
++		return clampContinuityWaitBudget(resp.WaitBudgetMs)
++	}
++	// Legacy deployments expose a configurable 1s-24h recovery budget. Keep
++	// the same request-wide deadline instead of silently shortening it to 120s.
++	ms := resp.WaitBudgetMs
++	if ms < 1000 {
++		ms = 1000
++	}
++	if ms > int64((24*time.Hour)/time.Millisecond) {
++		ms = int64((24 * time.Hour) / time.Millisecond)
++	}
++	return time.Duration(ms) * time.Millisecond
++}
++
++func continuityResponsePollInterval(resp pluginapi.SchedulerContinuityResponse) time.Duration {
++	if !resp.Legacy {
++		return clampContinuityPollInterval(resp.PollIntervalMs)
++	}
++	ms := resp.PollIntervalMs
++	if ms < 1000 {
++		ms = 1000
++	}
++	if ms > int64((5*time.Minute)/time.Millisecond) {
++		ms = int64((5 * time.Minute) / time.Millisecond)
++	}
++	return time.Duration(ms) * time.Millisecond
++}
++
+ func (m *Manager) buildCodexContinuityCandidates(
+ 	ctx context.Context,
+ 	providers []string,
+@@ -725,6 +780,7 @@ func (m *Manager) buildCodexContinuityCandidates(
+ 		}
+ 		item := pluginapi.SchedulerContinuityCandidate{
+ 			ID:         candidate.ID,
++			AuthIndex:  candidate.Index,
+ 			Provider:   "codex",
+ 			Priority:   authPriority(candidate),
+ 			Status:     string(candidate.Status),
+diff --git a/sdk/cliproxy/auth/conductor_continuity_legacy_test.go b/sdk/cliproxy/auth/conductor_continuity_legacy_test.go
+new file mode 100644
+index 0000000..2bab8a7
+--- /dev/null
++++ b/sdk/cliproxy/auth/conductor_continuity_legacy_test.go
+@@ -0,0 +1,106 @@
++package auth
++
++import (
++	"context"
++	"net/http"
++	"testing"
++	"time"
++
++	"github.com/MoeForge/moego/json"
++	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
++	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
++	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
++)
++
++type legacyPreAdmissionScheduler struct{ testContinuityScheduler }
++
++func (*legacyPreAdmissionScheduler) RequiresPreAdmissionContinuity() bool { return true }
++
++func TestLegacyContinuityPrecedesHealthyDispatchAndRecoversWithZeroNativeRetries(t *testing.T) {
++	for _, stream := range []bool{false, true} {
++		t.Run(map[bool]string{false: "execute", true: "stream"}[stream], func(t *testing.T) {
++			manager := NewManager(nil, nil, nil)
++			manager.SetRetryConfig(0, 0, 0)
++			id, model := "legacy-compat-auth", "legacy-compat-model"
++			if _, err := manager.Register(context.Background(), &Auth{ID: id, Provider: "codex", Status: StatusActive}); err != nil {
++				t.Fatal(err)
++			}
++			registry.GetGlobalRegistry().RegisterClient(id, "codex", []*registry.ModelInfo{{ID: model}})
++			t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(id) })
++			calls, preAdmission, recovery := 0, 0, 0
++			attempt := func() error {
++				calls++
++				if calls == 1 {
++					return codexQuotaRejectionErr{status: http.StatusTooManyRequests, msg: `{"error":{"type":"usage_limit_reached"}}`, credentialScoped: true}
++				}
++				return nil
++			}
++			manager.RegisterExecutor(&continuityTestExecutor{
++				provider: "codex",
++				execFn: func(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
++					return cliproxyexecutor.Response{Payload: []byte(`{"ok":true}`)}, attempt()
++				},
++				streamFn: func(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
++					if err := attempt(); err != nil {
++						return nil, err
++					}
++					chunks := make(chan cliproxyexecutor.StreamChunk, 1)
++					chunks <- cliproxyexecutor.StreamChunk{Payload: []byte(`{"type":"response.completed"}`)}
++					close(chunks)
++					return &cliproxyexecutor.StreamResult{Chunks: chunks}, nil
++				},
++			})
++			manager.SetPluginScheduler(&legacyPreAdmissionScheduler{testContinuityScheduler{
++				hasContinuity: true,
++				continuityFunc: func(ctx context.Context, req pluginapi.SchedulerContinuityRequest) (pluginapi.SchedulerContinuityResponse, bool, error) {
++					if req.Phase == "pre_admission" {
++						preAdmission++
++						if calls != 0 {
++							t.Fatal("pre-admission followed dispatch")
++						}
++					} else {
++						recovery++
++						if _, _, err := manager.ResetQuota(ctx, id); err != nil {
++							t.Fatal(err)
++						}
++					}
++					return pluginapi.SchedulerContinuityResponse{Legacy: true, Decision: pluginapi.SchedulerContinuityReady}, true, nil
++				},
++			}})
++			request := cliproxyexecutor.Request{Model: model}
++			if stream {
++				result, err := manager.ExecuteStream(context.Background(), []string{"codex"}, request, cliproxyexecutor.Options{})
++				if err != nil {
++					t.Fatal(err)
++				}
++				for chunk := range result.Chunks {
++					if chunk.Err != nil {
++						t.Fatal(chunk.Err)
++					}
++				}
++			} else if _, err := manager.Execute(context.Background(), []string{"codex"}, request, cliproxyexecutor.Options{}); err != nil {
++				t.Fatal(err)
++			}
++			if calls != 2 || preAdmission != 1 || recovery != 1 {
++				t.Fatalf("dispatches=%d pre-admission=%d recovery=%d", calls, preAdmission, recovery)
++			}
++		})
++	}
++}
++
++func TestLegacyContinuityWireRetainsLongRecoveryBudget(t *testing.T) {
++	var legacy pluginapi.SchedulerContinuityResponse
++	if err := json.Unmarshal([]byte(`{"action":"wait","retry_after_ms":30000,"max_wait_ms":21600000}`), &legacy); err != nil {
++		t.Fatal(err)
++	}
++	if continuityResponseWaitBudget(legacy) != 6*time.Hour || continuityResponsePollInterval(legacy) != 30*time.Second {
++		t.Fatalf("legacy recovery was shortened: %+v", legacy)
++	}
++	var official pluginapi.SchedulerContinuityResponse
++	if err := json.Unmarshal([]byte(`{"decision":"wait","poll_interval_ms":30000,"wait_budget_ms":21600000}`), &official); err != nil {
++		t.Fatal(err)
++	}
++	if official.Legacy || continuityResponseWaitBudget(official) != maxContinuityWaitBudget || continuityResponsePollInterval(official) != maxContinuityPollInterval {
++		t.Fatalf("official bounds changed: %+v", official)
++	}
++}
+diff --git a/sdk/cliproxy/auth/conductor_execution.go b/sdk/cliproxy/auth/conductor_execution.go
+index 96bad50..c54c133 100644
+--- a/sdk/cliproxy/auth/conductor_execution.go
++++ b/sdk/cliproxy/auth/conductor_execution.go
+@@ -290,6 +290,9 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
+ 		}
+ 		return cliproxyexecutor.Response{}, markContinuityTerminatedError(termErr)
+ 	}
++	if errContinuity := m.runLegacyPreAdmissionContinuity(ctx, continuitySession, normalized, retryModel, opts, defaultRequestRetry); errContinuity != nil {
++		return cliproxyexecutor.Response{}, errContinuity
++	}
+ 	for attempt := 0; ; attempt++ {
+ 		if m.continuityDeadlineExceeded(continuitySession) {
+ 			continuitySession.budgetExhausted = true
+@@ -347,7 +350,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
+ 			pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
+ 			if _, okContinuity := m.canRunCodexContinuity(ctx, normalized); okContinuity &&
+ 				isPositiveQuotaRejectionError(errExec) {
+-				if !m.retryAllowedForRequest(ctx, attempt, normalized, retryModel, eligibility, pinnedAuthID, defaultRequestRetry, opts.Headers) {
++				if !continuitySession.legacy && !m.retryAllowedForRequest(ctx, attempt, normalized, retryModel, eligibility, pinnedAuthID, defaultRequestRetry, opts.Headers) {
+ 					continuitySession.terminated = true
+ 					break
+ 				}
+@@ -357,6 +360,9 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
+ 				}
+ 				if outcome == continuityOutcomeReady {
+ 					continuitySession.immediateReadyRetries = 0
++					if continuitySession.legacy {
++						attempt = -1
++					}
+ 					continue
+ 				}
+ 				break
+@@ -535,6 +541,9 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
+ 		}
+ 		return nil, termErr
+ 	}
++	if errContinuity := m.runLegacyPreAdmissionContinuity(ctx, continuitySession, normalized, retryModel, opts, defaultRequestRetry); errContinuity != nil {
++		return nil, errContinuity
++	}
+ 	_, shareStreamAttempts := m.canRunCodexContinuity(ctx, normalized)
+ 	attempt := 0
+ 	if shareStreamAttempts {
+@@ -619,7 +628,7 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
+ 			pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
+ 			if _, okContinuity := m.canRunCodexContinuity(ctx, normalized); okContinuity &&
+ 				isPositiveQuotaRejectionError(errStream) {
+-				if !m.retryAllowedForRequest(ctx, attempt, normalized, retryModel, eligibility, pinnedAuthID, defaultRequestRetry, opts.Headers) {
++				if !continuitySession.legacy && !m.retryAllowedForRequest(ctx, attempt, normalized, retryModel, eligibility, pinnedAuthID, defaultRequestRetry, opts.Headers) {
+ 					continuitySession.terminated = true
+ 					break
+ 				}
+@@ -629,8 +638,12 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
+ 				}
+ 				if outcome == continuityOutcomeReady {
+ 					continuitySession.immediateReadyRetries = 0
+-					attempt++
+-					continuitySession.codexAttemptsUsed++
++					if continuitySession.legacy {
++						attempt = 0
++					} else {
++						attempt++
++						continuitySession.codexAttemptsUsed++
++					}
+ 					continue
+ 				}
+ 				break
+diff --git a/sdk/pluginapi/types.go b/sdk/pluginapi/types.go
+index c03bb1f..1bb0f13 100644
+--- a/sdk/pluginapi/types.go
++++ b/sdk/pluginapi/types.go
+@@ -6,6 +6,7 @@ import (
+ 	"fmt"
+ 	"net/http"
+ 	"net/url"
++	"strings"
+ 	"time"
+ 
+ 	"github.com/MoeForge/moego/json"
+@@ -763,6 +764,8 @@ type SchedulerContinuity interface {
+ type SchedulerContinuityCandidate struct {
+ 	// ID identifies the auth record.
+ 	ID string `json:"id"`
++	// AuthIndex preserves the credential-scoped identity for legacy continuity plugins.
++	AuthIndex string `json:"auth_index,omitempty"`
+ 	// Provider identifies the auth provider.
+ 	Provider string `json:"provider"`
+ 	// Priority is the host priority assigned to the auth record.
+@@ -816,6 +819,8 @@ type SchedulerContinuityRequest struct {
+ 
+ // SchedulerContinuityResponse returns a continuity decision from a scheduler plugin.
+ type SchedulerContinuityResponse struct {
++	// Legacy identifies the older action/max_wait_ms wire contract inside the host.
++	Legacy bool `json:"-"`
+ 	// Decision selects "ready", "wait", or "disabled". Empty defaults to "disabled".
+ 	Decision SchedulerContinuityDecision `json:"decision,omitempty"`
+ 	// PollIntervalMs specifies the bounded poll interval in milliseconds when Decision is "wait".
+@@ -830,6 +835,9 @@ type SchedulerContinuityResponse struct {
+ // UnmarshalJSON supports both Go struct field names and snake_case field names.
+ func (r *SchedulerContinuityResponse) UnmarshalJSON(data []byte) error {
+ 	type rawResponse struct {
++		Action            *string `json:"action"`
++		RetryAfterMS      *int64  `json:"retry_after_ms"`
++		MaxWaitMS         *int64  `json:"max_wait_ms"`
+ 		Decision          *string `json:"Decision"`
+ 		AltDecision       *string `json:"decision"`
+ 		PollIntervalMs    *int64  `json:"PollIntervalMs"`
+@@ -863,6 +871,23 @@ func (r *SchedulerContinuityResponse) UnmarshalJSON(data []byte) error {
+ 	} else if raw.AltReason != nil {
+ 		r.Reason = *raw.AltReason
+ 	}
++	if raw.Decision == nil && raw.AltDecision == nil && raw.Action != nil {
++		r.Legacy = true
++		switch strings.ToLower(strings.TrimSpace(*raw.Action)) {
++		case "ready":
++			r.Decision = SchedulerContinuityReady
++		case "wait":
++			r.Decision = SchedulerContinuityWait
++		default:
++			r.Decision = SchedulerContinuityDisabled
++		}
++		if raw.RetryAfterMS != nil {
++			r.PollIntervalMs = *raw.RetryAfterMS
++		}
++		if raw.MaxWaitMS != nil {
++			r.WaitBudgetMs = *raw.MaxWaitMS
++		}
++	}
+ 	return nil
+ }
+ 

@@ -1751,6 +1751,9 @@ type runtimeStatus struct {
 	SerialWeeklyRebalanceRequired int                              `json:"serial_weekly_rebalance_required_confirmations"`
 	SerialWeeklyRebalance         serialWeeklyRebalanceState       `json:"serial_weekly_rebalance"`
 	SerialAllocationPolicy        string                           `json:"serial_allocation_policy"`
+	BalancedPriorityPolicy        string                           `json:"balanced_priority_policy"`
+	WeeklyCatchupWindow           string                           `json:"weekly_catchup_window"`
+	WeeklyOnlyCatchupSharePercent float64                          `json:"weekly_only_catchup_share_percent"`
 	SerialBudgetRebalancePercent  float64                          `json:"serial_budget_rebalance_percent"`
 	SerialSoftContinuation        bool                             `json:"serial_soft_continuation"`
 	QuotaDefaultPlan              string                           `json:"quota_default_plan"`
@@ -2676,6 +2679,9 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 		SerialWeeklyRebalanceRequired: serialWeeklyRebalanceConfirmations,
 		SerialWeeklyRebalance:         serialWeeklyRebalance,
 		SerialAllocationPolicy:        cfg.SerialAllocationPolicy,
+		BalancedPriorityPolicy:        cfg.BalancedPriorityPolicy,
+		WeeklyCatchupWindow:           cfg.WeeklyCatchupWindow.String(),
+		WeeklyOnlyCatchupSharePercent: cfg.WeeklyOnlyCatchupSharePercent,
 		SerialBudgetRebalancePercent:  cfg.SerialBudgetRebalancePercent,
 		SerialSoftContinuation:        cfg.SerialSoftContinuation,
 		QuotaDefaultPlan:              cfg.QuotaDefaultPlan,
