@@ -3,10 +3,43 @@ package main
 import (
 	"math"
 	"time"
+
+	"github.com/simplez2/cpa-codex-quota-scheduler/cpasdk/pluginapi"
 )
 
 func balancedResetWeighted(cfg pluginConfig) bool {
 	return cfg.SchedulerMode == "balanced" && cfg.BalancedPriorityPolicy == "reset_weighted"
+}
+
+// Called only by actual routing/usage events with s.mu held. A healthy standby
+// interval must not make a confirmed weekly-only account disappear forever
+// from catch-up allocation. Request a new read; never promote cached absence
+// into fresh eligibility, invent usage, or shorten an upstream error backoff.
+func (s *schedulerRuntimeState) requestWeeklyCatchupProbesLocked(now time.Time) {
+	if !s.cfg.Enabled || !s.cfg.QuotaProbeOnDemand || !balancedResetWeighted(s.cfg) || s.cfg.WeeklyOnlyCatchupSharePercent <= 0 {
+		return
+	}
+	age := max(time.Second, min(5*time.Minute, s.cfg.StaleAfter/2))
+	for id, q := range s.quotas {
+		if id != q.AuthID || q.FiveHourLimitStatus != "not_reported" || q.FiveHourLimitObservedAt.IsZero() ||
+			now.Before(q.FiveHourLimitObservedAt.Add(age)) {
+			continue
+		}
+		p := s.quotaPolls[id]
+		if !p.AttemptedAt.IsZero() && now.Before(p.AttemptedAt.Add(age)) {
+			continue
+		}
+		choice := inspectSerialCandidate(pluginapi.SchedulerAuthCandidate{ID: id}, q, true, s.cfg, now)
+		horizon, known := weeklyResetHorizon(choice, s.cfg, now)
+		if !known || horizon > s.cfg.WeeklyCatchupWindow || !choice.Eligible || choice.FiveHourKnown || choice.WeeklyProtected {
+			continue
+		}
+		if s.quotaPolls == nil {
+			s.quotaPolls = make(map[string]quotaPollState)
+		}
+		p.CatchupPending = true
+		s.quotaPolls[id] = p
+	}
 }
 
 // A real weekly reset is distinct from credential expiry and a moving, full

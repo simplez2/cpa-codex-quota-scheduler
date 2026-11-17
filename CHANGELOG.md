@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.44 — 2026-11-18
+
+- Refresh confirmed weekly-only catch-up candidates on real routing or usage
+  activity before standby snapshots lose freshness. Coalesce requests, retain
+  independent error backoff, and never invent quota freshness or account usage.
+  Idle pools still do not poll for catch-up alone.
+
 ## 0.3.43 — 2026-11-18
 
 - Add opt-in balanced reset weighting: share work across usable 5h credentials

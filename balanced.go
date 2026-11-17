@@ -146,6 +146,7 @@ func (s *schedulerRuntimeState) balancedPick(req pluginapi.SchedulerPickRequest,
 	if !s.cfg.Enabled {
 		return pluginapi.SchedulerPickResponse{}
 	}
+	s.requestWeeklyCatchupProbesLocked(now)
 	if s.balancedAccounts == nil {
 		s.balancedAccounts = map[string]*balancedAccount{}
 	}

@@ -1,6 +1,6 @@
 # Codex 额度调度
 
-源码版本：**0.3.43**。
+源码版本：**0.3.44**。
 
 均衡模式可选择 `balanced_priority_policy: reset_weighted`：在可用 5h
 账号之间分配预计消耗；周额度距重置进入 `weekly_catchup_window`（默认 48h）

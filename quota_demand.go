@@ -25,6 +25,7 @@ func (s *schedulerRuntimeState) recordQuotaDemand(record pluginapi.UsageRecord, 
 	p.LastUsageAt = now
 	p.UsagePending = true
 	s.quotaPolls[id] = p
+	s.requestWeeklyCatchupProbesLocked(now)
 }
 
 // resetCPACredentialCooldown clears CPA's runtime credential/model cooldown
@@ -135,11 +136,15 @@ func (s *schedulerRuntimeState) quotaProbeReason(id string, now time.Time) strin
 	// advances successful observations; failed calls keep their own backoff.
 	warmupDue := p.Failures == 0 && p.Error == "" && !p.AttemptedAt.IsZero() &&
 		s.warmupQuotaProbeDue(id, cfg, q, p, phase, now)
-	if now.Before(p.NextAt) && !rotationUrgent && !warmupDue {
+	catchupDue := p.CatchupPending && balancedResetWeighted(cfg) && cfg.WeeklyOnlyCatchupSharePercent > 0
+	if now.Before(p.NextAt) && !rotationUrgent && !warmupDue && !(catchupDue && p.Failures == 0 && p.Error == "") {
 		return ""
 	}
 	if warmupDue {
 		return "warmup"
+	}
+	if catchupDue {
+		return "weekly_catchup"
 	}
 	// A live host continuity assessment may ask for a post-reset observation.
 	// It never overrides per-credential backoff or authenticates a refill.

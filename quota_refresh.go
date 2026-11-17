@@ -21,13 +21,14 @@ type quotaPollState struct {
 	LastUsageAt time.Time
 	// UsagePending records event order even when the clock reports the same
 	// timestamp for a probe and a later usage callback.
-	UsagePending bool
-	Reason       string
-	AuthIndex    string
-	AttemptedAt  time.Time
-	NextAt       time.Time
-	Failures     int
-	Error        string
+	UsagePending   bool
+	CatchupPending bool
+	Reason         string
+	AuthIndex      string
+	AttemptedAt    time.Time
+	NextAt         time.Time
+	Failures       int
+	Error          string
 }
 
 const quotaRefreshRequestTimeout = 10 * time.Second
@@ -420,7 +421,7 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 		}
 		s.mu.Lock()
 		poll := s.quotaPolls[id]
-		preflight := (strings.HasPrefix(reason, "epoch_") || reason == "warmup") && poll.Failures == 0 && poll.Error == ""
+		preflight := (strings.HasPrefix(reason, "epoch_") || reason == "warmup" || reason == "weekly_catchup") && poll.Failures == 0 && poll.Error == ""
 		if now.Before(poll.NextAt) && !preflight {
 			s.mu.Unlock()
 			continue
@@ -439,6 +440,7 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 		poll.AuthIndex = auth.AuthIndex
 		poll.AttemptedAt = now
 		poll.UsagePending = false
+		poll.CatchupPending = false
 		s.recordQuotaEpochProbeAttemptLocked(id, reason, now)
 		poll.NextAt = now.Add(interval)
 		// A reset timestamp schedules an observation; it never proves renewed quota.
@@ -480,6 +482,7 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 				// Cancellation cannot consume demand or erase an event which
 				// arrived while this HTTP request was in flight.
 				previousPoll.UsagePending = previousPoll.UsagePending || current.UsagePending
+				previousPoll.CatchupPending = previousPoll.CatchupPending || current.CatchupPending
 				if current.LastUsageAt.After(previousPoll.LastUsageAt) {
 					previousPoll.LastUsageAt = current.LastUsageAt
 				}
