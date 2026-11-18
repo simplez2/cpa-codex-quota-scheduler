@@ -865,6 +865,7 @@ type adqSettlementBaseline struct {
 }
 
 type adqReservation struct {
+	cardLoan         cardLoan              // returned to the balanced picker only; never stored or serialized
 	ID               string                `json:"reservation_id"`
 	AuthID           string                `json:"auth_id"`
 	SessionKey       string                `json:"session_key,omitempty"`

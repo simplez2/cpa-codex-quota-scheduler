@@ -69,7 +69,7 @@ export const fields = [
   ['serial_weekly_rebalance_percent','按周剩余比例换号的优势','expert','number','百分点；仅按周剩余比例的分配方式使用。0 关闭。',0,100,1],
   ['drain_window_hours','临近重置的消耗窗口','expert','number','小时；更倾向在重置前使用剩余额度。',.1,168,.1],
   ['switch_hysteresis_percent','切换比较的余量带宽','expert','number','百分点；避免余量相近时频繁切换。',0,100,.1],
-  ['prefer_reset_credits','同组优先有官方重置次数的凭据','expert','boolean','官方可用重置次数作为同组候选的辅助排序，不会压过5h和临近重置优先级；本地周期计数不参与此比较，也不会自动消耗重置卡。'],
+  ['prefer_reset_credits','同组优先利用官方重置卡','expert','boolean','容量与期限策略中，同组双限额号按可接续的卡数、这轮需再用的量和可提前的时间分配新请求。临期纯周、热会话和额度保留规则优先；关闭后恢复普通份额，不影响独立的到期用卡设置。'],
   ['window_order','额度窗口比较顺序','expert','select','同类额度窗口的优先顺序。', [['5h,weekly,monthly','5h → 周 → 月'],['5h,monthly,weekly','5h → 月 → 周'],['weekly,5h,monthly','周 → 5h → 月'],['weekly,monthly,5h','周 → 月 → 5h'],['monthly,5h,weekly','月 → 5h → 周'],['monthly,weekly,5h','月 → 周 → 5h']]],
   ['reserve_monthly_percent','月额度保留比例','expert','number','存在月额度窗口时使用。',0,99.9,.1],
   ['soft_limit_percent','动态调度软阈值','expert','number','已用百分比；主要用于非串行模式。',.1,100,.1],

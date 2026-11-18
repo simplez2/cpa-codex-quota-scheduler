@@ -1693,6 +1693,7 @@ type runtimeADQProviderCircuitStatus struct {
 }
 
 type runtimeADQAccountStatus struct {
+	fiveCapacity float64 // before any ADQ width approximation
 	adqAccountMetrics
 	AbsoluteCapacityKnown bool `json:"absolute_capacity_known"`
 }
@@ -1960,6 +1961,7 @@ func isJSONEmptyValue(value reflect.Value) bool {
 }
 
 type runtimeQuotaStatus struct {
+	ManualCardCycle        *manualCardCycle              `json:"manual_card_cycle,omitempty"`
 	ResetCreditDetails     resetCreditPanelStatus        `json:"reset_credit_details"`
 	SelectionPriority      runtimeQuotaPriorityStatus    `json:"selection_priority"`
 	FiveHourLimitStatus    string                        `json:"five_hour_limit_status,omitempty"`
@@ -2112,7 +2114,7 @@ func runtimeADQAccountFor(snapshot quotaSnapshot, cfg pluginConfig, policy adqPo
 	weeklyCapacity, fiveCapacity, capacitySource, fullyObserved := adqResolveCapacities(
 		weeklyCapacity, weeklyKnown, fiveCapacity, fiveKnown, planWeight, policy.MaxQuotaRatio5h,
 	)
-	status := &runtimeADQAccountStatus{AbsoluteCapacityKnown: fullyObserved}
+	status := &runtimeADQAccountStatus{AbsoluteCapacityKnown: fullyObserved, fiveCapacity: fiveCapacity}
 	weeklyRemaining, fiveRemaining := 0.0, 0.0
 	weeklyReset, fiveReset := time.Time{}, time.Time{}
 	for _, window := range snapshot.Windows {
@@ -2196,9 +2198,24 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 	cfg := s.cfg
 	quotas := make(map[string]quotaSnapshot, len(s.quotas))
 	fiveHourLimits := make(map[string]string, len(s.quotas))
+	type cardObservation struct {
+		native     quotaSnapshot
+		collective time.Time
+		pending    float64
+	}
+	cardObservations := map[string]cardObservation{}
+	collective, _ := s.collectiveHorizonLocked(now)
 	for key, snapshot := range s.quotas {
 		quotas[key] = s.serialConservativeQuotaLocked(snapshot, now)
 		fiveHourLimits[snapshot.AuthID] = poolFiveHourLimitStatus(s.quotaNative[snapshot.AuthID], snapshot, now, cfg.StaleAfter)
+		id := snapshot.AuthID
+		if _, seen := cardObservations[id]; !seen && capacityDeadlineEnabled(cfg) && cfg.PreferResetCredits && resetCreditStates[id].Count > 0 {
+			free := collective
+			if !free.IsZero() && s.credentialSawRefillLocked(serialCandidate{Candidate: pluginapi.SchedulerAuthCandidate{ID: id}, Snapshot: snapshot}, now) {
+				free = time.Time{}
+			}
+			cardObservations[id] = cardObservation{s.quotaNative[id], free, adqPendingWithoutReservation(s.balancedAccounts[id], s.adqReservations, now)}
+		}
 	}
 	costSamples := make(map[string][]float64, len(s.costSamples))
 	for key, samples := range s.costSamples {
@@ -2461,6 +2478,11 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 		}
 		item.Runway = runwayByAuth[canonical]
 		budgetChoice := inspectSerialCandidate(pluginapi.SchedulerAuthCandidate{ID: canonical}, snapshot, true, cfg, now)
+		if o, ok := cardObservations[canonical]; ok && item.ADQ != nil && (item.AuthHealth == nil || !item.AuthHealth.Blocked) {
+			m := item.ADQ.adqAccountMetrics
+			m.WEffective, m.HEffective = max(0, m.WEffective-o.pending), max(0, m.HEffective-o.pending)
+			item.ManualCardCycle = manualCycleFor(snapshot, o.native, resetCreditStates[canonical], m, item.ADQ.fiveCapacity, rotationDemand, cfg, adqPolicy, o.collective, now)
+		}
 		item.SelectionPriority = quotaPriorityStatus(budgetChoice, cfg, now)
 		if budgetChoice.Priority.WeeklyUrgent && item.ADQ != nil && item.ADQ.Eligible {
 			horizon, _ := weeklyResetHorizon(budgetChoice, cfg, now)

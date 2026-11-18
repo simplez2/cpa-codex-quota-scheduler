@@ -20,6 +20,7 @@ type balancedPending struct {
 	Cost          float64
 	ReservationID string
 	weeklyEpoch   weeklyServiceEpoch
+	cardLoan      cardLoan
 }
 
 // Credits are local fair-share work units, never an upstream quota reservation.
@@ -33,6 +34,8 @@ type balancedAccount struct {
 	Pending       []balancedPending
 	Completed     map[string]time.Time
 	weeklyService weeklyService
+	loanIndex     string
+	loanDebt      float64
 }
 
 type balancedAccountStatus struct {
@@ -407,7 +410,12 @@ func (s *schedulerRuntimeState) balancedPick(req pluginapi.SchedulerPickRequest,
 		}
 	}
 	if pending.weeklyEpoch.index == "" {
-		account.Credit -= cost
+		fair := account
+		if reservation.cardLoan.diverted {
+			pending.cardLoan = reservation.cardLoan
+			fair = pending.cardLoan.owner
+		}
+		fair.Credit -= cost
 	} else {
 		// Deadline service has its own ledger. Return to ordinary sharing
 		// with neutral credit once this weekly sprint ends.
@@ -554,7 +562,14 @@ func (s *schedulerRuntimeState) observeBalancedUsage(record pluginapi.UsageRecor
 		// A very large completion changes future share without starving an
 		// account forever. This estimate cannot mark its quota exhausted.
 		limit := math.Max(predicted, .001) * 16
-		account.Credit = math.Max(-limit, math.Min(limit, account.Credit+predicted-actual))
+		fair := account
+		if loan := pending.cardLoan; loan.diverted {
+			if loan.owner.loanIndex != loan.index {
+				return
+			}
+			fair = loan.owner
+		}
+		fair.Credit = math.Max(-limit, math.Min(limit, fair.Credit+predicted-actual))
 	}
 }
 

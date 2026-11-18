@@ -1,8 +1,8 @@
 # Codex 额度调度
 
-源码版本：**0.3.50**。
+源码版本：**0.3.51**。
 
-均衡模式可选 `balanced_priority_policy: capacity_deadline`。平时先用有 5h 和周双重限制的账号；快到自然周重置的纯周账号会接新会话或已过缓存期的安全接续。双限额号只为本轮错过后无法补用的部分抢跑；与纯周最后冲刺竞争时，还须有该纯周号持续消耗的观测支持。集体重置预告填在 `collective_reset_window`，可留空，不能据此预支额度。手动卡不作为余额；已开启到期自动用卡时，只按已核实的本账号临期卡安排现有真实请求。见[调度模型与边界](docs/CAPACITY_DEADLINE.md)。
+均衡模式可选 `balanced_priority_policy: capacity_deadline`。平时先用有 5h 和周双重限制的账号；快到自然周重置的纯周账号会接新会话或已过缓存期的安全接续。双限额号只有错过本轮就来不及补用、且确有纯周冲刺余裕时，才能在最后冲刺中抢跑。打开 `prefer_reset_credits` 后，普通双限额派单还会计算哪一个号用掉当前余量能更早到周保留线，考虑套餐支持的卡数、到期时间及每轮 5h 容量。由客户决定何时手动用卡；原有到期自动用卡设置独立。集体重置预告可填在 `collective_reset_window`，不能据此预支额度。见[调度模型与边界](docs/CAPACITY_DEADLINE.md)。
 
 均衡模式可选择 `balanced_priority_policy: reset_weighted`：在可用 5h
 账号之间分配预计消耗；周额度距重置进入 `weekly_catchup_window`（默认 48h）

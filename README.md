@@ -5,9 +5,14 @@
 
 Standalone CPA plugin for balanced concurrent or serial Codex account selection, native quota polling,
 5h/weekly/monthly windows, persistent 429 quarantine and optional warmup.
-Source version: **0.3.50**. Published platform builds and checksums are available
+Source version: **0.3.51**. Published platform builds and checksums are available
 from [GitHub Releases](https://github.com/simplez2/cpa-codex-quota-scheduler/releases).
 See [CPA permissions and compatibility](CPA_PERMISSIONS.md) before installation.
+
+With `capacity_deadline` and `prefer_reset_credits`, ordinary dual-account placements
+can favor a credential that can reach its weekly reserve earlier with usable manual
+reset cards. Both burst and steady arrivals are considered. Natural weekly sprints
+and protected sessions keep precedence. This routing decision never redeems a card.
 
 New sessions prefer usable 5h quota, then confirmed weekly-only backups. Within
 the same pool, an earlier confirmed reset has higher priority. Existing eligible

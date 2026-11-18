@@ -106,7 +106,7 @@ import (
 
 const (
 	pluginName    = "codex-quota-scheduler"
-	pluginVersion = "0.3.50"
+	pluginVersion = "0.3.51"
 
 	// providerCodex is the CPA provider key for OpenAI Codex (ChatGPT backend).
 	providerCodex = "codex"
@@ -728,7 +728,7 @@ func pluginRegistration() registration {
 				{Name: "guard_cost_quantile", Type: pluginapi.ConfigFieldTypeNumber, Description: "Request-cost quantile used when a quota window is low."},
 				{Name: "high_cost_quantile", Type: pluginapi.ConfigFieldTypeNumber, Description: "Request-cost quantile used for high-effort or long-tail requests."},
 				{Name: "shadow_log_interval", Type: pluginapi.ConfigFieldTypeString, Description: "Minimum interval between aggregate shadow disagreement log messages; zero disables them."},
-				{Name: "prefer_reset_credits", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Prefer accounts with available Codex reset credits within the same window class."},
+				{Name: "prefer_reset_credits", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Within ordinary dual-limited placements, capacity_deadline can advance manual reset opportunities using fresh, supported card inventories. Does not redeem credits."},
 				{Name: "window_order", Type: pluginapi.ConfigFieldTypeArray, Description: "Priority order, normally [5h, weekly, monthly]."},
 			},
 		},

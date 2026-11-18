@@ -91,6 +91,18 @@ export function resetCreditView(account, now=Date.now()) {
   const next=credits.filter(credit=>credit.expires>now).sort((a,b)=>a.expires-b.expires)[0];
   const autoBefore=typeof d?.auto_before==='string'?d.auto_before.replace(/^(\d+)h0m0s$/,'$1 小时').replace(/^(\d+)m0s$/,'$1 分钟').replace(/^(\d+)s$/,'$1 秒'):'';
   const notes=d?resetCreditNotices(d):[];
+  const plan=account?.manual_card_cycle;
+  if(d?.supported_available_fresh===true && plan) {
+    const hours=n=>Number.isFinite(n)&&n>=0?n.toFixed(1):null;
+    if(plan.state==='at_reserve' && hours(plan.free_horizon_hours)!==null)
+      notes.push('已到周保留线；距自然或预告重置约 '+hours(plan.free_horizon_hours)+' 小时。如仍有需求，可手动用一张卡恢复双额度。');
+    if(plan.state==='free_reset_near')
+      notes.push('已到周保留线，免费重置已临近或进入预告区间；可先留卡，等待上游确认。');
+    if(plan.state==='advance' && Number.isFinite(plan.packet_week_percent) && hours(plan.advance_hours)!==null)
+      notes.push('本轮再用约 '+Number(plan.packet_week_percent.toFixed(2))+' 个周额度百分点，理论上可提前 '+hours(plan.advance_hours)+' 小时到保留线。仅供分配真实请求，不会因此用卡。');
+    if(plan.state==='progress' && hours(plan.paced_advance_hours)!==null)
+      notes.push('本轮不足以省下一整次补量；按持续流量情景，先用当前 5h 余量，预计可提前 '+hours(plan.paced_advance_hours)+' 小时到保留线。');
+  }
   const lastAction=d?resetCreditLastAction(d):'';
   if(lastAction)notes.push(lastAction);
   return {

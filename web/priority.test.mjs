@@ -2,6 +2,13 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {quotaPriorityText,resetCreditsText,resetCreditDetails,resetCreditView,observedResetsText,compareAccountPriorities} from './priority.mjs';
 
+test('native reserve, a modelled timing gain and stale card evidence have distinct messages',()=>{
+  const view=(state,fresh=true)=>resetCreditView({manual_card_cycle:{state,free_horizon_hours:55,packet_week_percent:2,advance_hours:5,paced_advance_hours:1},reset_credit_details:{supported_available_fresh:fresh}}).notes.join(' ');
+  assert.match(view('at_reserve'),/可手动/); assert.match(view('free_reset_near'),/先留卡/);
+  assert.match(view('advance'),/2 个周额度百分点/);assert.match(view('progress'),/持续流量/);
+  assert.doesNotMatch(view('at_reserve',false),/已到周保留线/);
+});
+
 test('priority distinguishes confirmed weekly-only backup, missing 5h and a dormant window',()=>{
   assert.match(quotaPriorityText({selection_priority:{reason:'weekly_only_backup'}}),/仅周限.*后备/);
   assert.match(quotaPriorityText({selection_priority:{reason:'five_hour_unconfirmed'}}),/5h 待确认/);

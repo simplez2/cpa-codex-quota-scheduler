@@ -75,6 +75,7 @@ type resetCreditState struct {
 	LastAction   string
 	ActionAt     time.Time
 	AutoFailures int
+	QuotaAfter   time.Time // a possibly exercised card requires two newer native quota windows
 }
 
 func resetCreditHash(value string) string {
@@ -268,6 +269,7 @@ func (s *schedulerRuntimeState) refreshResetCredits(ctx context.Context) {
 			}
 			state.NextAt = time.Now().Add(delay)
 		} else {
+			state.QuotaAfter = manualCardQuotaBarrier(previous, state)
 			state.LastAction, state.ActionAt = previous.LastAction, previous.ActionAt
 			state.AutoFailures = previous.AutoFailures
 			state.NextAt = resetCreditsNextRead(state, cfg, time.Now())

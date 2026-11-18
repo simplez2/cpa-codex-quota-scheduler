@@ -1,4 +1,4 @@
-# Standalone CPA quota scheduler v0.3.50.
+# Standalone CPA quota scheduler v0.3.51.
 plugins:
   enabled: true
   configs:
@@ -73,6 +73,8 @@ plugins:
       max_ban: 24h
       half_open_probe_timeout: 15m
       half_open_retry_after: 2m
+      # In capacity_deadline, allocate discretionary dual-account turns to bring
+      # verified holder(s) closer to an efficient manual reset. This does not use a card.
       prefer_reset_credits: true
       # Optional: consumes a real reset credit before it expires. OFF by default.
       reset_credits_auto_use: false

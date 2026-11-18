@@ -515,6 +515,10 @@ func (s *schedulerRuntimeState) adqRouteChoicesWithAllocationLocked(req pluginap
 		if !ok {
 			return "", adqReservation{}, false, true
 		}
+		var loan cardLoan
+		if mode == adqAllocateBalanced && stickyID == "" && serialPinnedAuthID(req) == "" {
+			decision, loan = s.cardCyclePickLocked(decision, available, inputs, cost, policy, now)
+		}
 		fiveCost := cost
 		if decision.Metrics.WeeklyOnly {
 			fiveCost = 0
@@ -524,6 +528,8 @@ func (s *schedulerRuntimeState) adqRouteChoicesWithAllocationLocked(req pluginap
 			FiveHour: fiveCost, Weekly: cost, TTL: policy.ReservationTimeout,
 		}, now)
 		if ok {
+			loan.commit(cost)
+			reservation.cardLoan = loan
 			if mode == adqAllocateWeeklyDeadline {
 				decision.Reason = "在最早一批周重置中按所需消耗速度和近期已分配工作量选择凭证。"
 			} else if mode == adqAllocateOpportunity {

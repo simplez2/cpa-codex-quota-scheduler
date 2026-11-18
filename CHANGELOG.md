@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.51 — 2026-11-19
+
+- Bring forward manual card opportunities within the ordinary dual-limited share. Compare the discrete 5h refill schedule and a steady-arrival scenario; count only cards a customer could actually exercise in sequence. Preserve natural weekly deadlines, sticky sessions and admission reserves. The panel distinguishes projected progress from a natively observed weekly reserve. Card redemption settings are unchanged.
+
 ## 0.3.50 — 2026-11-19
 
 - Add an opt-in capacity/deadline policy for dual-limited and weekly-only accounts. Compare current 5h stock against later refill opportunities, preserve confirmed natural weekly sprints, and handle an optional uncertain group reset or an already scheduled account-specific reset card without crediting either as supply.
