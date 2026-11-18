@@ -222,7 +222,28 @@ func (s *schedulerRuntimeState) balancedPick(req pluginapi.SchedulerPickRequest,
 	reservation := adqReservation{}
 	var handbackDeadline time.Time
 	remaining := choices
-	for len(remaining) > 0 {
+	if sticky == nil && pinned == "" && s.cfg.WeeklyOnlyPriorityWindow > 0 {
+		var urgent, rest []serialCandidate
+		for _, choice := range choices {
+			if choice.Priority.WeeklyUrgent {
+				urgent = append(urgent, choice)
+			} else {
+				rest = append(rest, choice)
+			}
+		}
+		if len(urgent) > 0 {
+			// Unbound placements use the deadline lane before ordinary quotas.
+			// Require an atomic debit. On failure remove these candidates from
+			// this pick so they cannot slip back through unreserved fallback.
+			id, reserved, ok, _ := s.adqRouteChoicesWithAllocationLocked(req, urgent, cost, now, session, "", true)
+			if ok {
+				selected, reservation = id, reserved
+			} else {
+				adqRejected, remaining = true, rest
+			}
+		}
+	}
+	for selected == "" && len(remaining) > 0 {
 		group, rest := nextQuotaPriorityGroup(remaining, s.cfg, now)
 		groupSticky := sticky
 		if groupSticky != nil && quotaAffinityMustYield(*groupSticky, group, s.cfg) {

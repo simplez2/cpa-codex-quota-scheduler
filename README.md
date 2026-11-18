@@ -5,7 +5,7 @@
 
 Standalone CPA plugin for balanced concurrent or serial Codex account selection, native quota polling,
 5h/weekly/monthly windows, persistent 429 quarantine and optional warmup.
-Source version: **0.3.45**. Published platform builds and checksums are available
+Source version: **0.3.46**. Published platform builds and checksums are available
 from [GitHub Releases](https://github.com/simplez2/cpa-codex-quota-scheduler/releases).
 See [CPA permissions and compatibility](CPA_PERMISSIONS.md) before installation.
 
@@ -309,8 +309,12 @@ quota according to `window_order`. With `reset_weighted`, an existing fallback
 conversation that was active within the last five minutes can stay on its
 confirmed eligible weekly credential for up to five minutes from its first
 deferred handback. Later turns do not extend this deadline. The continuation
-still needs a free slot and an atomic weekly reservation. New sessions keep the
-existing 5h priority and weekly catch-up share. A
+still needs a free slot and an atomic weekly reservation. With
+`weekly_only_priority_window` set to 1h–24h, reset weighting first tries
+confirmed weekly-only credentials in that final window for unbound sessions.
+Selection still requires an atomic reservation; if the account is busy or
+cannot reserve quota, other eligible credentials can serve the request. Set
+`0s` (the default) to keep only proportional catch-up. A
 configured quota switch threshold, hard quota limit, quarantine/429, unavailable
 credential or incompatible model allows failover and rebind the conversation to its replacement. Explicit account
 pins remain isolated from ordinary conversation bindings. An already emitted

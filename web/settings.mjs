@@ -17,7 +17,8 @@ export function continuitySummary(status) {
 export const fields = [
 	['balanced_priority_policy','均衡优先级策略','allocation','select','仅均衡模式生效。重置加权在可用 5h 账号之间分配预计消耗，周重置临近时适度加权；严格顺序保留原有按额度池和最早重置先用的规则。已有可用会话保持绑定。', [['strict_deadline','严格按重置顺序'],['reset_weighted','均衡分配与周重置补耗']]],
 	['weekly_catchup_window','周重置前补耗窗口','allocation','duration','重置加权模式生效。默认 48 小时，可设 1 至 168 小时；按确认的周重置时间计算，不使用令牌过期时间。5h 账号的周重置加权最高 2 倍。'],
-	['weekly_only_catchup_share_percent','周线号补耗目标份额','allocation','number','默认 15%，可设 0 至 40%。有可用 5h 额度时，所有临近周重置的周线号合计占新会话预计消耗的目标份额；0 关闭补耗。已有会话和实际请求消耗会影响最终流量占比。5h 额度不足时仍可完整兜底。',0,40,1],
+	['weekly_only_priority_window','周重置前新会话优先窗口','allocation','duration','仅重置加权模式生效。可设 1 至 24 小时，0 秒关闭。在此窗口内，确认仅有周限额且本轮有额度可预留的账号优先接新会话。已有可用会话继续保持绑定。'],
+	['weekly_only_catchup_share_percent','周线号补耗目标份额','allocation','number','默认 15%，可设 0 至 40%。在新会话优先窗口之外，有可用 5h 额度时，这是临近周重置的周线号合计占新会话预计消耗的目标份额。0 关闭按比例补耗。5h 额度不足时仍可完整兜底。',0,40,1],
   ['scheduler_mode','调度模式','allocation','select','5h 账号为主力、仅周限账号为后备。均衡模式可选重置加权：在 5h 账号间均衡分配，周线号临近周重置时少量补耗；严格顺序和串行模式按额度池、重置先后选号。已有会话保持绑定，达到设定阈值或凭据不可用时才换号。观察对比仅记录另一种算法的选择，实际仍走传统调度。', [['balanced','均衡并发（会话粘性）'],['serial','串行调配'],['legacy','传统调度'],['shadow','观察对比'],['enforce','动态节奏控制']]],
   ['account_concurrency_enabled','限制每凭据并发','allocation','boolean','默认开启。真实请求、重试和预热共用每个 CPA 凭据的槽位；长请求保留槽位直到 CPA 确认结束。保存后立即生效。'],
   ['account_max_concurrency','每凭据最大并发','allocation','number','1 至 64，默认 2。不同 CPA 凭据独立计数，即使属于同一个账号；调低上限不会中断已开始的请求。',1,64,1],

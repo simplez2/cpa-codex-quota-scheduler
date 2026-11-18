@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.46 — 2026-11-18
+
+- Allow reset-weighted routing to prioritize confirmed weekly-only headroom for
+  new sessions in a configurable final 1–24 hours before weekly reset. Keep the
+  usual catch-up share outside that window. Existing bindings and weekly reserves
+  still apply. An unreservable priority candidate falls back to the ordinary pool.
+
 ## 0.3.45 — 2026-11-18
 
 - In reset-weighted balanced mode, give active weekly fallback conversations a

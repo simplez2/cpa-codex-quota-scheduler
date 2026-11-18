@@ -1756,6 +1756,7 @@ type runtimeStatus struct {
 	SerialAllocationPolicy        string                           `json:"serial_allocation_policy"`
 	BalancedPriorityPolicy        string                           `json:"balanced_priority_policy"`
 	WeeklyCatchupWindow           string                           `json:"weekly_catchup_window"`
+	WeeklyOnlyPriorityWindow      string                           `json:"weekly_only_priority_window"`
 	WeeklyOnlyCatchupSharePercent float64                          `json:"weekly_only_catchup_share_percent"`
 	SerialBudgetRebalancePercent  float64                          `json:"serial_budget_rebalance_percent"`
 	SerialSoftContinuation        bool                             `json:"serial_soft_continuation"`
@@ -2577,11 +2578,11 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 		priorityOrder[i] = i
 	}
 	sort.SliceStable(priorityOrder, func(i, j int) bool {
-		return compareQuotaPriority(selectionPriorities[snapshots[priorityOrder[i]].AuthID], selectionPriorities[snapshots[priorityOrder[j]].AuthID]) < 0
+		return compareQuotaPlacementPriority(selectionPriorities[snapshots[priorityOrder[i]].AuthID], selectionPriorities[snapshots[priorityOrder[j]].AuthID]) < 0
 	})
 	rank := 1
 	for i, index := range priorityOrder {
-		if i > 0 && compareQuotaPriority(selectionPriorities[snapshots[index].AuthID], selectionPriorities[snapshots[priorityOrder[i-1]].AuthID]) != 0 {
+		if i > 0 && compareQuotaPlacementPriority(selectionPriorities[snapshots[index].AuthID], selectionPriorities[snapshots[priorityOrder[i-1]].AuthID]) != 0 {
 			rank++
 		}
 		snapshots[index].SelectionPriority.Rank = rank
@@ -2685,6 +2686,7 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 		SerialAllocationPolicy:        cfg.SerialAllocationPolicy,
 		BalancedPriorityPolicy:        cfg.BalancedPriorityPolicy,
 		WeeklyCatchupWindow:           cfg.WeeklyCatchupWindow.String(),
+		WeeklyOnlyPriorityWindow:      cfg.WeeklyOnlyPriorityWindow.String(),
 		WeeklyOnlyCatchupSharePercent: cfg.WeeklyOnlyCatchupSharePercent,
 		SerialBudgetRebalancePercent:  cfg.SerialBudgetRebalancePercent,
 		SerialSoftContinuation:        cfg.SerialSoftContinuation,

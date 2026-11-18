@@ -18,6 +18,7 @@ type quotaSelectionPriority struct {
 	WeeklyProtected bool
 	Weighted        bool
 	WeeklyCatchup   bool
+	WeeklyUrgent    bool
 }
 
 func quotaPriorityFor(choice serialCandidate, cfg pluginConfig, now time.Time) quotaSelectionPriority {
@@ -45,10 +46,23 @@ func quotaPriorityFor(choice serialCandidate, cfg pluginConfig, now time.Time) q
 	}
 	p.Weighted = balancedResetWeighted(cfg)
 	p.WeeklyCatchup = weeklyOnlyCatchup(choice, cfg, now)
+	p.WeeklyUrgent = weeklyOnlyUrgent(choice, cfg, now)
 	if p.WeeklyCatchup {
 		p.WindowRank = windowRankInOrder("5h", cfg.WindowOrder)
 	}
 	return p
+}
+
+// The panel describes placement of new sessions. Established bindings still
+// use the ordinary grouping and their existing affinity and recovery rules.
+func compareQuotaPlacementPriority(a, b quotaSelectionPriority) int {
+	if a.WeeklyUrgent != b.WeeklyUrgent {
+		if a.WeeklyUrgent {
+			return -1
+		}
+		return 1
+	}
+	return compareQuotaPriority(a, b)
 }
 
 func compareQuotaPriority(a, b quotaSelectionPriority) int {
@@ -91,7 +105,7 @@ func compareQuotaPriority(a, b quotaSelectionPriority) int {
 // using a weekly-only backup must yield when usable, higher-priority 5h quota
 // returns. A plan name alone never establishes either quota class.
 func quotaAffinityMustYield(current serialCandidate, choices []serialCandidate, cfg pluginConfig) bool {
-	if !current.QuotaKnown || current.FiveHourKnown || (balancedResetWeighted(cfg) && current.Priority.WeeklyCatchup) {
+	if !current.QuotaKnown || current.FiveHourKnown || current.Priority.WeeklyCatchup || current.Priority.WeeklyUrgent {
 		return false
 	}
 	for _, choice := range choices {
@@ -162,6 +176,8 @@ func quotaPriorityStatus(choice serialCandidate, cfg pluginConfig, now time.Time
 		out.Reason = "quota_unknown"
 	case !choice.Eligible:
 		out.Reason = choice.Reason
+	case p.WeeklyUrgent:
+		out.Reason = "weekly_only_urgent"
 	case p.WeeklyCatchup:
 		out.Reason = "weekly_only_catchup"
 	case p.Weighted && p.Window == "5h":

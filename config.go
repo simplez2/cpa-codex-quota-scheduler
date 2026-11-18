@@ -38,6 +38,7 @@ type pluginConfig struct {
 	SerialAllocationPolicy        string
 	BalancedPriorityPolicy        string
 	WeeklyCatchupWindow           time.Duration
+	WeeklyOnlyPriorityWindow      time.Duration
 	WeeklyOnlyCatchupSharePercent float64
 	SerialBudgetRebalancePercent  float64
 	QuotaDefaultPlan              string
@@ -107,6 +108,7 @@ type yamlPluginConfig struct {
 	SerialAllocationPolicy        string             `yaml:"serial_allocation_policy"`
 	BalancedPriorityPolicy        string             `yaml:"balanced_priority_policy"`
 	WeeklyCatchupWindow           string             `yaml:"weekly_catchup_window"`
+	WeeklyOnlyPriorityWindow      string             `yaml:"weekly_only_priority_window"`
 	WeeklyOnlyCatchupSharePercent *float64           `yaml:"weekly_only_catchup_share_percent"`
 	SerialBudgetRebalancePercent  *float64           `yaml:"serial_budget_rebalance_percent"`
 	QuotaDefaultPlan              string             `yaml:"quota_default_plan"`
@@ -324,6 +326,13 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 			return cfg, fmt.Errorf("weekly_only_catchup_share_percent must be between 0 and 40")
 		}
 		cfg.WeeklyOnlyCatchupSharePercent = value
+	}
+	if in.WeeklyOnlyPriorityWindow != "" {
+		value, err := time.ParseDuration(in.WeeklyOnlyPriorityWindow)
+		if err != nil || value < 0 || value > 24*time.Hour || (value > 0 && value < time.Hour) {
+			return cfg, fmt.Errorf("weekly_only_priority_window must be 0s or between 1h and 24h")
+		}
+		cfg.WeeklyOnlyPriorityWindow = value
 	}
 	if in.QuotaDefaultPlan != "" {
 		plan, ok := normalizeQuotaPlan(in.QuotaDefaultPlan)

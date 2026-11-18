@@ -8,7 +8,10 @@ plan capacity and bounded reset urgency. Sustainable allocation increases weekly
 reset urgency gradually within `weekly_catchup_window` (48h), capped at 2x;
 5h deadline urgency is also capped at 2x. Confirmed weekly-only credentials may
 join this pool near weekly reset with a combined new-session target share of
-`weekly_only_catchup_share_percent` (15%). They remain full backups when no 5h
+`weekly_only_catchup_share_percent` (15%). The optional final
+`weekly_only_priority_window` (0s or 1h–24h) places unbound requests on freshly
+confirmed weekly-only credentials first, subject to an atomic weekly reservation.
+They remain full backups when no 5h
 candidate admits work. These are allocation weights, not guaranteed traffic
 percentages or permission to cross quota gates. Eligible catch-up conversations
 keep their binding. Strict deadline ordering remains the compatibility default

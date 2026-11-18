@@ -11,12 +11,24 @@ func balancedResetWeighted(cfg pluginConfig) bool {
 	return cfg.SchedulerMode == "balanced" && cfg.BalancedPriorityPolicy == "reset_weighted"
 }
 
+func weeklyCatchupProbeHorizon(cfg pluginConfig) time.Duration {
+	limit := cfg.WeeklyOnlyPriorityWindow
+	if cfg.WeeklyOnlyCatchupSharePercent > 0 {
+		limit = max(limit, cfg.WeeklyCatchupWindow)
+	}
+	return limit
+}
+
 // Called only by actual routing/usage events with s.mu held. A healthy standby
 // interval must not make a confirmed weekly-only account disappear forever
 // from catch-up allocation. Request a new read; never promote cached absence
 // into fresh eligibility, invent usage, or shorten an upstream error backoff.
 func (s *schedulerRuntimeState) requestWeeklyCatchupProbesLocked(now time.Time) {
-	if !s.cfg.Enabled || !s.cfg.QuotaProbeOnDemand || !balancedResetWeighted(s.cfg) || s.cfg.WeeklyOnlyCatchupSharePercent <= 0 {
+	if !s.cfg.Enabled || !s.cfg.QuotaProbeOnDemand || !balancedResetWeighted(s.cfg) {
+		return
+	}
+	horizonLimit := weeklyCatchupProbeHorizon(s.cfg)
+	if horizonLimit <= 0 {
 		return
 	}
 	age := max(time.Second, min(5*time.Minute, s.cfg.StaleAfter/2))
@@ -31,7 +43,7 @@ func (s *schedulerRuntimeState) requestWeeklyCatchupProbesLocked(now time.Time) 
 		}
 		choice := inspectSerialCandidate(pluginapi.SchedulerAuthCandidate{ID: id}, q, true, s.cfg, now)
 		horizon, known := weeklyResetHorizon(choice, s.cfg, now)
-		if !known || horizon > s.cfg.WeeklyCatchupWindow || !choice.Eligible || choice.FiveHourKnown || choice.WeeklyProtected {
+		if !known || horizon > horizonLimit || !choice.Eligible || choice.FiveHourKnown || choice.WeeklyProtected {
 			continue
 		}
 		if s.quotaPolls == nil {
@@ -70,13 +82,26 @@ func weeklyResetHorizon(choice serialCandidate, cfg pluginConfig, now time.Time)
 }
 
 func weeklyOnlyCatchup(choice serialCandidate, cfg pluginConfig, now time.Time) bool {
-	if !balancedResetWeighted(cfg) || cfg.WeeklyOnlyCatchupSharePercent <= 0 || !choice.Eligible ||
-		choice.FiveHourKnown || choice.WindowClass != "weekly" || choice.WeeklyProtected ||
-		poolFiveHourLimitStatus(quotaSnapshot{}, choice.Snapshot, now, cfg.StaleAfter) != "not_reported" {
+	if !balancedResetWeighted(cfg) || cfg.WeeklyOnlyCatchupSharePercent <= 0 || !confirmedAvailableWeeklyOnly(choice, cfg, now) {
 		return false
 	}
 	horizon, known := weeklyResetHorizon(choice, cfg, now)
 	return known && horizon <= cfg.WeeklyCatchupWindow
+}
+
+func confirmedAvailableWeeklyOnly(choice serialCandidate, cfg pluginConfig, now time.Time) bool {
+	return choice.Eligible && choice.WeeklyKnown && !choice.WeeklyProtected && !choice.FiveHourKnown &&
+		choice.WindowClass == "weekly" &&
+		poolFiveHourLimitStatus(quotaSnapshot{}, choice.Snapshot, now, cfg.StaleAfter) == "not_reported"
+}
+
+func weeklyOnlyUrgent(choice serialCandidate, cfg pluginConfig, now time.Time) bool {
+	if !balancedResetWeighted(cfg) || cfg.WeeklyOnlyPriorityWindow <= 0 || !confirmedAvailableWeeklyOnly(choice, cfg, now) ||
+		!quotaSnapshotFresh(choice.Snapshot, now, cfg.StaleAfter) {
+		return false
+	}
+	horizon, known := weeklyResetHorizon(choice, cfg, now)
+	return known && horizon <= cfg.WeeklyOnlyPriorityWindow
 }
 
 const balancedWeeklyHandbackGrace = 5 * time.Minute
