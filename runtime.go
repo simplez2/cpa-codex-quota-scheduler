@@ -131,15 +131,16 @@ type schedulerRuntimeState struct {
 	lastBanClearReason         string
 	lastBanClearAt             time.Time
 
-	pickCounter             uint64
-	balancedClock           time.Time
-	balancedAccounts        map[string]*balancedAccount
-	balancedSessions        map[string]balancedSessionBinding
-	balancedSessionPrunedAt time.Time
-	balancedSessionHits     uint64
-	balancedSessionSwitches uint64
-	balancedWeeklyDeferrals uint64
-	balancedUnkeyedRequests uint64
+	pickCounter                  uint64
+	balancedClock                time.Time
+	balancedAccounts             map[string]*balancedAccount
+	balancedSessions             map[string]balancedSessionBinding
+	balancedSessionPrunedAt      time.Time
+	balancedSessionHits          uint64
+	balancedSessionSwitches      uint64
+	balancedWeeklyDeferrals      uint64
+	balancedWeeklyColdMigrations uint64
+	balancedUnkeyedRequests      uint64
 
 	// ADQ-PBS state is kept separate from the legacy credit scheduler so a
 	// partial telemetry rollout can fall back without losing sticky bindings.
@@ -229,6 +230,7 @@ func configureSchedulerRuntime(raw []byte) {
 	schedulerRuntime.balancedSessionHits = 0
 	schedulerRuntime.balancedSessionSwitches = 0
 	schedulerRuntime.balancedWeeklyDeferrals = 0
+	schedulerRuntime.balancedWeeklyColdMigrations = 0
 	schedulerRuntime.balancedUnkeyedRequests = 0
 	schedulerRuntime.adqPolicy = defaultADQPolicy()
 	schedulerRuntime.adqReservations = newADQReservationBook()
@@ -1723,6 +1725,7 @@ type runtimeStatus struct {
 	BalancedSessionHits           uint64                           `json:"balanced_session_hits"`
 	BalancedSessionSwitches       uint64                           `json:"balanced_session_switches"`
 	BalancedWeeklyDeferrals       uint64                           `json:"balanced_weekly_handoff_deferrals"`
+	BalancedWeeklyColdMigrations  uint64                           `json:"balanced_weekly_cold_migrations"`
 	BalancedUnkeyedRequests       uint64                           `json:"balanced_unkeyed_requests"`
 	StickySeconds                 int                              `json:"sticky_seconds"`
 	BalancedAccounts              map[string]balancedAccountStatus `json:"balanced_accounts,omitempty"`
@@ -2224,7 +2227,7 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 	}
 	balancedStickyCount := len(s.snapshotBalancedSessionsLocked(now))
 	balancedHits, balancedSwitches, balancedUnkeyed := s.balancedSessionHits, s.balancedSessionSwitches, s.balancedUnkeyedRequests
-	balancedWeeklyDeferrals := s.balancedWeeklyDeferrals
+	balancedWeeklyDeferrals, balancedWeeklyColdMigrations := s.balancedWeeklyDeferrals, s.balancedWeeklyColdMigrations
 	bindings := make(map[string]stickyBinding, len(s.stickyBindings))
 	for key, binding := range s.stickyBindings {
 		bindings[key] = binding
@@ -2725,6 +2728,7 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 		BalancedSessionHits:           balancedHits,
 		BalancedSessionSwitches:       balancedSwitches,
 		BalancedWeeklyDeferrals:       balancedWeeklyDeferrals,
+		BalancedWeeklyColdMigrations:  balancedWeeklyColdMigrations,
 		BalancedUnkeyedRequests:       balancedUnkeyed,
 		StickySeconds:                 cfg.StickySeconds,
 		SessionSwitches:               sessionSwitches,

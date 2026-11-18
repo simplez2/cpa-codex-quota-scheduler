@@ -115,6 +115,38 @@ func weeklyDeadlinePace(effective float64, horizon time.Duration) float64 {
 	return effective / max(weeklyDeadlinePaceFloor, horizon).Hours()
 }
 
+// A direct binding can move between turns, after both cache age bands. Keep
+// a source that is also spending down a confirmed final weekly window.
+// The caller already excluded CPA's request-scoped credential pins.
+func (s *schedulerRuntimeState) balancedColdWeeklyHandoffLocked(session string, binding balancedSessionBinding, source serialCandidate, now time.Time) bool {
+	if !balancedResetWeighted(s.cfg) || s.cfg.WeeklyOnlyPriorityWindow <= 0 || session == "" ||
+		!source.Eligible || !source.FiveHourKnown || binding.AuthID != source.Candidate.ID ||
+		binding.AuthIndex == "" || binding.AuthIndex != source.Snapshot.AuthIndex ||
+		adqCacheState(now.Sub(binding.LastUsedAt), s.adqPolicyLocked()) != "cold" {
+		return false
+	}
+	if horizon, known := weeklyResetHorizon(source, s.cfg, now); known && horizon <= s.cfg.WeeklyOnlyPriorityWindow {
+		return false
+	}
+	active, lifecycleObserved := s.concurrency.sessionActivity(session, binding.AuthID)
+	return !active && (lifecycleObserved || !s.balancedSessionHasPendingLocked(session, binding.AuthID, now))
+}
+
+// An elective handoff must have room for this whole request, including the
+// completed work that the upstream quota reading has not acknowledged yet.
+// The definitive selection still needs a free slot and an atomic reservation.
+func (s *schedulerRuntimeState) balancedUrgentWeeklyCanTakeLocked(choice serialCandidate, cost float64, now time.Time) bool {
+	if !choice.Priority.WeeklyUrgent {
+		return false
+	}
+	input, ok := s.adqInputForChoiceLocked(choice, now)
+	if !ok {
+		return false
+	}
+	metrics := adqAssessAccount(input, s.adqPolicyLocked(), now)
+	return metrics.Eligible && metrics.WEffective >= cost
+}
+
 const balancedWeeklyHandbackGrace = 5 * time.Minute
 
 // Give a hot weekly fallback one short handback window after 5h becomes

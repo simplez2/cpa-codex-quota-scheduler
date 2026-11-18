@@ -106,7 +106,7 @@ import (
 
 const (
 	pluginName    = "codex-quota-scheduler"
-	pluginVersion = "0.3.47"
+	pluginVersion = "0.3.48"
 
 	// providerCodex is the CPA provider key for OpenAI Codex (ChatGPT backend).
 	providerCodex = "codex"
@@ -682,7 +682,7 @@ func pluginRegistration() registration {
 				{Name: "serial_allocation_policy", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"sustainable", "weekly_remaining"}, Description: "Weekly allocation policy for both serial and balanced modes. sustainable uses remaining weekly quota divided by time until reset; weekly_remaining uses remaining weekly fraction. Balanced weights also include plan capacity and 5h headroom; existing session affinity remains authoritative."},
 				{Name: "balanced_priority_policy", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"strict_deadline", "reset_weighted"}, Description: "Balanced mode only: strict_deadline retains pool/deadline groups; reset_weighted shares work across usable 5h credentials with bounded reset urgency, allowing limited weekly-only catch-up near weekly reset. Existing session affinity and quota gates remain authoritative."},
 				{Name: "weekly_catchup_window", Type: pluginapi.ConfigFieldTypeString, Description: "Weekly reset catch-up horizon for reset_weighted mode, between 1h and 168h; default 48h. Only confirmed future weekly resets receive urgency."},
-				{Name: "weekly_only_priority_window", Type: pluginapi.ConfigFieldTypeString, Description: "In reset_weighted mode, place new sessions on usable confirmed weekly-only accounts first during their final 1h to 24h. Set 0s (default) to disable. An eligible existing session keeps its binding."},
+				{Name: "weekly_only_priority_window", Type: pluginapi.ConfigFieldTypeString, Description: "In reset_weighted mode, prioritize confirmed weekly-only accounts during their final 1h to 24h for new sessions and eligible cold 5h handoffs. Usable urgent weekly bindings are retained. Set 0s (default) to disable."},
 				{Name: "weekly_only_catchup_share_percent", Type: pluginapi.ConfigFieldTypeNumber, Description: "Combined weekly-only target share of new-session allocation during proportional catch-up while 5h quota is usable, between 0 and 40 percent; default 15. Zero disables proportional catch-up, independently of the final priority window. Full weekly-only fallback remains available when 5h quota cannot admit requests."},
 				{Name: "serial_budget_rebalance_percent", Type: pluginapi.ConfigFieldTypeNumber, Description: "Relative weekly budget advantage before proactive sustainable handoff (default 20 percent, 0 disables); requires independent evidence and minimum hold."},
 				{Name: "serial_soft_continuation", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Legacy session continuation past a soft threshold; defaults false so subsequent session requests follow the replacement."},

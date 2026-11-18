@@ -346,6 +346,10 @@ func concurrencyWaitReason(req pluginapi.SchedulerPickRequest, preferred string,
 func (s *schedulerRuntimeState) concurrencyAliases(candidate pluginapi.SchedulerAuthCandidate) []string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	return s.concurrencyAliasesLocked(candidate)
+}
+
+func (s *schedulerRuntimeState) concurrencyAliasesLocked(candidate pluginapi.SchedulerAuthCandidate) []string {
 	snapshot, ok := s.lookupQuotaLocked(candidate.ID, candidateAuthIndex(candidate))
 	canonical := s.canonicalAuthIDLocked(candidate.ID, candidateAuthIndex(candidate))
 	out := []string{"auth:" + canonical}
@@ -362,15 +366,40 @@ func (s *schedulerRuntimeState) concurrencyAliases(candidate pluginapi.Scheduler
 	// Separate CPA credentials stay independent even for the same workspace/user.
 	return out
 }
+
+func (s *schedulerRuntimeState) concurrencyOfferAvailableLocked(req pluginapi.SchedulerPickRequest, candidate pluginapi.SchedulerAuthCandidate, cfg pluginConfig, now time.Time) bool {
+	if !cfg.AccountConcurrencyEnabled {
+		return true
+	}
+	aliases := s.concurrencyAliasesLocked(candidate)
+	g := &s.concurrency
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if !g.supported {
+		return true
+	}
+	// Apply the same slot and FIFO rules as admission. Selection will recheck
+	// after releases or retries change the ledger.
+	token := schedulerHeader(req.Options, concurrencyHeader)
+	request := g.requests[g.tokens[token]]
+	return !g.blockedLocked(g.keyLocked(aliases), request, cfg.AccountMaxConcurrency, now)
+}
+
 func (s *schedulerRuntimeState) concurrencyPreferred(req pluginapi.SchedulerPickRequest, cfg pluginConfig, now time.Time) string {
 	preferred := serialPinnedAuthID(req)
+	var binding balancedSessionBinding
+	var session string
+	directBinding := false
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if now.Before(s.balancedClock) {
 		now = s.balancedClock
 	}
 	if preferred == "" && (normalizeSchedulerMode(cfg.SchedulerMode) == "balanced" || normalizeSchedulerMode(cfg.SchedulerMode) == "serial") && cfg.StickySeconds > 0 {
-		binding, ok := s.balancedSessionLocked(schedulerSessionHash(req), now)
+		session = schedulerSessionHash(req)
+		var ok bool
+		binding, ok = s.balancedSessionLocked(session, now)
+		directBinding = ok
 		if !ok {
 			binding, ok = s.balancedSessionLocked(schedulerParentSessionHash(req), now)
 		}
@@ -386,6 +415,9 @@ func (s *schedulerRuntimeState) concurrencyPreferred(req pluginapi.SchedulerPick
 			continue
 		}
 		snapshot, found := s.lookupQuotaLocked(candidate.ID, candidateAuthIndex(candidate))
+		if normalizeSchedulerMode(cfg.SchedulerMode) == "balanced" {
+			snapshot = s.serialConservativeQuotaLocked(snapshot, now)
+		}
 		choice := inspectSerialCandidate(candidate, snapshot, found, cfg, now)
 		if serialPinnedAuthID(req) == "" && normalizeSerialSelectionSource(s.serialSelectionSource) != "manual" &&
 			s.quotaAffinityMustYieldLocked(choice, req, now) {
@@ -393,6 +425,22 @@ func (s *schedulerRuntimeState) concurrencyPreferred(req pluginapi.SchedulerPick
 		}
 		stickyEligible := choice.Eligible || (cfg.SerialSoftContinuation && choice.Reason == "serial_threshold")
 		if stickyEligible && banStore.schedulable(candidate.ID, now) && !s.adqProviderCircuitActiveLockedForConcurrency(candidate, now) {
+			if directBinding && s.balancedColdWeeklyHandoffLocked(session, binding, choice, now) {
+				cost := max(.001, s.predictCostLocked(req, false))
+				for _, offer := range req.Candidates {
+					if offer.ID == preferred || !banStore.schedulable(offer.ID, now) || s.adqProviderCircuitActiveLockedForConcurrency(offer, now) {
+						continue
+					}
+					q, found := s.lookupQuotaLocked(offer.ID, candidateAuthIndex(offer))
+					q = s.serialConservativeQuotaLocked(q, now)
+					if s.balancedUrgentWeeklyCanTakeLocked(inspectSerialCandidate(offer, q, found, cfg, now), cost, now) &&
+						s.concurrencyOfferAvailableLocked(req, offer, cfg, now) {
+						// A queue for another session on the old credential
+						// must not hide an available weekly handoff.
+						return ""
+					}
+				}
+			}
 			return preferred
 		}
 	}
@@ -892,22 +940,20 @@ func (s *schedulerRuntimeState) rollbackUndispatchedConcurrency(token string) {
 }
 func (s *schedulerRuntimeState) concurrencyComplete(id string) {
 	s.continuityComplete(id)
+	// Close slot and renew activity atomically with respect to the cache handoff
+	// guard. Otherwise a long turn briefly looks cold just after releasing it.
+	s.mu.Lock()
 	r := s.concurrency.release(id)
-	if r == nil {
-		return
-	}
-	if !r.Dispatched {
-		s.rollbackUndispatchedConcurrency(r.Token)
-		return
-	}
-	if r.SessionKey != "" {
-		s.mu.Lock()
+	if r != nil && r.Dispatched && r.SessionKey != "" {
 		now := s.balancedTimeLocked(time.Now())
 		if binding, ok := s.balancedSessions[r.SessionKey]; ok && binding.AuthID == r.AuthID {
 			binding.LastUsedAt = now
 			s.balancedSessions[r.SessionKey] = binding
 		}
-		s.mu.Unlock()
+	}
+	s.mu.Unlock()
+	if r != nil && !r.Dispatched {
+		s.rollbackUndispatchedConcurrency(r.Token)
 	}
 }
 
@@ -943,14 +989,19 @@ func (s *schedulerRuntimeState) releaseRejectedContinuityAttempt(id string) {
 }
 
 func (g *accountConcurrencyGate) hasActiveSession(session, authID string) bool {
+	active, _ := g.sessionActivity(session, authID)
+	return active
+}
+
+func (g *accountConcurrencyGate) sessionActivity(session, authID string) (active, lifecycleObserved bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	for _, request := range g.requests {
 		if request.SessionKey == session && request.AuthID == authID && request.Key != "" {
-			return true
+			return true, g.supported
 		}
 	}
-	return false
+	return false, g.supported
 }
 
 func (s *schedulerRuntimeState) beginWarmupConcurrency(candidate warmupCandidate, cfg pluginConfig) (string, bool) {

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.48 — 2026-11-19
+
+- On the next unpinned turn after both cache age bands, allow an idle 5h
+  binding to move to an available weekly-only credential in the final priority
+  window. Protect in-flight work and sources already in their own final weekly
+  window. Once selected, prefer the bound urgent weekly credential even when
+  5h returns, with normal quota and slot checks. Report cold moves in status.
+
 ## 0.3.47 — 2026-11-18
 
 - Within the final weekly priority window, distribute new work by the effective

@@ -1,4 +1,4 @@
-# Standalone CPA quota scheduler v0.3.47.
+# Standalone CPA quota scheduler v0.3.48.
 plugins:
   enabled: true
   configs:
@@ -25,8 +25,8 @@ plugins:
       # Strict ordering remains the compatibility default.
       balanced_priority_policy: strict_deadline
       weekly_catchup_window: 48h
-      # Optional final priority for new sessions on confirmed weekly-only credentials (0s or 1h–24h).
-      # In this window, share new work by spendable weekly quota per hour left until reset.
+      # Optional final priority for new sessions and cold 5h handoffs (0s or 1h–24h).
+      # Share eligible work by spendable weekly quota per hour left until reset.
       weekly_only_priority_window: 0s
       # Combined target share before the final priority window, while usable 5h exists.
       weekly_only_catchup_share_percent: 15

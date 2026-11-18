@@ -103,7 +103,11 @@ func (s *schedulerRuntimeState) balancedSessionValidLocked(key string, binding b
 	}
 	// A long generation is active time, not idle time. Its completion renews
 	// the binding so the following tool call does not start another account.
-	if account := s.balancedAccounts[binding.AuthID]; account != nil {
+	return s.balancedSessionHasPendingLocked(key, binding.AuthID, now)
+}
+
+func (s *schedulerRuntimeState) balancedSessionHasPendingLocked(key, authID string, now time.Time) bool {
+	if account := s.balancedAccounts[authID]; account != nil {
 		for _, pending := range account.Pending {
 			if pending.Session == key && now.Sub(pending.At) < balancedPendingTTL {
 				return true

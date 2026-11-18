@@ -196,9 +196,8 @@ func (s *schedulerRuntimeState) balancedPick(req pluginapi.SchedulerPickRequest,
 			candidate.ID == binding.AuthID && (binding.AuthIndex == "" || binding.AuthIndex == snapshot.AuthIndex)) {
 			continue
 		}
-		// A live conversation stays on an available account even if another
-		// plan or weekly budget scores better. Hard quota and CPA's filtered
-		// candidates remain authoritative; soft tiers only place new sessions.
+		// Identify current affinity before testing for a safe handoff at a turn
+		// boundary. Hard quota and CPA's filtered candidates stay authoritative.
 		if bound && (choice.Eligible || s.cfg.SerialSoftContinuation) && choice.Candidate.ID == binding.AuthID &&
 			(binding.AuthIndex == "" || !found || binding.AuthIndex == snapshot.AuthIndex) {
 			copy := choice
@@ -231,23 +230,45 @@ func (s *schedulerRuntimeState) balancedPick(req pluginapi.SchedulerPickRequest,
 	adqRejected := false
 	reservation := adqReservation{}
 	var handbackDeadline time.Time
+	coldMigration := false
 	remaining := choices
-	if sticky == nil && pinned == "" && s.cfg.WeeklyOnlyPriorityWindow > 0 {
+	if sticky != nil && sticky.Priority.WeeklyUrgent {
+		// Spend the rest of this confirmed weekly cycle on the bound account.
+		// Validate and reserve it independently of how many 5h accounts recover
+		// or whether the ordinary priority tier has complete telemetry.
+		id, reserved, ok := s.adqRouteChoicesLocked(req, []serialCandidate{*sticky}, cost, now, session, sticky.Candidate.ID)
+		if ok {
+			selected, reservation = id, reserved
+			s.balancedSessionHits++
+		} else {
+			adqRejected = true
+			remaining = make([]serialCandidate, 0, len(choices)-1)
+			for _, choice := range choices {
+				if choice.Candidate.ID != sticky.Candidate.ID {
+					remaining = append(remaining, choice)
+				}
+			}
+			sticky = nil
+		}
+	}
+	canMoveCold := selected == "" && sticky != nil && directBinding && s.balancedColdWeeklyHandoffLocked(session, binding, *sticky, now)
+	if selected == "" && (sticky == nil || canMoveCold) && pinned == "" && s.cfg.WeeklyOnlyPriorityWindow > 0 {
 		var urgent, rest []serialCandidate
-		for _, choice := range choices {
-			if choice.Priority.WeeklyUrgent {
+		for _, choice := range remaining {
+			if choice.Priority.WeeklyUrgent && (!canMoveCold || s.balancedUrgentWeeklyCanTakeLocked(choice, cost, now)) {
 				urgent = append(urgent, choice)
 			} else {
 				rest = append(rest, choice)
 			}
 		}
 		if len(urgent) > 0 {
-			// Unbound placements use the deadline lane before ordinary quotas.
-			// Require an atomic debit. On failure remove these candidates from
-			// this pick so they cannot slip back through unreserved fallback.
+			// New sessions and cold 5h bindings share the same deadline weights.
+			// If this tier cannot reserve, leave an otherwise usable binding in
+			// place and do not reuse a rejected candidate without reservation.
 			id, reserved, ok, _ := s.adqRouteChoicesWithAllocationLocked(req, urgent, cost, now, session, "", adqAllocateWeeklyDeadline)
 			if ok {
 				selected, reservation = id, reserved
+				coldMigration = canMoveCold
 			} else {
 				adqRejected, remaining = true, rest
 			}
@@ -358,6 +379,9 @@ func (s *schedulerRuntimeState) balancedPick(req pluginapi.SchedulerPickRequest,
 			}
 		}
 		bindingChanged = s.bindBalancedSessionLocked(session, selected, index, now)
+		if coldMigration {
+			s.balancedWeeklyColdMigrations++
+		}
 		if !handbackDeadline.IsZero() && s.balancedSessions[session].WeeklyHandbackBy.IsZero() {
 			current := s.balancedSessions[session]
 			current.WeeklyHandbackBy = handbackDeadline
