@@ -72,7 +72,7 @@ func TestWeeklyOnlyADQReservesOnlyWeeklyAndNeverInventsFiveHourQuota(t *testing.
 	if !ok || !input.WeeklyOnly || input.FiveHourCapacity != 0 || input.FiveHourRemaining != 0 {
 		t.Fatalf("confirmed weekly-only quota fell out of atomic admission: %+v, ok=%v", input, ok)
 	}
-	id, reservation, ok, handled := s.adqRouteChoicesWithAllocationLocked(req, []serialCandidate{choice}, 1, now, "", "", true)
+	id, reservation, ok, handled := s.adqRouteChoicesWithAllocationLocked(req, []serialCandidate{choice}, 1, now, "", "", adqAllocateBalanced)
 	if !ok || !handled || id != weekly.AuthID || reservation.Weekly != 1 || reservation.FiveHour != 0 {
 		t.Fatalf("weekly-only debit not scoped to weekly quota: id=%s reservation=%+v ok=%v handled=%v", id, reservation, ok, handled)
 	}
@@ -84,7 +84,7 @@ func TestWeeklyOnlyADQReservesOnlyWeeklyAndNeverInventsFiveHourQuota(t *testing.
 		t.Fatalf("settlement fabricated a 5h debit: five=%v week=%v", five, week)
 	}
 	s.adqReservations.Release(reservation.ID)
-	_, _, ok, handled = s.adqRouteChoicesWithAllocationLocked(req, []serialCandidate{choice}, 1000, now, "", "", true)
+	_, _, ok, handled = s.adqRouteChoicesWithAllocationLocked(req, []serialCandidate{choice}, 1000, now, "", "", adqAllocateBalanced)
 	if ok || !handled {
 		t.Fatal("weekly over-reservation fell back to unreserved native selection")
 	}

@@ -435,17 +435,26 @@ func (s *schedulerRuntimeState) adqFilterChoicesLocked(choices []serialCandidate
 }
 
 func (s *schedulerRuntimeState) adqRouteChoicesLocked(req pluginapi.SchedulerPickRequest, choices []serialCandidate, cost float64, now time.Time, sessionKey, stickyAuthID string) (string, adqReservation, bool) {
-	id, reservation, ok, _ := s.adqRouteChoicesWithAllocationLocked(req, choices, cost, now, sessionKey, stickyAuthID, false)
+	id, reservation, ok, _ := s.adqRouteChoicesWithAllocationLocked(req, choices, cost, now, sessionKey, stickyAuthID, adqAllocateNative)
 	return id, reservation, ok
 }
 
+type adqAllocationMode uint8
+
+const (
+	adqAllocateNative adqAllocationMode = iota
+	adqAllocateBalanced
+	adqAllocateWeeklyDeadline
+)
+
 // handled distinguishes unavailable telemetry (legacy fallback) from an ADQ
 // admission failure. A hard rejection must never fall through unreserved.
-func (s *schedulerRuntimeState) adqRouteChoicesWithAllocationLocked(req pluginapi.SchedulerPickRequest, choices []serialCandidate, cost float64, now time.Time, sessionKey, stickyAuthID string, balanced bool) (string, adqReservation, bool, bool) {
+func (s *schedulerRuntimeState) adqRouteChoicesWithAllocationLocked(req pluginapi.SchedulerPickRequest, choices []serialCandidate, cost float64, now time.Time, sessionKey, stickyAuthID string, mode adqAllocationMode) (string, adqReservation, bool, bool) {
 	if len(choices) == 0 || s.adqReservations == nil {
 		return "", adqReservation{}, false, false
 	}
 	policy := s.adqPolicyLocked()
+	balanced := mode != adqAllocateNative
 	excluded := make(map[string]bool)
 	for len(excluded) < len(choices) {
 		available := s.adqFilterChoicesLocked(choices, excluded)
@@ -491,7 +500,7 @@ func (s *schedulerRuntimeState) adqRouteChoicesWithAllocationLocked(req pluginap
 		var allocation map[string]adqAllocationScore
 		var weights map[string]float64
 		if balanced {
-			allocation, weights = s.balancedADQAllocationLocked(available, inputs, cost, now, policy)
+			allocation, weights = s.balancedADQAllocationLocked(available, inputs, cost, now, policy, mode)
 		}
 		decision, ok := adqChooseWithAllocation(inputs, s.adqForecastDemandLocked(now), cost, policy, now, allocation)
 		if !ok {
@@ -506,6 +515,9 @@ func (s *schedulerRuntimeState) adqRouteChoicesWithAllocationLocked(req pluginap
 			FiveHour: fiveCost, Weekly: cost, TTL: policy.ReservationTimeout,
 		}, now)
 		if ok {
+			if mode == adqAllocateWeeklyDeadline {
+				decision.Reason = "按周额度重置前所需的小时消耗率分配；" + decision.Reason
+			}
 			decision.ReservationID = reservation.ID
 			decision.ReservationFiveHour = reservation.FiveHour
 			decision.ReservationWeekly = reservation.Weekly

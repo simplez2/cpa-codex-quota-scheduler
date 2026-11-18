@@ -67,6 +67,71 @@ func TestBalancedPlacesNewSessionsOnUrgentWeeklyWithoutMovingLiveBinding(t *test
 	}
 }
 
+func deadlinePaceFixture(t *testing.T) (*schedulerRuntimeState, pluginapi.SchedulerPickRequest, time.Time) {
+	t.Helper()
+	s, req, now := urgentWeeklyFixture(t)
+	s.cfg.StickySeconds = 0
+	for _, entry := range []struct {
+		id   string
+		used float64
+		left time.Duration
+	}{{"weekly-backup", 18, 18 * time.Hour}, {"weekly-second", 58, 3 * time.Hour}} {
+		q := s.quotas[entry.id]
+		q.Windows[0].UsedPercent, q.Windows[0].ResetAt = entry.used, now.Add(entry.left)
+		s.quotas[entry.id], s.quotaNative[entry.id] = q, q
+	}
+	return s, req, now
+}
+
+func TestBalancedWeeklyDeadlineDistributesWorkByRequiredPace(t *testing.T) {
+	resetBanStoreForTest()
+	defer resetBanStoreForTest()
+	s, req, now := deadlinePaceFixture(t)
+	work := map[string]float64{}
+	picks := map[string]int{}
+	s.globalCostSamples = make([]float64, minimumQuantileSamples)
+	for i := 0; i < 240; i++ {
+		cost := []float64{.01, .04, .02}[i%3]
+		for j := range s.globalCostSamples {
+			s.globalCostSamples[j] = cost
+		}
+		got := s.balancedPick(req, now)
+		if got.Reject || (got.AuthID != "weekly-backup" && got.AuthID != "weekly-second") {
+			t.Fatalf("request %d escaped the eligible deadline tier: %+v", i, got)
+		}
+		decision := s.adqLastDecision
+		work[got.AuthID] += decision.ReservationWeekly
+		picks[got.AuthID]++
+		// Isolate allocation at fixed native readings. Settlement is exercised
+		// separately and must not be needed to obtain cost-weighted shares.
+		s.adqReservations.Release(decision.ReservationID)
+		s.balancedAccounts[got.AuthID].Pending = nil
+	}
+	// Ready headroom is 80 units in 18h vs. 40 in 3h: target pace ratio 1:3.
+	share := work["weekly-second"] / (work["weekly-backup"] + work["weekly-second"])
+	t.Logf("earlier reset: %.2f%% of reserved work, picks=%v", share*100, picks)
+	if share < .735 || share > .765 {
+		t.Fatalf("required pace did not determine reserved work: got %v", work)
+	}
+}
+
+func TestBalancedWeeklyDeadlineRecalculatesForReservedWork(t *testing.T) {
+	resetBanStoreForTest()
+	defer resetBanStoreForTest()
+	s, req, now := deadlinePaceFixture(t)
+	s.adqReservations.SetCapacity("weekly-second", 0, 40)
+	reservation, ok := s.adqReservations.TryReserve(adqReservationRequest{AuthID: "weekly-second", Weekly: 32}, now)
+	if !ok {
+		t.Fatal("fixture could not reserve ongoing work")
+	}
+	defer s.adqReservations.Release(reservation.ID)
+	// Only eight of the 40 units are uncommitted on weekly-second. Its new
+	// rate drops to 8/3, below the other credential's 80/18.
+	if got := s.balancedPick(req, now); got.Reject || got.AuthID != "weekly-backup" {
+		t.Fatalf("already committed work got counted twice: %+v", got)
+	}
+}
+
 func TestBalancedUrgentWeeklyFallsBackWithoutCrossingAdmissionBoundaries(t *testing.T) {
 	for _, state := range []string{"unreservable", "unreservable_without_alternative", "stale", "outside", "window_elapsed", "absent_unconfirmed", "not_in_host_candidates"} {
 		t.Run(state, func(t *testing.T) {

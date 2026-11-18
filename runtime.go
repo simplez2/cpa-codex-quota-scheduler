@@ -2458,6 +2458,10 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 		item.Runway = runwayByAuth[canonical]
 		budgetChoice := inspectSerialCandidate(pluginapi.SchedulerAuthCandidate{ID: canonical}, snapshot, true, cfg, now)
 		item.SelectionPriority = quotaPriorityStatus(budgetChoice, cfg, now)
+		if budgetChoice.Priority.WeeklyUrgent && item.ADQ != nil && item.ADQ.Eligible {
+			horizon, _ := weeklyResetHorizon(budgetChoice, cfg, now)
+			item.SelectionPriority.WeeklyDeadlineUnitsPerHour = weeklyDeadlinePace(item.ADQ.WEffective, horizon)
+		}
 		selectionPriorities[canonical] = budgetChoice.Priority
 		if item.Eligible && (cfg.SchedulerMode == "serial" || cfg.SchedulerMode == "balanced") &&
 			!cfg.SerialSoftContinuation && budgetChoice.Reason == "serial_threshold" {

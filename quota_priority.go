@@ -161,11 +161,12 @@ func nextQuotaPriorityGroup(choices []serialCandidate, cfg pluginConfig, now tim
 }
 
 type runtimeQuotaPriorityStatus struct {
-	Rank    int    `json:"rank"`
-	Window  string `json:"window"`
-	Reason  string `json:"reason"`
-	ResetAt string `json:"reset_at,omitempty"`
-	Cached  bool   `json:"cached"`
+	Rank                       int     `json:"rank"`
+	Window                     string  `json:"window"`
+	Reason                     string  `json:"reason"`
+	ResetAt                    string  `json:"reset_at,omitempty"`
+	Cached                     bool    `json:"cached"`
+	WeeklyDeadlineUnitsPerHour float64 `json:"weekly_deadline_units_per_hour,omitempty"`
 }
 
 func quotaPriorityStatus(choice serialCandidate, cfg pluginConfig, now time.Time) runtimeQuotaPriorityStatus {

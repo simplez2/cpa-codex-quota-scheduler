@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.47 — 2026-11-18
+
+- Within the final weekly priority window, distribute new work by the effective
+  weekly quota left per hour until reset. Include the weekly reserve and
+  outstanding debits; bound the denominator at 30 minutes. Report the target
+  rate per credential in scheduler status. Keep the same admission and affinity rules.
+
 ## 0.3.46 — 2026-11-18
 
 - Allow reset-weighted routing to prioritize confirmed weekly-only headroom for

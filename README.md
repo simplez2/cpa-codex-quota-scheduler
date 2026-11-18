@@ -5,7 +5,7 @@
 
 Standalone CPA plugin for balanced concurrent or serial Codex account selection, native quota polling,
 5h/weekly/monthly windows, persistent 429 quarantine and optional warmup.
-Source version: **0.3.46**. Published platform builds and checksums are available
+Source version: **0.3.47**. Published platform builds and checksums are available
 from [GitHub Releases](https://github.com/simplez2/cpa-codex-quota-scheduler/releases).
 See [CPA permissions and compatibility](CPA_PERMISSIONS.md) before installation.
 
@@ -312,6 +312,10 @@ deferred handback. Later turns do not extend this deadline. The continuation
 still needs a free slot and an atomic weekly reservation. With
 `weekly_only_priority_window` set to 1h–24h, reset weighting first tries
 confirmed weekly-only credentials in that final window for unbound sessions.
+Their target share of new work is proportional to spendable weekly quota per
+hour until reset. Spendable quota excludes the configured reserve and outstanding
+debits, and the rate uses a minimum 30-minute horizon. The scheduler status
+reports the rate as `weekly_deadline_units_per_hour` under `selection_priority`.
 Selection still requires an atomic reservation; if the account is busy or
 cannot reserve quota, other eligible credentials can serve the request. Set
 `0s` (the default) to keep only proportional catch-up. A

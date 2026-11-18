@@ -81,13 +81,21 @@ func balancedWeightWithQuota(choice serialCandidate, cfg pluginConfig, now time.
 
 // Compute a tentative fair-share round. Only a successful ADQ reservation
 // commits these credits; collision retries cannot mint additional credit.
-func (s *schedulerRuntimeState) balancedADQAllocationLocked(choices []serialCandidate, inputs []adqAccountInput, cost float64, now time.Time, policy adqPolicy) (map[string]adqAllocationScore, map[string]float64) {
+func (s *schedulerRuntimeState) balancedADQAllocationLocked(choices []serialCandidate, inputs []adqAccountInput, cost float64, now time.Time, policy adqPolicy, mode adqAllocationMode) (map[string]adqAllocationScore, map[string]float64) {
 	weights := make(map[string]float64, len(inputs))
 	weeklyOnly := make(map[string]bool)
 	total := 0.0
 	for i, input := range inputs {
 		metrics := adqAssessAccount(input, policy, now)
 		if !metrics.Eligible {
+			continue
+		}
+		if mode == adqAllocateWeeklyDeadline {
+			// Use effective work units, not raw percentages or plan multipliers
+			// a second time. Existing sessions also consume this headroom, so
+			// their real burn feeds back into the next new-session placement.
+			horizon, _ := weeklyResetHorizon(choices[i], s.cfg, now)
+			weights[input.ID] = weeklyDeadlinePace(metrics.WEffective, horizon)
 			continue
 		}
 		five, weekly := 100.0, 100.0
@@ -103,7 +111,9 @@ func (s *schedulerRuntimeState) balancedADQAllocationLocked(choices []serialCand
 			weeklyOnly[input.ID] = true
 		}
 	}
-	capBalancedCatchupWeights(weights, weeklyOnly, s.cfg)
+	if mode != adqAllocateWeeklyDeadline {
+		capBalancedCatchupWeights(weights, weeklyOnly, s.cfg)
+	}
 	for _, weight := range weights {
 		total += weight
 	}
@@ -235,7 +245,7 @@ func (s *schedulerRuntimeState) balancedPick(req pluginapi.SchedulerPickRequest,
 			// Unbound placements use the deadline lane before ordinary quotas.
 			// Require an atomic debit. On failure remove these candidates from
 			// this pick so they cannot slip back through unreserved fallback.
-			id, reserved, ok, _ := s.adqRouteChoicesWithAllocationLocked(req, urgent, cost, now, session, "", true)
+			id, reserved, ok, _ := s.adqRouteChoicesWithAllocationLocked(req, urgent, cost, now, session, "", adqAllocateWeeklyDeadline)
 			if ok {
 				selected, reservation = id, reserved
 			} else {
@@ -273,7 +283,7 @@ func (s *schedulerRuntimeState) balancedPick(req pluginapi.SchedulerPickRequest,
 				return ""
 			}
 			return groupSticky.Candidate.ID
-		}(), true)
+		}(), adqAllocateBalanced)
 		if adqOK {
 			// ADQ commits the policy's fair-share round only after reservation;
 			// the fallback cannot overwrite this decision or double-credit it.

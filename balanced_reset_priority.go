@@ -104,6 +104,17 @@ func weeklyOnlyUrgent(choice serialCandidate, cfg pluginConfig, now time.Time) b
 	return known && horizon <= cfg.WeeklyOnlyPriorityWindow
 }
 
+// The final half hour shares one denominator. This bounds the influence of
+// small reset timestamp differences without treating a passed reset as a refill.
+const weeklyDeadlinePaceFloor = 30 * time.Minute
+
+func weeklyDeadlinePace(effective float64, horizon time.Duration) float64 {
+	if !finiteADQ(effective) || effective <= 0 || horizon <= 0 {
+		return 0
+	}
+	return effective / max(weeklyDeadlinePaceFloor, horizon).Hours()
+}
+
 const balancedWeeklyHandbackGrace = 5 * time.Minute
 
 // Give a hot weekly fallback one short handback window after 5h becomes
