@@ -136,7 +136,7 @@ func (s *schedulerRuntimeState) quotaProbeReason(id string, now time.Time) strin
 	// advances successful observations; failed calls keep their own backoff.
 	warmupDue := p.Failures == 0 && p.Error == "" && !p.AttemptedAt.IsZero() &&
 		s.warmupQuotaProbeDue(id, cfg, q, p, phase, now)
-	catchupDue := p.CatchupPending && balancedResetWeighted(cfg) && weeklyCatchupProbeHorizon(cfg) > 0
+	catchupDue := p.CatchupPending && balancedResetWeighted(cfg) && (weeklyCatchupProbeHorizon(cfg) > 0 || capacityDeadlineEnabled(cfg))
 	if now.Before(p.NextAt) && !rotationUrgent && !warmupDue && !(catchupDue && p.Failures == 0 && p.Error == "") {
 		return ""
 	}

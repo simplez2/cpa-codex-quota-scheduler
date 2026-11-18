@@ -106,7 +106,7 @@ import (
 
 const (
 	pluginName    = "codex-quota-scheduler"
-	pluginVersion = "0.3.49"
+	pluginVersion = "0.3.50"
 
 	// providerCodex is the CPA provider key for OpenAI Codex (ChatGPT backend).
 	providerCodex = "codex"
@@ -680,7 +680,8 @@ func pluginRegistration() registration {
 				{Name: "serial_5h_switch_percent", Type: pluginapi.ConfigFieldTypeNumber, Description: "Custom 5h used-percent handoff threshold when serial_5h_handoff_mode is custom_threshold. Defaults to the global serial_switch_percent when omitted."},
 				{Name: "serial_prefer_active_cycle", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Prefer an already-started quota cycle when choosing the next serial auth."},
 				{Name: "serial_allocation_policy", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"sustainable", "weekly_remaining"}, Description: "Weekly allocation policy for both serial and balanced modes. sustainable uses remaining weekly quota divided by time until reset; weekly_remaining uses remaining weekly fraction. Balanced weights also include plan capacity and 5h headroom; existing session affinity remains authoritative."},
-				{Name: "balanced_priority_policy", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"strict_deadline", "reset_weighted"}, Description: "Balanced mode only: strict_deadline retains pool/deadline groups; reset_weighted shares work across usable 5h credentials with bounded reset urgency, allowing limited weekly-only catch-up near weekly reset. Existing session affinity and quota gates remain authoritative."},
+				{Name: "balanced_priority_policy", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"strict_deadline", "reset_weighted", "capacity_deadline"}, Description: "Balanced placement: strict order, reset weights, or capacity_deadline for constrained 5h tranches and flexible weekly stock."},
+				{Name: "collective_reset_window", Type: pluginapi.ConfigFieldTypeString, Description: "Optional capacity_deadline forecast: earliest/latest RFC3339 instants with timezones; equal for an exact time, up to 24h apart. No forecast by default. This never grants quota or redeems a credit."},
 				{Name: "weekly_catchup_window", Type: pluginapi.ConfigFieldTypeString, Description: "Weekly reset catch-up horizon for reset_weighted mode, between 1h and 168h; default 48h. Only confirmed future weekly resets receive urgency."},
 				{Name: "weekly_only_priority_window", Type: pluginapi.ConfigFieldTypeString, Description: "In reset_weighted mode, prioritize confirmed weekly-only accounts during their final 1h to 24h for new sessions and eligible cold 5h handoffs. Usable urgent weekly bindings are retained. Set 0s (default) to disable."},
 				{Name: "weekly_only_catchup_share_percent", Type: pluginapi.ConfigFieldTypeNumber, Description: "Combined weekly-only target share of new-session allocation during proportional catch-up while 5h quota is usable, between 0 and 40 percent; default 15. Zero disables proportional catch-up, independently of the final priority window. Full weekly-only fallback remains available when 5h quota cannot admit requests."},

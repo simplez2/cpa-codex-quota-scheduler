@@ -1758,6 +1758,7 @@ type runtimeStatus struct {
 	SerialWeeklyRebalance         serialWeeklyRebalanceState       `json:"serial_weekly_rebalance"`
 	SerialAllocationPolicy        string                           `json:"serial_allocation_policy"`
 	BalancedPriorityPolicy        string                           `json:"balanced_priority_policy"`
+	CollectiveResetWindow         string                           `json:"collective_reset_window,omitempty"`
 	WeeklyCatchupWindow           string                           `json:"weekly_catchup_window"`
 	WeeklyOnlyPriorityWindow      string                           `json:"weekly_only_priority_window"`
 	WeeklyOnlyCatchupSharePercent float64                          `json:"weekly_only_catchup_share_percent"`
@@ -2693,6 +2694,7 @@ func (s *schedulerRuntimeState) status() runtimeStatus {
 		SerialAllocationPolicy:        cfg.SerialAllocationPolicy,
 		BalancedPriorityPolicy:        cfg.BalancedPriorityPolicy,
 		WeeklyCatchupWindow:           cfg.WeeklyCatchupWindow.String(),
+		CollectiveResetWindow:         cfg.CollectiveResetWindow,
 		WeeklyOnlyPriorityWindow:      cfg.WeeklyOnlyPriorityWindow.String(),
 		WeeklyOnlyCatchupSharePercent: cfg.WeeklyOnlyCatchupSharePercent,
 		SerialBudgetRebalancePercent:  cfg.SerialBudgetRebalancePercent,

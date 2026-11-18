@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.50 — 2026-11-19
+
+- Add an opt-in capacity/deadline policy for dual-limited and weekly-only accounts. Compare current 5h stock against later refill opportunities, preserve confirmed natural weekly sprints, and handle an optional uncertain group reset or an already scheduled account-specific reset card without crediting either as supply.
+
 ## 0.3.49 — 2026-11-19
 
 - Place flexible urgent weekly work on the earliest spendable reset group.

@@ -105,7 +105,7 @@ func compareQuotaPriority(a, b quotaSelectionPriority) int {
 // using a weekly-only backup must yield when usable, higher-priority 5h quota
 // returns. A plan name alone never establishes either quota class.
 func quotaAffinityMustYield(current serialCandidate, choices []serialCandidate, cfg pluginConfig) bool {
-	if !current.QuotaKnown || current.FiveHourKnown || current.Priority.WeeklyCatchup || current.Priority.WeeklyUrgent {
+	if !current.QuotaKnown || current.FiveHourKnown || current.Priority.WeeklyCatchup || current.Priority.WeeklyUrgent || current.flexSprint {
 		return false
 	}
 	for _, choice := range choices {

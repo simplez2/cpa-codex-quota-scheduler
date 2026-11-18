@@ -1,4 +1,4 @@
-# Standalone CPA quota scheduler v0.3.49.
+# Standalone CPA quota scheduler v0.3.50.
 plugins:
   enabled: true
   configs:
@@ -24,6 +24,8 @@ plugins:
       # Opt into reset_weighted with scheduler_mode: balanced for fair sharing.
       # Strict ordering remains the compatibility default.
       balanced_priority_policy: strict_deadline
+      # capacity_deadline supports an optional earliest/latest interval with timezone.
+      collective_reset_window: ""
       weekly_catchup_window: 48h
       # Optional final priority for new sessions and cold 5h handoffs (0s or 1h–24h).
       # Among the earliest spendable resets, balance by required pace and recent work.

@@ -28,6 +28,7 @@ func rotationSampleHorizon(cfg pluginConfig) time.Duration {
 
 func (s *schedulerRuntimeState) observeRotationQuotaLocked(snapshot quotaSnapshot, now time.Time) {
 	s.rotationRunway.maxSampleGap = rotationSampleHorizon(s.cfg)
+	s.rotationRunway.trackCapacityIntervals = capacityDeadlineEnabled(s.cfg)
 	s.rotationRunway.Observe(snapshot, now)
 }
 

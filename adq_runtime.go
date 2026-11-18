@@ -445,6 +445,7 @@ const (
 	adqAllocateNative adqAllocationMode = iota
 	adqAllocateBalanced
 	adqAllocateWeeklyDeadline
+	adqAllocateOpportunity
 )
 
 // handled distinguishes unavailable telemetry (legacy fallback) from an ADQ
@@ -525,6 +526,15 @@ func (s *schedulerRuntimeState) adqRouteChoicesWithAllocationLocked(req pluginap
 		if ok {
 			if mode == adqAllocateWeeklyDeadline {
 				decision.Reason = "在最早一批周重置中按所需消耗速度和近期已分配工作量选择凭证。"
+			} else if mode == adqAllocateOpportunity {
+				switch available[0].opportunityTier {
+				case 1:
+					decision.Reason = "优先使用错过本轮 5h 后无法在截止前补用的额度。"
+				case 2:
+					decision.Reason = "既有到期用卡计划临近，优先使用该账号当前可预留的额度。"
+				case 3:
+					decision.Reason = "集体重置预估区间临近，按各账号本轮实际可用额度分配。"
+				}
 			}
 			decision.ReservationID = reservation.ID
 			decision.ReservationFiveHour = reservation.FiveHour
@@ -545,7 +555,7 @@ func (s *schedulerRuntimeState) adqRouteChoicesWithAllocationLocked(req pluginap
 					if score, found := allocation[input.ID]; found {
 						if account := s.balancedAccounts[available[i].Candidate.ID]; account != nil {
 							account.Weight = weights[input.ID]
-							if mode == adqAllocateBalanced {
+							if mode == adqAllocateBalanced || mode == adqAllocateOpportunity {
 								account.Credit = score.Credit
 							}
 						}

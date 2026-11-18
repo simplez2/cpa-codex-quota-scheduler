@@ -15,7 +15,8 @@ export function continuitySummary(status) {
   return action+(reason?' · '+reason:'');
 }
 export const fields = [
-	['balanced_priority_policy','均衡优先级策略','allocation','select','仅均衡模式生效。重置加权在可用 5h 账号之间分配预计消耗，周重置临近时适度加权；严格顺序保留原有按额度池和最早重置先用的规则。已有可用会话保持绑定。', [['strict_deadline','严格按重置顺序'],['reset_weighted','均衡分配与周重置补耗']]],
+	['balanced_priority_policy','均衡优先级策略','allocation','select','按可用容量和截止时间调度：平时先用双限额号，临近自然周重置时使用纯周额度；有活动预告时，再计算哪些 5h 额度必须提前用。', [['strict_deadline','严格按重置顺序'],['reset_weighted','均衡分配与周重置补耗'],['capacity_deadline','按可用容量和截止时间']]],
+	['collective_reset_window','集体重置预估区间','allocation','text','仅在知道活动时间时填写“最早/最晚”，两端都带时区，例如 2026-12-01T18:00:00+08:00/2026-12-01T20:00:00+08:00。最多相隔 24 小时，时间确定可填相同值。留空时按账号自然周期调度。'],
 	['weekly_catchup_window','周重置前补耗窗口','allocation','duration','重置加权模式生效。默认 48 小时，可设 1 至 168 小时；按确认的周重置时间计算，不使用令牌过期时间。5h 账号的周重置加权最高 2 倍。'],
 	['weekly_only_priority_window','周重置前新会话优先窗口','allocation','duration','仅重置加权模式生效。可设 1 至 24 小时，0 秒关闭。在此窗口内，确认仅有周限额且本轮有额度可预留的账号优先接新会话。已有可用会话继续保持绑定。'],
 	['weekly_only_catchup_share_percent','周线号补耗目标份额','allocation','number','默认 15%，可设 0 至 40%。在新会话优先窗口之外，有可用 5h 额度时，这是临近周重置的周线号合计占新会话预计消耗的目标份额。0 关闭按比例补耗。5h 额度不足时仍可完整兜底。',0,40,1],

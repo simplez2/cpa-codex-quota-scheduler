@@ -8,7 +8,7 @@ import (
 )
 
 func balancedResetWeighted(cfg pluginConfig) bool {
-	return cfg.SchedulerMode == "balanced" && cfg.BalancedPriorityPolicy == "reset_weighted"
+	return cfg.SchedulerMode == "balanced" && (cfg.BalancedPriorityPolicy == "reset_weighted" || cfg.BalancedPriorityPolicy == "capacity_deadline")
 }
 
 func weeklyCatchupProbeHorizon(cfg pluginConfig) time.Duration {
@@ -28,7 +28,9 @@ func (s *schedulerRuntimeState) requestWeeklyCatchupProbesLocked(now time.Time) 
 		return
 	}
 	horizonLimit := weeklyCatchupProbeHorizon(s.cfg)
-	if horizonLimit <= 0 {
+	capacity := capacityDeadlineEnabled(s.cfg)
+	_, burst := s.collectiveHorizonLocked(now)
+	if horizonLimit <= 0 && !capacity {
 		return
 	}
 	age := max(time.Second, min(5*time.Minute, s.cfg.StaleAfter/2))
@@ -43,7 +45,15 @@ func (s *schedulerRuntimeState) requestWeeklyCatchupProbesLocked(now time.Time) 
 		}
 		choice := inspectSerialCandidate(pluginapi.SchedulerAuthCandidate{ID: id}, q, true, s.cfg, now)
 		horizon, known := weeklyResetHorizon(choice, s.cfg, now)
-		if !known || horizon > horizonLimit || !choice.Eligible || choice.FiveHourKnown || choice.WeeklyProtected {
+		forecast := capacity && burst && !s.credentialSawRefillLocked(choice, now)
+		card := time.Time{}
+		if capacity {
+			card = s.plannedCardLocked(choice, now)
+		}
+		if (!known || horizon > horizonLimit) && !forecast && (card.IsZero() || card.Sub(now) > 5*time.Hour) {
+			continue
+		}
+		if !choice.Eligible || choice.FiveHourKnown || choice.WeeklyProtected {
 			continue
 		}
 		if s.quotaPolls == nil {
@@ -86,6 +96,9 @@ func weeklyOnlyCatchup(choice serialCandidate, cfg pluginConfig, now time.Time) 
 		return false
 	}
 	horizon, known := weeklyResetHorizon(choice, cfg, now)
+	if capacityDeadlineEnabled(cfg) && cfg.WeeklyCatchupWindow > cfg.WeeklyOnlyPriorityWindow && horizon >= cfg.WeeklyCatchupWindow {
+		return false
+	}
 	return known && horizon <= cfg.WeeklyCatchupWindow
 }
 
@@ -119,7 +132,7 @@ func weeklyDeadlinePace(effective float64, horizon time.Duration) float64 {
 // a source that is also spending down a confirmed final weekly window.
 // The caller already excluded CPA's request-scoped credential pins.
 func (s *schedulerRuntimeState) balancedColdWeeklyHandoffLocked(session string, binding balancedSessionBinding, source serialCandidate, now time.Time) bool {
-	if !balancedResetWeighted(s.cfg) || s.cfg.WeeklyOnlyPriorityWindow <= 0 || session == "" ||
+	if !balancedResetWeighted(s.cfg) || (s.cfg.WeeklyOnlyPriorityWindow <= 0 && !capacityDeadlineEnabled(s.cfg)) || session == "" ||
 		!source.Eligible || !source.FiveHourKnown || binding.AuthID != source.Candidate.ID ||
 		binding.AuthIndex == "" || binding.AuthIndex != source.Snapshot.AuthIndex ||
 		adqCacheState(now.Sub(binding.LastUsedAt), s.adqPolicyLocked()) != "cold" {

@@ -25,6 +25,7 @@ type quotaRunwaySample struct {
 }
 
 type quotaRunwayObservation struct {
+	intervals     []capacityInterval
 	observedAt    time.Time
 	resetAt       time.Time
 	windowSeconds int64
@@ -39,8 +40,9 @@ type quotaRunwayObservation struct {
 // Neither these rates nor the two-minute forecast represent an inflight count,
 // an absolute account capacity, or a guarantee about the next request's cost.
 type quotaRunwayTracker struct {
-	bindings map[string]string
-	windows  map[quotaRunwayKey]quotaRunwayObservation
+	trackCapacityIntervals bool
+	bindings               map[string]string
+	windows                map[quotaRunwayKey]quotaRunwayObservation
 	// A separate diagnostic tracker may follow a slower polling cadence. The
 	// admission/reserve tracker keeps its original short horizon.
 	maxSampleGap time.Duration
@@ -169,6 +171,17 @@ func (t *quotaRunwayTracker) Observe(snapshot quotaSnapshot, now time.Time) {
 			previous.ewma = 0
 		}
 		delta := window.UsedPercent - previous.usedPercent
+		if class == "weekly" && t.trackCapacityIntervals {
+			// Separate from positive burn samples: a flat reading is evidence of
+			// zero service, not permission to project the last burst.
+			for len(previous.intervals) > 0 && previous.intervals[0].end.Before(window.ObservedAt.Add(-10*time.Minute)) {
+				previous.intervals = previous.intervals[1:]
+			}
+			previous.intervals = append(previous.intervals, capacityInterval{previous.observedAt, window.ObservedAt, delta})
+			if len(previous.intervals) > 128 {
+				previous.intervals = previous.intervals[len(previous.intervals)-128:]
+			}
+		}
 		if delta > 0 {
 			rate := delta / elapsed.Hours()
 			if math.IsNaN(rate) || math.IsInf(rate, 0) || rate <= 0 {

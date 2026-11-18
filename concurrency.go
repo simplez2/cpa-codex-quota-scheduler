@@ -419,6 +419,7 @@ func (s *schedulerRuntimeState) concurrencyPreferred(req pluginapi.SchedulerPick
 			snapshot = s.serialConservativeQuotaLocked(snapshot, now)
 		}
 		choice := inspectSerialCandidate(candidate, snapshot, found, cfg, now)
+		choice.flexSprint = s.capacityFlexHoldLocked(choice, now)
 		if serialPinnedAuthID(req) == "" && normalizeSerialSelectionSource(s.serialSelectionSource) != "manual" &&
 			s.quotaAffinityMustYieldLocked(choice, req, now) {
 			return ""
@@ -427,16 +428,21 @@ func (s *schedulerRuntimeState) concurrencyPreferred(req pluginapi.SchedulerPick
 		if stickyEligible && banStore.schedulable(candidate.ID, now) && !s.adqProviderCircuitActiveLockedForConcurrency(candidate, now) {
 			if directBinding && s.balancedColdWeeklyHandoffLocked(session, binding, choice, now) {
 				cost := max(.001, s.predictCostLocked(req, false))
+				var offers []serialCandidate
 				for _, offer := range req.Candidates {
-					if offer.ID == preferred || !banStore.schedulable(offer.ID, now) || s.adqProviderCircuitActiveLockedForConcurrency(offer, now) {
+					if !banStore.schedulable(offer.ID, now) || s.adqProviderCircuitActiveLockedForConcurrency(offer, now) ||
+						!s.concurrencyOfferAvailableLocked(req, offer, cfg, now) {
 						continue
 					}
 					q, found := s.lookupQuotaLocked(offer.ID, candidateAuthIndex(offer))
 					q = s.serialConservativeQuotaLocked(q, now)
-					if s.balancedUrgentWeeklyCanTakeLocked(inspectSerialCandidate(offer, q, found, cfg, now), cost, now) &&
-						s.concurrencyOfferAvailableLocked(req, offer, cfg, now) {
-						// A queue for another session on the old credential
-						// must not hide an available weekly handoff.
+					offers = append(offers, inspectSerialCandidate(offer, q, found, cfg, now))
+				}
+				for _, tier := range s.placementTiersLocked(offers, cost, now, preferred) {
+					if len(tier.choices) > 0 && tier.choices[0].Candidate.ID == preferred {
+						return preferred
+					}
+					if len(tier.choices) > 0 {
 						return ""
 					}
 				}

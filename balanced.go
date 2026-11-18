@@ -87,6 +87,8 @@ func balancedWeightWithQuota(choice serialCandidate, cfg pluginConfig, now time.
 func (s *schedulerRuntimeState) balancedADQAllocationLocked(choices []serialCandidate, inputs []adqAccountInput, cost float64, now time.Time, policy adqPolicy) (map[string]adqAllocationScore, map[string]float64) {
 	weights := make(map[string]float64, len(inputs))
 	weeklyOnly := make(map[string]bool)
+	opportunity := len(choices) > 0 && choices[0].opportunityTier > 0
+	maxRamp := 0.
 	total := 0.0
 	for i, input := range inputs {
 		metrics := adqAssessAccount(input, policy, now)
@@ -101,12 +103,20 @@ func (s *schedulerRuntimeState) balancedADQAllocationLocked(choices []serialCand
 			weekly = 100 * metrics.WEffective / metrics.W
 		}
 		weight := balancedWeightWithQuota(choices[i], s.cfg, now, five, weekly)
+		if opportunity {
+			weight = choices[i].opportunityWeight
+		}
 		weights[input.ID] = weight
 		if metrics.WeeklyOnly {
 			weeklyOnly[input.ID] = true
+			if capacityDeadlineEnabled(s.cfg) {
+				maxRamp = max(maxRamp, catchupCapacityRamp(choices[i], s.cfg, now))
+			}
 		}
 	}
-	capBalancedCatchupWeights(weights, weeklyOnly, s.cfg)
+	if !opportunity {
+		capPlacementCatchup(weights, weeklyOnly, s.cfg, maxRamp)
+	}
 	for _, weight := range weights {
 		total += weight
 	}
@@ -182,6 +192,7 @@ func (s *schedulerRuntimeState) balancedPick(req pluginapi.SchedulerPickRequest,
 		snapshot, found := s.lookupQuotaLocked(candidate.ID, candidateAuthIndex(candidate))
 		snapshot = s.serialConservativeQuotaLocked(snapshot, now)
 		choice := inspectSerialCandidate(candidate, snapshot, found, s.cfg, now)
+		choice.flexSprint = s.capacityFlexHoldLocked(choice, now)
 		if !choice.Eligible && choice.Reason != "serial_threshold" {
 			continue
 		}
@@ -225,7 +236,7 @@ func (s *schedulerRuntimeState) balancedPick(req pluginapi.SchedulerPickRequest,
 	var handbackDeadline time.Time
 	coldMigration := false
 	remaining := choices
-	if sticky != nil && sticky.Priority.WeeklyUrgent {
+	if sticky != nil && (sticky.Priority.WeeklyUrgent || sticky.flexSprint) {
 		// Spend the rest of this confirmed weekly cycle on the bound account.
 		// Validate and reserve it independently of how many 5h accounts recover
 		// or whether the ordinary priority tier has complete telemetry.
@@ -245,25 +256,46 @@ func (s *schedulerRuntimeState) balancedPick(req pluginapi.SchedulerPickRequest,
 		}
 	}
 	canMoveCold := selected == "" && sticky != nil && directBinding && s.balancedColdWeeklyHandoffLocked(session, binding, *sticky, now)
-	if selected == "" && (sticky == nil || canMoveCold) && pinned == "" && s.cfg.WeeklyOnlyPriorityWindow > 0 {
-		var urgent, rest []serialCandidate
-		for _, choice := range remaining {
-			if choice.Priority.WeeklyUrgent && (!canMoveCold || s.balancedUrgentWeeklyCanTakeLocked(choice, cost, now)) {
-				urgent = append(urgent, choice)
-			} else {
-				rest = append(rest, choice)
+	if selected == "" && (sticky == nil || canMoveCold) && pinned == "" && (s.cfg.WeeklyOnlyPriorityWindow > 0 || capacityDeadlineEnabled(s.cfg)) {
+		source := ""
+		if canMoveCold {
+			source = binding.AuthID
+		}
+		failed := map[string]bool{}
+		for _, tier := range s.placementTiersLocked(remaining, cost, now, source) {
+			var group []serialCandidate
+			for _, c := range tier.choices {
+				if !failed[c.Candidate.ID] {
+					group = append(group, c)
+				}
+			}
+			if len(group) == 0 {
+				continue
+			}
+			id, r, ok, _ := s.adqRouteChoicesWithAllocationLocked(req, group, cost, now, session, "", tier.mode)
+			if ok {
+				selected, reservation = id, r
+				coldMigration = canMoveCold && source != id
+				if canMoveCold && source == id {
+					s.balancedSessionHits++
+				}
+				break
+			}
+			adqRejected = true
+			for _, c := range group {
+				failed[c.Candidate.ID] = true
 			}
 		}
-		if len(urgent) > 0 {
-			// New sessions and cold 5h bindings share the same deadline weights.
-			// If this tier cannot reserve, leave an otherwise usable binding in
-			// place and do not reuse a rejected candidate without reservation.
-			id, reserved, ok, _ := s.adqRouteChoicesWithAllocationLocked(req, urgent, cost, now, session, "", adqAllocateWeeklyDeadline)
-			if ok {
-				selected, reservation = id, reserved
-				coldMigration = canMoveCold
-			} else {
-				adqRejected, remaining = true, rest
+		if selected == "" && len(failed) > 0 {
+			var rest []serialCandidate
+			for _, c := range remaining {
+				if !failed[c.Candidate.ID] {
+					rest = append(rest, c)
+				}
+			}
+			remaining = rest
+			if sticky != nil && failed[sticky.Candidate.ID] {
+				sticky = nil
 			}
 		}
 	}
@@ -317,13 +349,17 @@ func (s *schedulerRuntimeState) balancedPick(req pluginapi.SchedulerPickRequest,
 			continue
 		} else {
 			weights, weeklyOnly := map[string]float64{}, map[string]bool{}
+			maxRamp := 0.
 			for _, choice := range group {
 				weights[choice.Candidate.ID] = balancedWeight(choice, s.cfg, now)
 				if !choice.FiveHourKnown && choice.QuotaKnown {
 					weeklyOnly[choice.Candidate.ID] = true
+					if capacityDeadlineEnabled(s.cfg) {
+						maxRamp = max(maxRamp, catchupCapacityRamp(choice, s.cfg, now))
+					}
 				}
 			}
-			capBalancedCatchupWeights(weights, weeklyOnly, s.cfg)
+			capPlacementCatchup(weights, weeklyOnly, s.cfg, maxRamp)
 			total := 0.0
 			for _, choice := range group {
 				s.balancedAccounts[choice.Candidate.ID].Weight = weights[choice.Candidate.ID]

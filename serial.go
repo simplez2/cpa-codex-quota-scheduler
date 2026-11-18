@@ -30,6 +30,9 @@ const (
 // mode keeps a global primary for unkeyed requests and independent bindings
 // for conversations, while quota safety and ranking choose eligible handoffs.
 type serialCandidate struct {
+	opportunityWeight   float64
+	opportunityTier     int
+	flexSprint          bool
 	Candidate           pluginapi.SchedulerAuthCandidate
 	Snapshot            quotaSnapshot
 	QuotaKnown          bool

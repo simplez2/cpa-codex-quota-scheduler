@@ -37,6 +37,9 @@ type pluginConfig struct {
 	SerialSoftContinuation        bool
 	SerialAllocationPolicy        string
 	BalancedPriorityPolicy        string
+	CollectiveResetWindow         string
+	collectiveEarliest            time.Time
+	collectiveLatest              time.Time
 	WeeklyCatchupWindow           time.Duration
 	WeeklyOnlyPriorityWindow      time.Duration
 	WeeklyOnlyCatchupSharePercent float64
@@ -107,6 +110,7 @@ type yamlPluginConfig struct {
 	SerialSoftContinuation        *bool              `yaml:"serial_soft_continuation"`
 	SerialAllocationPolicy        string             `yaml:"serial_allocation_policy"`
 	BalancedPriorityPolicy        string             `yaml:"balanced_priority_policy"`
+	CollectiveResetWindow         string             `yaml:"collective_reset_window"`
 	WeeklyCatchupWindow           string             `yaml:"weekly_catchup_window"`
 	WeeklyOnlyPriorityWindow      string             `yaml:"weekly_only_priority_window"`
 	WeeklyOnlyCatchupSharePercent *float64           `yaml:"weekly_only_catchup_share_percent"`
@@ -161,7 +165,7 @@ func defaultPluginConfig() pluginConfig {
 		QuotaProbeOnDemand:            true,
 		AuthExpiryAutoRepair:          true,
 		ResetCreditsAutoUseBefore:     10 * time.Minute,
-		QuotaURL:                      "https://chatgpt.com/backend-api/wham/usage",
+		QuotaURL:                      defaultQuotaURL,
 		QuotaRefreshBatch:             8,
 		Enabled:                       true,
 		SchedulerMode:                 "serial",
@@ -308,10 +312,17 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 		cfg.SerialBudgetRebalancePercent = v
 	}
 	if in.BalancedPriorityPolicy != "" {
-		if in.BalancedPriorityPolicy != "strict_deadline" && in.BalancedPriorityPolicy != "reset_weighted" {
-			return cfg, fmt.Errorf("balanced_priority_policy must be strict_deadline or reset_weighted")
+		if in.BalancedPriorityPolicy != "strict_deadline" && in.BalancedPriorityPolicy != "reset_weighted" && in.BalancedPriorityPolicy != "capacity_deadline" {
+			return cfg, fmt.Errorf("unknown balanced_priority_policy")
 		}
 		cfg.BalancedPriorityPolicy = in.BalancedPriorityPolicy
+	}
+	if in.CollectiveResetWindow != "" {
+		early, late, ok := parseCollectiveWindow(in.CollectiveResetWindow)
+		if !ok {
+			return cfg, fmt.Errorf("collective_reset_window requires two RFC3339 times with offsets, earliest/latest, at most 24h apart")
+		}
+		cfg.CollectiveResetWindow, cfg.collectiveEarliest, cfg.collectiveLatest = in.CollectiveResetWindow, early, late
 	}
 	if in.WeeklyCatchupWindow != "" {
 		value, err := time.ParseDuration(in.WeeklyCatchupWindow)
