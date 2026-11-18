@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.49 — 2026-11-19
+
+- Place flexible urgent weekly work on the earliest spendable reset group.
+  Within that group, account for work already assigned to pinned and sticky
+  turns when distributing new work. Track service per credential and weekly
+  cycle, discount older work, and reconcile usage or cancelled admissions.
+
 ## 0.3.48 — 2026-11-19
 
 - On the next unpinned turn after both cache age bands, allow an idle 5h

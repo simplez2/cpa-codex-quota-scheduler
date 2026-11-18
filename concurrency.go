@@ -923,6 +923,7 @@ func (s *schedulerRuntimeState) rollbackUndispatchedConcurrency(token string) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	now := s.balancedTimeLocked(time.Now())
 	for _, account := range s.balancedAccounts {
 		pending := account.Pending[:0]
 		for _, p := range account.Pending {
@@ -930,7 +931,11 @@ func (s *schedulerRuntimeState) rollbackUndispatchedConcurrency(token string) {
 				pending = append(pending, p)
 				continue
 			}
-			account.Credit += p.Cost
+			if p.weeklyEpoch.index != "" {
+				account.weeklyService.correct(p.weeklyEpoch, -p.Cost, p.At, now)
+			} else {
+				account.Credit += p.Cost
+			}
 			if s.adqReservations != nil && p.ReservationID != "" {
 				s.adqReservations.Release(p.ReservationID)
 			}

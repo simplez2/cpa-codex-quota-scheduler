@@ -343,7 +343,7 @@ func TestBalancedADQWeightsAccountForReservationsAndSettling(t *testing.T) {
 	}
 	inputs[0].ReservationFiveHour = 1
 	inputs[0].SettlingWeekly = 5
-	_, weights := s.balancedADQAllocationLocked(choices, inputs, 1, now, s.adqPolicyLocked(), adqAllocateBalanced)
+	_, weights := s.balancedADQAllocationLocked(choices, inputs, 1, now, s.adqPolicyLocked())
 	if weights["a"] >= weights["b"] {
 		t.Fatalf("local debt ignored: %v", weights)
 	}

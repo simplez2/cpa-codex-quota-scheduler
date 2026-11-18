@@ -5,7 +5,7 @@
 
 Standalone CPA plugin for balanced concurrent or serial Codex account selection, native quota polling,
 5h/weekly/monthly windows, persistent 429 quarantine and optional warmup.
-Source version: **0.3.48**. Published platform builds and checksums are available
+Source version: **0.3.49**. Published platform builds and checksums are available
 from [GitHub Releases](https://github.com/simplez2/cpa-codex-quota-scheduler/releases).
 See [CPA permissions and compatibility](CPA_PERMISSIONS.md) before installation.
 
@@ -312,10 +312,15 @@ deferred handback. Later turns do not extend this deadline. The continuation
 still needs a free slot and an atomic weekly reservation. With
 `weekly_only_priority_window` set to 1h–24h, reset weighting first tries
 confirmed weekly-only credentials in that final window for unbound sessions.
-Their target share of new work is proportional to spendable weekly quota per
-hour until reset. Spendable quota excludes the configured reserve and outstanding
-debits, and the rate uses a minimum 30-minute horizon. The scheduler status
-reports the rate as `weekly_deadline_units_per_hour` under `selection_priority`.
+Among credentials that can reserve the whole request, the earliest reset and its
+neighbors (within 5% of the remaining time, up to 30 minutes) get first choice.
+Within this group, the target pace is spendable weekly quota per hour until reset,
+with a minimum denominator of 30 minutes. A flexible turn goes to the account
+with the lowest recent work plus half its estimated cost, divided by that pace.
+Recent work includes pinned and sticky turns and decays by half every 30 minutes.
+Completions correct the original estimate. Failed or cancelled undispatched turns
+release it. Status reports the pace as `selection_priority.weekly_deadline_units_per_hour`
+and recent work as `balanced_accounts[auth_id].recent_weekly_work_units`.
 The next unpinned turn of an idle 5h conversation can also use this tier once
 the cache age bands have passed (50 minutes since activity by default). A
 running turn or a source in its own final weekly window keeps its preference.

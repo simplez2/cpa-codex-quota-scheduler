@@ -19,25 +19,28 @@ type balancedPending struct {
 	Model         string
 	Cost          float64
 	ReservationID string
+	weeklyEpoch   weeklyServiceEpoch
 }
 
 // Credits are local fair-share work units, never an upstream quota reservation.
 // Selection and its predicted debit are atomic, including simultaneous calls.
 type balancedAccount struct {
-	Credit     float64
-	LastPicked time.Time
-	LastSeen   time.Time
-	Picks      uint64
-	Weight     float64
-	Pending    []balancedPending
-	Completed  map[string]time.Time
+	Credit        float64
+	LastPicked    time.Time
+	LastSeen      time.Time
+	Picks         uint64
+	Weight        float64
+	Pending       []balancedPending
+	Completed     map[string]time.Time
+	weeklyService weeklyService
 }
 
 type balancedAccountStatus struct {
-	Picks      uint64    `json:"picks"`
-	Pending    int       `json:"pending_estimate"`
-	Weight     float64   `json:"weight"`
-	LastPicked time.Time `json:"last_picked"`
+	Picks            uint64    `json:"picks"`
+	Pending          int       `json:"pending_estimate"`
+	Weight           float64   `json:"weight"`
+	LastPicked       time.Time `json:"last_picked"`
+	WeeklyRecentWork float64   `json:"recent_weekly_work_units,omitempty"`
 }
 
 // Both policies allocate predicted work, rather than equal request counts.
@@ -81,21 +84,13 @@ func balancedWeightWithQuota(choice serialCandidate, cfg pluginConfig, now time.
 
 // Compute a tentative fair-share round. Only a successful ADQ reservation
 // commits these credits; collision retries cannot mint additional credit.
-func (s *schedulerRuntimeState) balancedADQAllocationLocked(choices []serialCandidate, inputs []adqAccountInput, cost float64, now time.Time, policy adqPolicy, mode adqAllocationMode) (map[string]adqAllocationScore, map[string]float64) {
+func (s *schedulerRuntimeState) balancedADQAllocationLocked(choices []serialCandidate, inputs []adqAccountInput, cost float64, now time.Time, policy adqPolicy) (map[string]adqAllocationScore, map[string]float64) {
 	weights := make(map[string]float64, len(inputs))
 	weeklyOnly := make(map[string]bool)
 	total := 0.0
 	for i, input := range inputs {
 		metrics := adqAssessAccount(input, policy, now)
 		if !metrics.Eligible {
-			continue
-		}
-		if mode == adqAllocateWeeklyDeadline {
-			// Use effective work units, not raw percentages or plan multipliers
-			// a second time. Existing sessions also consume this headroom, so
-			// their real burn feeds back into the next new-session placement.
-			horizon, _ := weeklyResetHorizon(choices[i], s.cfg, now)
-			weights[input.ID] = weeklyDeadlinePace(metrics.WEffective, horizon)
 			continue
 		}
 		five, weekly := 100.0, 100.0
@@ -111,9 +106,7 @@ func (s *schedulerRuntimeState) balancedADQAllocationLocked(choices []serialCand
 			weeklyOnly[input.ID] = true
 		}
 	}
-	if mode != adqAllocateWeeklyDeadline {
-		capBalancedCatchupWeights(weights, weeklyOnly, s.cfg)
-	}
+	capBalancedCatchupWeights(weights, weeklyOnly, s.cfg)
 	for _, weight := range weights {
 		total += weight
 	}
@@ -363,21 +356,29 @@ func (s *schedulerRuntimeState) balancedPick(req pluginapi.SchedulerPickRequest,
 		return pluginapi.SchedulerPickResponse{}
 	}
 	account := s.balancedAccounts[selected]
-	account.Credit -= cost
 	account.LastPicked = now
 	account.Picks++
 	if len(account.Pending) >= 256 {
 		account.Pending = account.Pending[1:]
 	}
-	account.Pending = append(account.Pending, balancedPending{At: now, Model: normalizeModelName(req.Model), Cost: cost, Session: session, RequestToken: schedulerHeader(req.Options, concurrencyHeader), ReservationID: reservation.ID})
-	if session != "" {
-		var index string
-		for _, choice := range choices {
-			if choice.Candidate.ID == selected {
-				index = choice.Snapshot.AuthIndex
-				break
-			}
+	pending := balancedPending{At: now, Model: normalizeModelName(req.Model), Cost: cost, Session: session, RequestToken: schedulerHeader(req.Options, concurrencyHeader), ReservationID: reservation.ID}
+	selectedChoice, _ := serialChoiceByID(choices, selected)
+	index := selectedChoice.Snapshot.AuthIndex
+	if selectedChoice.Priority.WeeklyUrgent && index != "" {
+		if horizon, ok := weeklyResetHorizon(selectedChoice, s.cfg, now); ok {
+			pending.weeklyEpoch = weeklyServiceEpoch{index, now.Add(horizon)}
+			account.weeklyService.assign(pending.weeklyEpoch, cost, now)
 		}
+	}
+	if pending.weeklyEpoch.index == "" {
+		account.Credit -= cost
+	} else {
+		// Deadline service has its own ledger. Return to ordinary sharing
+		// with neutral credit once this weekly sprint ends.
+		account.Credit = 0
+	}
+	account.Pending = append(account.Pending, pending)
+	if session != "" {
 		bindingChanged = s.bindBalancedSessionLocked(session, selected, index, now)
 		if coldMigration {
 			s.balancedWeeklyColdMigrations++
@@ -446,7 +447,7 @@ func (s *schedulerRuntimeState) observeBalancedUsage(record pluginapi.UsageRecor
 	index := -1
 	distance := 30 * time.Second
 	for i, p := range account.Pending {
-		if p.Model != model {
+		if p.Model != model || (p.weeklyEpoch.index != "" && record.AuthIndex != "" && p.weeklyEpoch.index != record.AuthIndex) {
 			continue
 		}
 		delta := p.At.Sub(record.RequestedAt)
@@ -487,6 +488,13 @@ func (s *schedulerRuntimeState) observeBalancedUsage(record pluginapi.UsageRecor
 
 	actual, known := usageCredits(record, s.pricing)
 	validActual := known && !record.Failed && actual >= 0 && finiteADQ(actual)
+	if pending.weeklyEpoch.index != "" && (record.Failed || validActual) {
+		charged := actual
+		if record.Failed {
+			charged = 0
+		}
+		account.weeklyService.correct(pending.weeklyEpoch, charged-predicted, pending.At, now)
+	}
 	if reservationID := strings.TrimSpace(pending.ReservationID); reservationID != "" && s.adqReservations != nil {
 		if record.Failed {
 			s.adqReservations.Release(reservationID)
@@ -506,7 +514,7 @@ func (s *schedulerRuntimeState) observeBalancedUsage(record pluginapi.UsageRecor
 			s.adqReservations.Settle(reservationID, debit, debit, snapshot, now, s.adqPolicyLocked().SettlementTimeout)
 		}
 	}
-	if validActual {
+	if validActual && pending.weeklyEpoch.index == "" {
 		// A very large completion changes future share without starving an
 		// account forever. This estimate cannot mark its quota exhausted.
 		limit := math.Max(predicted, .001) * 16
@@ -523,7 +531,12 @@ func (s *schedulerRuntimeState) balancedStatusLocked(now time.Time) map[string]b
 				pending++
 			}
 		}
-		result[id] = balancedAccountStatus{account.Picks, pending, account.Weight, account.LastPicked}
+		status := balancedAccountStatus{Picks: account.Picks, Pending: pending, Weight: account.Weight, LastPicked: account.LastPicked}
+		if q, ok := s.lookupQuotaLocked(id, ""); ok {
+			epoch := weeklyServiceEpoch{q.AuthIndex, adqResetForClass(q, "weekly")}
+			status.WeeklyRecentWork = account.weeklyService.atTime(epoch, now)
+		}
+		result[id] = status
 	}
 	return result
 }

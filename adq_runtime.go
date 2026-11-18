@@ -470,6 +470,12 @@ func (s *schedulerRuntimeState) adqRouteChoicesWithAllocationLocked(req pluginap
 			input.Sticky = false
 			inputs = append(inputs, input)
 		}
+		if mode == adqAllocateWeeklyDeadline {
+			available, inputs = weeklyDeadlineGroup(available, inputs, cost, s.cfg, policy, now)
+			if len(inputs) == 0 {
+				return "", adqReservation{}, false, true
+			}
+		}
 		// Session affinity is a hard preference whenever the sticky candidate is
 		// present in this tier; ADQ's own hard weekly/5h gate still applies.
 		session := strings.TrimSpace(sessionKey)
@@ -499,8 +505,10 @@ func (s *schedulerRuntimeState) adqRouteChoicesWithAllocationLocked(req pluginap
 		}
 		var allocation map[string]adqAllocationScore
 		var weights map[string]float64
-		if balanced {
-			allocation, weights = s.balancedADQAllocationLocked(available, inputs, cost, now, policy, mode)
+		if mode == adqAllocateWeeklyDeadline {
+			allocation, weights = s.weeklyDeadlineScoresLocked(available, inputs, cost, policy, now)
+		} else if balanced {
+			allocation, weights = s.balancedADQAllocationLocked(available, inputs, cost, now, policy)
 		}
 		decision, ok := adqChooseWithAllocation(inputs, s.adqForecastDemandLocked(now), cost, policy, now, allocation)
 		if !ok {
@@ -516,7 +524,7 @@ func (s *schedulerRuntimeState) adqRouteChoicesWithAllocationLocked(req pluginap
 		}, now)
 		if ok {
 			if mode == adqAllocateWeeklyDeadline {
-				decision.Reason = "按周额度重置前所需的小时消耗率分配；" + decision.Reason
+				decision.Reason = "在最早一批周重置中按所需消耗速度和近期已分配工作量选择凭证。"
 			}
 			decision.ReservationID = reservation.ID
 			decision.ReservationFiveHour = reservation.FiveHour
@@ -536,7 +544,10 @@ func (s *schedulerRuntimeState) adqRouteChoicesWithAllocationLocked(req pluginap
 				for i, input := range inputs {
 					if score, found := allocation[input.ID]; found {
 						if account := s.balancedAccounts[available[i].Candidate.ID]; account != nil {
-							account.Credit, account.Weight = score.Credit, weights[input.ID]
+							account.Weight = weights[input.ID]
+							if mode == adqAllocateBalanced {
+								account.Credit = score.Credit
+							}
 						}
 					}
 				}

@@ -75,7 +75,7 @@ func deadlinePaceFixture(t *testing.T) (*schedulerRuntimeState, pluginapi.Schedu
 		id   string
 		used float64
 		left time.Duration
-	}{{"weekly-backup", 18, 18 * time.Hour}, {"weekly-second", 58, 3 * time.Hour}} {
+	}{{"weekly-backup", 78, 12 * time.Hour}, {"weekly-second", 38, 12*time.Hour - time.Minute}} {
 		q := s.quotas[entry.id]
 		q.Windows[0].UsedPercent, q.Windows[0].ResetAt = entry.used, now.Add(entry.left)
 		s.quotas[entry.id], s.quotaNative[entry.id] = q, q
@@ -107,7 +107,8 @@ func TestBalancedWeeklyDeadlineDistributesWorkByRequiredPace(t *testing.T) {
 		s.adqReservations.Release(decision.ReservationID)
 		s.balancedAccounts[got.AuthID].Pending = nil
 	}
-	// Ready headroom is 80 units in 18h vs. 40 in 3h: target pace ratio 1:3.
+	// In the same deadline group, 20 vs. 60 spendable units at almost
+	// identical horizons target a work ratio very close to 1:3.
 	share := work["weekly-second"] / (work["weekly-backup"] + work["weekly-second"])
 	t.Logf("earlier reset: %.2f%% of reserved work, picks=%v", share*100, picks)
 	if share < .735 || share > .765 {
@@ -119,14 +120,13 @@ func TestBalancedWeeklyDeadlineRecalculatesForReservedWork(t *testing.T) {
 	resetBanStoreForTest()
 	defer resetBanStoreForTest()
 	s, req, now := deadlinePaceFixture(t)
-	s.adqReservations.SetCapacity("weekly-second", 0, 40)
-	reservation, ok := s.adqReservations.TryReserve(adqReservationRequest{AuthID: "weekly-second", Weekly: 32}, now)
+	s.adqReservations.SetCapacity("weekly-second", 0, 60)
+	reservation, ok := s.adqReservations.TryReserve(adqReservationRequest{AuthID: "weekly-second", Weekly: 52}, now)
 	if !ok {
 		t.Fatal("fixture could not reserve ongoing work")
 	}
 	defer s.adqReservations.Release(reservation.ID)
-	// Only eight of the 40 units are uncommitted on weekly-second. Its new
-	// rate drops to 8/3, below the other credential's 80/18.
+	// Only eight units remain uncommitted, below the other's 20 at the same horizon.
 	if got := s.balancedPick(req, now); got.Reject || got.AuthID != "weekly-backup" {
 		t.Fatalf("already committed work got counted twice: %+v", got)
 	}
