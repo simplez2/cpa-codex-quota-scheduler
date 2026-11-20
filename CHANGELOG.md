@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.53 — 2026-11-21
+
+- Include CPA credential and model cooldowns, verified exhausted windows, and pending quota recovery in the account recovery panel. Mark missing or stale host details so they do not look like an empty recovery queue. Label the bulk action as clearing plugin state and only offer host quota cooldown recovery for an eligible credential with fresh native quota.
+
 ## 0.3.52 — 2026-11-20
 
 - Refresh a credential's native quota after a likely manual reset-card redemption, even when the credential is idle or in standby. Honor provider backoff and retry briefly if the usage endpoint still reports the old windows. Replay pending changes saved by the previous release.

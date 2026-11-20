@@ -106,7 +106,7 @@ import (
 
 const (
 	pluginName    = "codex-quota-scheduler"
-	pluginVersion = "0.3.52"
+	pluginVersion = "0.3.53"
 
 	// providerCodex is the CPA provider key for OpenAI Codex (ChatGPT backend).
 	providerCodex = "codex"
@@ -1054,7 +1054,7 @@ func managementRegistration() pluginapi.ManagementRegistrationResponse {
 			{
 				Method:      http.MethodGet,
 				Path:        managementRoutePrefix + "/bans",
-				Description: "List Codex auths currently held out of the pool by Codex Quota Scheduler.",
+				Description: "List plugin quarantine and read-only Codex credential recovery information.",
 			},
 			{
 				Method:      http.MethodPost,
@@ -1145,6 +1145,7 @@ type managementBanStatus struct {
 	ProbeSuccesses uint64              `json:"probe_successes"`
 	ProbeFailures  uint64              `json:"probe_failures"`
 	Bans           []managementBanInfo `json:"bans"`
+	Recovery       managementRecovery  `json:"recovery"`
 }
 
 type managementBanInfo struct {
@@ -1220,6 +1221,7 @@ func currentBanStatus() managementBanStatus {
 		ProbeSuccesses: stats.ProbeSuccesses,
 		ProbeFailures:  stats.ProbeFailures,
 		Bans:           bans,
+		Recovery:       schedulerRuntime.managementRecovery(bans, now),
 	}
 }
 

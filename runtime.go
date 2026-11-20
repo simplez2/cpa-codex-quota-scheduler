@@ -77,6 +77,7 @@ type schedulerRuntimeState struct {
 	resetCreditMu         sync.Mutex
 	resetCredits          map[string]resetCreditState
 	resetCreditInventory  map[string]cpaAuthFileEntry
+	recoveryInventoryAt   time.Time
 	quotaPolls            map[string]quotaPollState
 	quotaRunway           quotaRunwayTracker
 	quotaNative           map[string]quotaSnapshot
@@ -219,6 +220,7 @@ func configureSchedulerRuntime(raw []byte) {
 	schedulerRuntime.quotaPolls = make(map[string]quotaPollState)
 	schedulerRuntime.resetCredits = make(map[string]resetCreditState)
 	schedulerRuntime.resetCreditInventory = nil
+	schedulerRuntime.recoveryInventoryAt = time.Time{}
 	schedulerRuntime.quotaRunway = quotaRunwayTracker{}
 	schedulerRuntime.continuityDemandUntil = make(map[string]time.Time)
 	schedulerRuntime.continuity.clearPacing(time.Now())

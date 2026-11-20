@@ -597,13 +597,35 @@ function renderQuotaEpoch() {
 }
 function renderBans() {
   const list=$('bans-list');list.replaceChildren();
-  for(const ban of state.bans||[]) {
+  const recovery=state.accountRecovery;
+  const accounts=Array.isArray(recovery?.accounts)?recovery.accounts:(state.bans||[]).map(plugin=>({auth_id:plugin.auth_id,plugin,can_clear:plugin.state!=='half_open'}));
+  const labels={cooldown:'冷却中',probe_ready:'等待恢复探测',half_open:'正在探测恢复',awaiting_quota:'等待上游额度确认'};
+  const reasons={quota:'额度限制',credential_quota:'额度限制',transient_rate_limit:'临时限流',unauthorized:'认证异常',payment_required:'需要检查套餐',model_not_supported:'模型不可用',cloudflare_challenge:'上游验证'};
+  const windows={'5h':'5h 额度',weekly:'周额度',monthly:'月额度'};
+  const retryAt=value=>timestamp(value)?' · 最早重试 '+dateText(value):'';
+  for(const account of accounts) {
     const item=element('li'),line=element('div','warmup-line');
-    line.append(element('span','warmup-id',ban.auth_id),action('解除冷却',()=>confirmOperation('解除此账号的冷却','请确认上游额度已经恢复。本操作只移除本地冷却记录。',()=>mutate('/unban','POST',{auth_id:ban.auth_id},'已解除本地冷却。'))));
-    item.append(line,element('p','subtext','到期 '+dateText(ban.reset_at)));list.append(item);
+    line.append(element('span','warmup-id',account.auth_id));
+    if(account.can_clear){
+      const button=action('解除冷却',()=>confirmOperation('解除此账号的冷却','确认上游额度已恢复后，清除此凭证在 CPA 和插件中的冷却。',()=>mutate('/unban','POST',{auth_id:account.auth_id},'已解除此凭证的冷却，并安排重新查询额度。')));
+      button.setAttribute('aria-label','解除冷却：'+account.auth_id);
+      line.append(button);
+    }
+    item.append(line);
+    const plugin=account.plugin;
+    if(plugin)item.append(element('p','subtext','插件 · '+(labels[plugin.state]||'等待恢复')+(plugin.state==='cooldown'?retryAt(plugin.reset_at):'')));
+    if(account.guard)item.append(element('p','subtext',(labels[account.guard]||'等待恢复')+(account.guard==='awaiting_quota'&&timestamp(account.guard_until)?' · 预计重置 '+dateText(account.guard_until):retryAt(account.guard_until))));
+    for(const window of account.quota||[])item.append(element('p','subtext',(windows[window.class]||'额度')+'已耗尽'+(timestamp(window.reset_at)?' · 预计重置 '+dateText(window.reset_at):' · 重置时间待确认')));
+    for(const entry of account.cpa||[]){
+      const scope=entry.scope==='model'&&entry.model_key?'CPA 模型 '+entry.model_key:entry.scope==='credential'?'CPA 凭证':'CPA 范围待确认';
+      item.append(element('p','subtext',scope+' · '+(reasons[entry.reason]||'冷却中')+retryAt(entry.retry_at)));
+    }
+    if(account.cpa_unavailable&&!account.cpa?.length)item.append(element('p','subtext','CPA 暂不可用 · 冷却详情待确认'));
+    list.append(item);
   }
-  if(!list.children.length)list.append(element('li','subtext','没有等待恢复的账号'));
-  $('unban-all').disabled=operating||editor.isSaving()||!(state.bans||[]).length;
+  if(!accounts.length)list.append(element('li','subtext',recovery?.native_status==='current'?'没有正在冷却或等待恢复的账号':'暂无已知恢复记录。'));
+  if(recovery?.native_status!=='current')list.append(element('li','subtext','CPA 冷却详情尚未取得或已过期，列表可能不完整。'));
+  $('unban-all').disabled=operating||editor.isSaving()||!(recovery?.can_clear_local??accounts.some(account=>account.can_clear));
 }
 function render() {
   const accounts = state.snapshots || [];
@@ -666,6 +688,7 @@ async function refresh(force=false) {
     if (epoch !== authEpoch) return;
     if (typeof result.enabled !== 'boolean' || (result.snapshots != null && !Array.isArray(result.snapshots)) || !Array.isArray(bansResult.bans)) throw new Error('额度接口返回格式不匹配，请检查当前 CPA 的插件版本。');
     result.bans = bansResult.bans;
+    result.accountRecovery = bansResult.recovery;
     state = result; failures = 0; render();
     if(pendingRemember) {
       pendingRemember=false;
@@ -713,7 +736,7 @@ $('edit-scheduler').addEventListener('click',()=>focusAllocation('scheduler_mode
 $('edit-concurrency').addEventListener('click',()=>focusAllocation('account_max_concurrency'));
 document.querySelectorAll('[data-view]').forEach(button=>button.addEventListener('click',()=>showView(button.dataset.view)));
 $('auto-select').addEventListener('click',()=>mutate('/serial-active','DELETE',undefined,'已恢复自动调配，后续请求重新选择账号。'));
-$('unban-all').addEventListener('click',()=>confirmOperation('解除全部冷却','将移除所有本地冷却记录。仅在确认相关账号的上游额度已恢复后执行。',()=>mutate('/unban-all','POST',{},'已解除全部本地冷却。')));
+$('unban-all').addEventListener('click',()=>confirmOperation('清除插件冷却','将清除插件记录的隔离和恢复等待状态。请先确认相关账号的上游额度已恢复。',()=>mutate('/unban-all','POST',{},'已清除插件冷却。')));
 $('retry-all').addEventListener('click',()=>confirmOperation('恢复已阻止的预热重试','仅清除因失败而被阻止的预热记录。已确认周期、等待间隔和每日预算继续保留。',()=>mutate('/warmup-retry','POST',{all:true},'已恢复被阻止的预热重试。')));
 $('cancel-operation').addEventListener('click',()=>{$('operation-dialog').close();pendingOperation=null;});
 $('confirm-operation').addEventListener('click',()=>{const fn=pendingOperation;pendingOperation=null;$('operation-dialog').close();fn?.();});

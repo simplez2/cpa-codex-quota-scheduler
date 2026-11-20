@@ -76,15 +76,17 @@ type cpaAuthFileEntry struct {
 		AccountID string `json:"chatgpt_account_id"`
 		PlanType  string `json:"plan_type"`
 	} `json:"id_token"`
-	ID          string `json:"id"`
-	AuthIndex   string `json:"auth_index"`
-	Name        string `json:"name"`
-	Provider    string `json:"provider"`
-	Type        string `json:"type"`
-	Status      string `json:"status"`
-	Disabled    bool   `json:"disabled"`
-	Unavailable bool   `json:"unavailable"`
-	Note        string `json:"note"`
+	ID             string          `json:"id"`
+	AuthIndex      string          `json:"auth_index"`
+	Name           string          `json:"name"`
+	Provider       string          `json:"provider"`
+	Type           string          `json:"type"`
+	Status         string          `json:"status"`
+	Disabled       bool            `json:"disabled"`
+	Unavailable    bool            `json:"unavailable"`
+	Note           string          `json:"note"`
+	NextRetryAfter json.RawMessage `json:"next_retry_after"`
+	Cooldowns      json.RawMessage `json:"cooldowns"`
 }
 
 type warmupAuthEligibilityStats struct {

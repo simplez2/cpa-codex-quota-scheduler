@@ -78,7 +78,7 @@
     </details>
     <div class="details-grid">
       <section class="detail-panel" aria-labelledby="policy-title"><div class="section-header"><h2 id="policy-title">调配安排</h2><button type="button" data-view="allocation">调整安排</button></div><dl id="policy" class="policy"></dl><p class="muted">日均预算按分钟精度计算，用于新会话的优先级比较：距重置越近，未用额度越优先。已有会话保持绑定，达到设定阈值或确实不可用时才换号。</p></section>
-      <section class="detail-panel" aria-labelledby="bans-title"><div class="section-header"><h2 id="bans-title">账号恢复</h2><button id="unban-all" class="runtime-action" type="button" disabled>解除全部冷却</button></div><p class="muted">确认上游额度已恢复后，可解除本地冷却。正常到期后会自动探测恢复。</p><ul id="bans-list" class="warmups"></ul></section>
+      <section class="detail-panel" aria-labelledby="bans-title"><div class="section-header"><h2 id="bans-title">账号恢复</h2><button id="unban-all" class="runtime-action" type="button" disabled>清除插件冷却</button></div><p class="muted">这里显示 CPA 冷却、插件冷却和等待额度确认的账号。到期后会自动探测，确认上游额度已恢复时也可手动解除。</p><ul id="bans-list" class="warmups"></ul></section>
     </div>
     </div>
     <p id="settings-unavailable" class="notice" hidden>设置读取失败，请刷新重试；额度概览仍可查看。</p>

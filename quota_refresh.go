@@ -361,6 +361,11 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 	s.quotas = next
 	s.identities = identities
 	s.resetCreditInventory = inventory
+	if files != nil {
+		s.recoveryInventoryAt = time.Now()
+	} else {
+		s.recoveryInventoryAt = time.Time{}
+	}
 	for id, state := range s.resetCredits {
 		if auth, ok := inventory[id]; !ok || auth.AuthIndex != state.AuthIndex {
 			delete(s.resetCredits, id)
