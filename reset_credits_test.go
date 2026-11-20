@@ -120,6 +120,7 @@ type resetCreditFixture struct {
 	quotaHTTP            int
 	quotaRetry           string
 	onQuota              func()
+	quotaBody            string
 	disabled             bool
 	replaced             bool
 	manualDuringQuota    bool
@@ -220,7 +221,10 @@ func (f *resetCreditFixture) serve(w http.ResponseWriter, r *http.Request) {
 			f.credits = f.credits[1:]
 			f.manualDuringQuota = false
 		}
-		result.Body = fmt.Sprintf(`{"account_id":"account-id","rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{"used_percent":%v,"limit_window_seconds":18000,"reset_after_seconds":3600},"secondary_window":{"used_percent":%v,"limit_window_seconds":604800,"reset_after_seconds":86400}},"rate_limit_reset_credits":{"available_count":%d,"applicable_available_count":%s}}`, f.used, f.used, len(f.credits), mustResetJSON(f.applicable))
+		result.Body = f.quotaBody
+		if result.Body == "" {
+			result.Body = fmt.Sprintf(`{"account_id":"account-id","rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{"used_percent":%v,"limit_window_seconds":18000,"reset_after_seconds":3600},"secondary_window":{"used_percent":%v,"limit_window_seconds":604800,"reset_after_seconds":86400}},"rate_limit_reset_credits":{"available_count":%d,"applicable_available_count":%s}}`, f.used, f.used, len(f.credits), mustResetJSON(f.applicable))
+		}
 	case call.Method == "POST" && call.URL == resetCreditsURL+"/consume":
 		f.posts++
 		var body map[string]string
@@ -278,6 +282,86 @@ func TestResetCreditDefaultOffOnlyReadsAndPanelRedactsIDs(t *testing.T) {
 		if strings.Contains(string(raw), secret) {
 			t.Fatal("panel leaked", secret)
 		}
+	}
+}
+
+func TestManualCardSyncRefreshesBothWindowsWhileIdle(t *testing.T) {
+	f := newResetCreditFixture(t)
+	s := f.state
+	now := time.Now().Truncate(time.Second)
+	oldFive, oldWeek := now.Add(2*time.Hour), now.Add(4*24*time.Hour)
+	newFive, newWeek := now.Add(5*time.Hour), now.Add(7*24*time.Hour)
+	body := func(fiveUsed, weekUsed int, five, week time.Time) string {
+		return fmt.Sprintf(`{"rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{"used_percent":%d,"limit_window_seconds":18000,"reset_at":%d},"secondary_window":{"used_percent":%d,"limit_window_seconds":604800,"reset_at":%d}}}`, fiveUsed, five.Unix(), weekUsed, week.Unix())
+	}
+	oldBody := body(58, 98, oldFive, oldWeek)
+	old, err := parseNativeQuota([]byte(oldBody), f.auth.ID, f.auth.AuthIndex, now.Add(-20*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.cfg.QuotaProbeOnDemand = true
+	s.cfg.QuotaRefreshCooldown = 30 * time.Minute
+	s.quotas[f.auth.ID], s.quotas[f.auth.AuthIndex] = old, old
+	s.quotaPolls = map[string]quotaPollState{f.auth.ID: {AuthIndex: f.auth.AuthIndex, AttemptedAt: old.RefreshedAt, NextAt: now.Add(10 * time.Minute)}}
+	f.tick()
+	if s.quotaPolls[f.auth.ID].CardSync != nil || f.quotas != 0 {
+		t.Fatal("initial inventory generated extra usage work")
+	}
+	f.mu.Lock()
+	f.credits = f.credits[1:]
+	f.quotaBody = oldBody
+	f.mu.Unlock()
+	f.tick()
+	if got := s.quotaProbeReason(f.auth.ID, time.Now()); got != cardQuotaSyncReason {
+		t.Fatalf("card removal did not wake idle credential: %q", got)
+	}
+	s.refreshOnce(context.Background())
+	p := s.quotaPolls[f.auth.ID]
+	if p.CardSync == nil || p.CardSync.Confirmed || p.CardSync.Attempts != 1 || f.quotas != 1 {
+		t.Fatalf("old clocks should require a follow-up: %+v (%d reads)", p.CardSync, f.quotas)
+	}
+	s.refreshOnce(context.Background())
+	if f.quotas != 1 {
+		t.Fatal("follow-up bypassed its delay")
+	}
+	p.NextAt = time.Now().Add(-time.Second)
+	s.quotaPolls[f.auth.ID] = p
+	f.mu.Lock()
+	f.quotaBody = body(0, 0, newFive, newWeek)
+	f.mu.Unlock()
+	s.refreshOnce(context.Background())
+	p = s.quotaPolls[f.auth.ID]
+	panel := s.status().Snapshots[0]
+	five, _ := fiveHourWindow(s.quotas[f.auth.ID])
+	week, _ := quotaEpochWeeklyWindow(s.quotas[f.auth.AuthIndex])
+	if !p.CardSync.Confirmed || p.CardSync.Attempts != 2 || !panel.Fresh ||
+		five.UsedPercent != 0 || !five.ResetAt.Equal(newFive) || week.UsedPercent != 0 || !week.ResetAt.Equal(newWeek) {
+		t.Fatalf("recovery was not published on both aliases: sync=%+v five=%+v week=%+v", p.CardSync, five, week)
+	}
+	f.tick()
+	s.refreshOnce(context.Background())
+	if f.quotas != 2 || f.posts != 0 {
+		t.Fatalf("unchanged cards repeated the sync: %d quota calls, %d writes", f.quotas, f.posts)
+	}
+}
+
+func TestCardQuotaSyncKeepsProviderBackoffAndCatchesPersistedMarker(t *testing.T) {
+	f := newResetCreditFixture(t)
+	s := f.state
+	now := time.Now()
+	s.cfg.QuotaProbeOnDemand = true
+	s.resetCredits = map[string]resetCreditState{f.auth.ID: {AuthIndex: f.auth.AuthIndex, QuotaAfter: now.Add(-time.Minute)}}
+	retryAt := now.Add(2 * time.Minute)
+	s.quotaPolls = map[string]quotaPollState{f.auth.ID: {
+		AuthIndex: f.auth.AuthIndex, AttemptedAt: now.Add(-2 * time.Minute), Error: "quota_http_429", Failures: 1, NextAt: retryAt,
+	}}
+	s.refreshOnce(context.Background())
+	p := s.quotaPolls[f.auth.ID]
+	if p.CardSync == nil || p.CardSync.Attempts != 0 || !p.NextAt.Equal(retryAt) || f.quotas != 0 {
+		t.Fatalf("persisted change did not survive backoff: %+v (%d reads)", p, f.quotas)
+	}
+	if got := s.quotaProbeReason(f.auth.ID, retryAt.Add(time.Second)); got != cardQuotaSyncReason {
+		t.Fatalf("card sync did not resume after backoff: %q", got)
 	}
 }
 

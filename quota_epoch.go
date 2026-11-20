@@ -333,7 +333,8 @@ func (s *schedulerRuntimeState) beginQuotaEpochSweepLocked(inventory map[string]
 		s.quotaEpoch.Sweep.Targets[id] = target
 		if forceProbe || newTarget {
 			poll := s.quotaPolls[id]
-			if !strings.Contains(poll.Error, "401") && !strings.Contains(poll.Error, "403") {
+			cardSyncBackoff := poll.cardQuotaSyncPending() && (poll.Failures > 0 || poll.Error != "")
+			if !cardSyncBackoff && !strings.Contains(poll.Error, "401") && !strings.Contains(poll.Error, "403") {
 				poll.NextAt = time.Time{}
 				s.quotaPolls[id] = poll
 			}

@@ -292,6 +292,9 @@ func (s *schedulerRuntimeState) refreshResetCredits(ctx context.Context) {
 		}
 		if current, ok := s.resetCreditInventory[id]; ok && current.AuthIndex == auth.AuthIndex {
 			s.resetCredits[id] = state
+			if err == nil {
+				s.queueCardQuotaSyncLocked(auth, state, s.quotas[id], time.Now())
+			}
 			// Publish list counts to the same official count used for scheduling.
 			if q, ok := s.quotas[id]; ok && q.AuthIndex == auth.AuthIndex && err == nil && state.CountKnown && !q.ResetCreditsObservedAt.After(state.ObservedAt) {
 				q.ResetCredits, q.ResetCreditsKnown, q.ResetCreditsObservedAt = state.Count, true, state.ObservedAt

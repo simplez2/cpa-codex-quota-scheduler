@@ -122,6 +122,12 @@ func (s *schedulerRuntimeState) quotaProbeReason(id string, now time.Time) strin
 	continuityUntil := s.continuityDemandUntil[id]
 	epochReason := s.quotaEpochProbeReasonLocked(id, now)
 	s.mu.RUnlock()
+	if p.cardQuotaSyncPending() {
+		if p.cardQuotaSyncDue(now) {
+			return cardQuotaSyncReason
+		}
+		return ""
+	}
 	if !cfg.QuotaProbeOnDemand {
 		return "periodic"
 	}

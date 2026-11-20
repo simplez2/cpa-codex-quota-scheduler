@@ -1,4 +1,4 @@
-# Standalone CPA quota scheduler v0.3.51.
+# Standalone CPA quota scheduler v0.3.52.
 plugins:
   enabled: true
   configs:

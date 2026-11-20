@@ -29,6 +29,7 @@ type quotaPollState struct {
 	NextAt         time.Time
 	Failures       int
 	Error          string
+	CardSync       *cardQuotaSync `json:",omitempty"`
 }
 
 const quotaRefreshRequestTimeout = 10 * time.Second
@@ -363,6 +364,9 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 	for id, state := range s.resetCredits {
 		if auth, ok := inventory[id]; !ok || auth.AuthIndex != state.AuthIndex {
 			delete(s.resetCredits, id)
+		} else {
+			// Also pick up a card change persisted by the previous version.
+			s.queueCardQuotaSyncLocked(auth, state, next[id], time.Now())
 		}
 	}
 	activeID := s.serialActiveAuthID
@@ -392,14 +396,19 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 	for id := range inventory {
 		ids = append(ids, id)
 	}
+	sortAt := time.Now()
 	s.mu.RLock()
 	sort.Slice(ids, func(i, j int) bool {
+		a, b := s.quotaPolls[ids[i]], s.quotaPolls[ids[j]]
+		cardA, cardB := a.cardQuotaSyncDue(sortAt), b.cardQuotaSyncDue(sortAt)
+		if cardA != cardB {
+			return cardA
+		}
 		if (ids[i] == activeID) != (ids[j] == activeID) {
 			return ids[i] == activeID
 		}
-		a, b := s.quotaPolls[ids[i]].AttemptedAt, s.quotaPolls[ids[j]].AttemptedAt
-		if !a.Equal(b) {
-			return a.Before(b)
+		if !a.AttemptedAt.Equal(b.AttemptedAt) {
+			return a.AttemptedAt.Before(b.AttemptedAt)
 		}
 		return ids[i] < ids[j]
 	})
@@ -421,12 +430,19 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 		}
 		s.mu.Lock()
 		poll := s.quotaPolls[id]
-		preflight := (strings.HasPrefix(reason, "epoch_") || reason == "warmup" || reason == "weekly_catchup") && poll.Failures == 0 && poll.Error == ""
+		preflight := (strings.HasPrefix(reason, "epoch_") || reason == "warmup" || reason == "weekly_catchup" || reason == cardQuotaSyncReason) && poll.Failures == 0 && poll.Error == ""
+		if reason == cardQuotaSyncReason && !poll.cardQuotaSyncDue(now) {
+			s.mu.Unlock()
+			continue
+		}
 		if now.Before(poll.NextAt) && !preflight {
 			s.mu.Unlock()
 			continue
 		}
 		interval := s.quotaPollIntervalLocked(id, activeID, now)
+		if reason == cardQuotaSyncReason {
+			interval = min(interval, time.Minute)
+		}
 		previousPoll := poll
 		if !preflight {
 			if deferUntil := quotaHeaderCacheDeadline(s.quotas[id], poll, cfg, interval, now); deferUntil.After(now) {
@@ -483,6 +499,7 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 				// arrived while this HTTP request was in flight.
 				previousPoll.UsagePending = previousPoll.UsagePending || current.UsagePending
 				previousPoll.CatchupPending = previousPoll.CatchupPending || current.CatchupPending
+				previousPoll.CardSync = current.CardSync
 				if current.LastUsageAt.After(previousPoll.LastUsageAt) {
 					previousPoll.LastUsageAt = current.LastUsageAt
 				}
@@ -525,6 +542,9 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 				poll.NextAt = retryAt
 			}
 			epochTransition = s.observeQuotaEpochProbeErrorLocked(id, poll.Error, time.Now())
+			if reason == cardQuotaSyncReason {
+				poll.finishCardQuotaSync(quotaSnapshot{}, now, time.Now(), false, false)
+			}
 		} else {
 			poll.Failures = 0
 			poll.Error = ""
@@ -569,7 +589,13 @@ func (s *schedulerRuntimeState) refreshOnce(ctx context.Context) {
 			s.quotas[auth.AuthIndex] = snapshot
 			s.observeFiveHourPhaseLocked(snapshot, time.Now())
 			s.updateCalibrationsLocked(map[string]quotaSnapshot{id: snapshot}, now)
-			epochTransition = s.observeQuotaEpochProbeLocked(id, previousSnapshot, snapshot, inventory, time.Now())
+			epochPrevious := previousSnapshot
+			if reason == cardQuotaSyncReason && poll.finishCardQuotaSync(nativeSnapshot, now, time.Now(), true, !poll.NextAt.After(attemptNextAt)) {
+				// An early refill following a card change is evidence about
+				// this credential. Peers can still signal a collective reset.
+				epochPrevious = snapshot
+			}
+			epochTransition = s.observeQuotaEpochProbeLocked(id, epochPrevious, snapshot, inventory, time.Now())
 			settlementSnapshot = snapshot
 			observeSettlement = true
 		}

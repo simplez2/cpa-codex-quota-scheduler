@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.52 — 2026-11-20
+
+- Refresh a credential's native quota after a likely manual reset-card redemption, even when the credential is idle or in standby. Honor provider backoff and retry briefly if the usage endpoint still reports the old windows. Replay pending changes saved by the previous release.
+
 ## 0.3.51 — 2026-11-19
 
 - Bring forward manual card opportunities within the ordinary dual-limited share. Compare the discrete 5h refill schedule and a steady-arrival scenario; count only cards a customer could actually exercise in sequence. Preserve natural weekly deadlines, sticky sessions and admission reserves. The panel distinguishes projected progress from a natively observed weekly reserve. Card redemption settings are unchanged.
