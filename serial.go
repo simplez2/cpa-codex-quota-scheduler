@@ -156,18 +156,16 @@ func serialWindowQuotaReason(window quotaWindow, cfg pluginConfig) string {
 	return "eligible"
 }
 
-// A configured weekly handoff is an admission boundary, including the balanced
-// last-resort tier. The separate reserve preference can still rank eligible
-// accounts without granting permission to cross this boundary.
-func weeklyHandoffBlocked(choice serialCandidate, cfg pluginConfig, now time.Time) bool {
+// A weekly handoff and an explicitly reserved 5h balance also bind the
+// last-resort tier. Other soft threshold preferences retain their fallback.
+func reservedHandoffClass(choice serialCandidate, cfg pluginConfig, now time.Time) string {
 	for _, window := range choice.Snapshot.Windows {
-		if normalizeWindowClass(window.Class) == "weekly" &&
-			(window.ResetAt.IsZero() || window.ResetAt.After(now)) &&
-			serialWindowQuotaReason(window, cfg) == "serial_threshold" {
-			return true
+		if (window.ResetAt.IsZero() || window.ResetAt.After(now)) &&
+			serialWindowQuotaReason(window, cfg) == "serial_threshold" && reserveBoundary(window, cfg) {
+			return normalizeWindowClass(window.Class)
 		}
 	}
-	return false
+	return ""
 }
 
 func inspectSerialCandidate(candidate pluginapi.SchedulerAuthCandidate, snapshot quotaSnapshot, found bool, cfg pluginConfig, now time.Time) serialCandidate {
@@ -561,7 +559,7 @@ func (s *schedulerRuntimeState) serialRequestLocalPickLocked(
 		if choice.Eligible {
 			choices = append(choices, choice)
 		} else if choice.Reason == "serial_threshold" {
-			if !weeklyHandoffBlocked(choice, cfg, now) {
+			if reservedHandoffClass(choice, cfg, now) == "" {
 				thresholdChoices = append(thresholdChoices, choice)
 			}
 		}
@@ -720,6 +718,7 @@ func (s *schedulerRuntimeState) serialPoolPickLocked(req pluginapi.SchedulerPick
 	}
 	currentSeen := false
 	currentEligible := false
+	currentReserved := false
 	currentChoice := serialCandidate{}
 	currentReason := "candidate_unavailable"
 	choices := make([]serialCandidate, 0, len(req.Candidates))
@@ -749,6 +748,7 @@ func (s *schedulerRuntimeState) serialPoolPickLocked(req pluginapi.SchedulerPick
 		s.annotateSerialCandidateLocked(&choice, now)
 		if candidate.ID == previous {
 			currentSeen = true
+			currentReserved = reservedHandoffClass(choice, cfg, now) != ""
 			if choice.Eligible {
 				currentEligible = true
 				currentChoice = choice
@@ -781,7 +781,7 @@ func (s *schedulerRuntimeState) serialPoolPickLocked(req pluginapi.SchedulerPick
 		}
 		if choice.Eligible {
 			choices = append(choices, choice)
-		} else if choice.Reason == "serial_threshold" {
+		} else if choice.Reason == "serial_threshold" && reservedHandoffClass(choice, cfg, now) == "" {
 			thresholdChoices = append(thresholdChoices, choice)
 		}
 	}
@@ -875,7 +875,7 @@ func (s *schedulerRuntimeState) serialPoolPickLocked(req pluginapi.SchedulerPick
 
 	thresholdFallback := false
 	if len(choices) == 0 && previous != "" && currentSeen &&
-		(currentReason == "limit_reached" || currentReason == "not_allowed" || currentReason == "quarantined") &&
+		(currentReserved || currentReason == "limit_reached" || currentReason == "not_allowed" || currentReason == "quarantined") &&
 		len(thresholdChoices) > 0 {
 		// A hard-exhausted primary must never delegate to CPA merely because
 		// every backup is at the soft threshold. Use the least-used backup and
@@ -883,7 +883,7 @@ func (s *schedulerRuntimeState) serialPoolPickLocked(req pluginapi.SchedulerPick
 		choices = thresholdChoices
 		thresholdFallback = true
 	}
-	if len(choices) == 0 && previous != "" && currentSeen && currentReason == "serial_threshold" {
+	if len(choices) == 0 && previous != "" && currentSeen && !currentReserved && currentReason == "serial_threshold" {
 		// A soft threshold is a switch preference, not a reason to delegate to
 		// CPA when every backup is equally full. Keep one account active until
 		// a hard limit or 429 provides an authoritative failover signal.

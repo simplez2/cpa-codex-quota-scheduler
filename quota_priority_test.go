@@ -106,7 +106,7 @@ func TestQuotaPriorityWeeklyReserveCannotSpendBackupBeforeFiveHour(t *testing.T)
 		t.Run(mode, func(t *testing.T) {
 			s, req := expiryPriorityFixture(t, mode, mode == "balanced")
 			q := s.quotas["five-sooner"]
-			q.Windows[1].UsedPercent = 95 // Within the soft reserve, still hard-eligible.
+			q.Windows[1].UsedPercent = 94 // Within the soft reserve, with room for the guarded reservation.
 			s.quotas[q.AuthID], s.quotaNative[q.AuthID] = q, q
 			got, err := s.schedulerPickUncapped(req)
 			if err != nil || got.AuthID != "five-sooner" {

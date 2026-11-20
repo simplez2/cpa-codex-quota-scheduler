@@ -155,7 +155,7 @@ func TestSerialContinuityConcurrentRequestsCommitSingleHandoff(t *testing.T) {
 	}
 }
 
-func TestSerialContinuityReserveStillServesWhenNoBackupExists(t *testing.T) {
+func TestSerialContinuityExplicitReserveStopsWhenNoBackupExists(t *testing.T) {
 	resetBanStoreForTest()
 	now := time.Now()
 	state := continuityTestState(now)
@@ -168,8 +168,8 @@ func TestSerialContinuityReserveStillServesWhenNoBackupExists(t *testing.T) {
 	q := state.quotas["primary"]
 	q.Windows[1].UsedPercent = 100 - state.cfg.Reserve5hPercent
 	state.quotas["primary"] = q
-	if got := state.serialPick(req, now.Add(time.Second)); !got.Handled || got.AuthID != "primary" {
-		t.Fatalf("soft safety reserve interrupted an otherwise usable account: %#v", got)
+	if got := state.serialPick(req, now.Add(time.Second)); got.AuthID != "" {
+		t.Fatalf("spent explicit reserve without a backup: %#v", got)
 	}
 	q.Windows[1].UsedPercent = 100
 	q.Windows[1].LimitReached = true
@@ -189,6 +189,11 @@ func TestSerialContinuityExplicitPinDoesNotChangePrimary(t *testing.T) {
 	req.Options.Metadata = map[string]any{"pinned_auth_id": "primary"}
 	q := state.quotas["primary"]
 	q.Windows[1].UsedPercent = 100 - state.cfg.Reserve5hPercent
+	state.quotas["primary"] = q
+	if got := state.serialPick(req, now); got.AuthID != "" {
+		t.Fatalf("explicit pin spent reserve: %#v", got)
+	}
+	q.Windows[1].UsedPercent--
 	state.quotas["primary"] = q
 	if got := state.serialPick(req, now); !got.Handled || got.AuthID != "primary" {
 		t.Fatalf("explicit pin was ignored: %#v", got)

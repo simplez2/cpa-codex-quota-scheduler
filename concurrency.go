@@ -476,7 +476,7 @@ func (s *schedulerRuntimeState) concurrencySchedulable(req pluginapi.SchedulerPi
 			snapshot, found := s.lookupQuotaLocked(candidate.ID, candidateAuthIndex(candidate))
 			snapshot = s.serialConservativeQuotaLocked(snapshot, now)
 			choice := inspectSerialCandidate(candidate, snapshot, found, cfg, now)
-			if weeklyHandoffBlocked(choice, cfg, now) && !cfg.SerialSoftContinuation {
+			if reservedHandoffClass(choice, cfg, now) != "" && !cfg.SerialSoftContinuation {
 				continue
 			}
 			if !choice.Eligible && !(mode == "balanced" && choice.Reason == "serial_threshold") {
@@ -739,12 +739,21 @@ func (s *schedulerRuntimeState) concurrencyAfter(req pluginapi.RequestInterceptR
 		s.mu.RLock()
 		cfg = s.cfg
 		detached := s.detached
+		reservedClass := ""
 		if selectedIndex == "" && selectedID != "" {
 			if quota, ok := s.lookupQuotaLocked(selectedID, ""); ok {
 				selectedIndex = quota.AuthIndex
 			}
 		}
 		if quota, ok := s.lookupQuotaLocked(selectedID, selectedIndex); ok {
+			// Native fallback and a quota update between Pick and dispatch both
+			// reach this hook. Use the actual selected credential, never a sibling.
+			mode := normalizeSchedulerMode(cfg.SchedulerMode)
+			if cfg.Enabled && !cfg.SerialSoftContinuation && (mode == "balanced" || mode == "serial") &&
+				quota.AuthID == selectedID && (selectedIndex == "" || selectedIndex == quota.AuthIndex) {
+				now := time.Now()
+				reservedClass = protectedWindow(s.serialConservativeQuotaLocked(quota, now), cfg, now)
+			}
 			// CPA's compact endpoint uses openai-response as ToFormat even when
 			// the selected credential is Codex. A matching native quota binding
 			// identifies that credential without affecting other providers.
@@ -766,6 +775,10 @@ func (s *schedulerRuntimeState) concurrencyAfter(req pluginapi.RequestInterceptR
 		if detached {
 			s.selectionMu.Unlock()
 			return pluginapi.RequestInterceptResponse{}
+		}
+		if isCodex && reservedClass != "" {
+			s.selectionMu.Unlock()
+			return concurrencyTermination(reservedClass+"_quota_reserved", "Selected Codex credential reached its "+reservedClass+" quota reserve")
 		}
 		g := &s.concurrency
 		g.mu.Lock()

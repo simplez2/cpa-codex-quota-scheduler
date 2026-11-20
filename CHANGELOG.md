@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.54 — 2026-11-21
+
+- Recheck the selected Codex credential's active reserve immediately before upstream dispatch. Non-generating WebSocket handshakes avoid protected credentials without recording generated usage. Late completions cannot reopen a protected balance in the same cycle or overwrite a newer anchored cycle.
+- Enforce weekly and explicitly enabled 5h reserves in serial last-resort selection and balanced reservations. Near a protected floor, reserve the configured guard cost for outstanding requests. The default 5h mode still runs to its upstream limit.
+
 ## 0.3.53 — 2026-11-21
 
 - Include CPA credential and model cooldowns, verified exhausted windows, and pending quota recovery in the account recovery panel. Mark missing or stale host details so they do not look like an empty recovery queue. Label the bulk action as clearing plugin state and only offer host quota cooldown recovery for an eligible credential with fresh native quota.

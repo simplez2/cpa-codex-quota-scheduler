@@ -136,10 +136,11 @@ func (s *schedulerRuntimeState) adqPolicyLocked() adqPolicy {
 	if policy.FiveHourWindow <= 0 || policy.WeeklyWindow <= 0 {
 		policy = defaultADQPolicy()
 	}
-	// The legacy panel reserve_5h_percent is a serial handoff setting. ADQ
-	// never silently converts it into a 5h quota reserve.
 	policy.FiveHourSafetyMargin = 0
 	if !s.cfg.SerialSoftContinuation {
+		if mode, _ := serialWindowHandoffPolicy(s.cfg, "5h"); mode == "reserve_aware" {
+			policy.FiveHourSafetyMargin = s.cfg.Reserve5hPercent / 100
+		}
 		mode, threshold := serialWindowHandoffPolicy(s.cfg, "weekly")
 		if mode != "429_only" {
 			reserve := 100 - threshold
@@ -375,7 +376,7 @@ func (s *schedulerRuntimeState) adqInputForChoiceLocked(choice serialCandidate, 
 	if choice.Reason == "not_allowed" || choice.Reason == "limit_reached" {
 		healthy = false
 	}
-	if weeklyHandoffBlocked(choice, s.cfg, now) && !s.cfg.SerialSoftContinuation {
+	if reservedHandoffClass(choice, s.cfg, now) != "" && !s.cfg.SerialSoftContinuation {
 		healthy = false
 	}
 	return adqAccountInput{
@@ -519,13 +520,22 @@ func (s *schedulerRuntimeState) adqRouteChoicesWithAllocationLocked(req pluginap
 		if mode == adqAllocateBalanced && stickyID == "" && serialPinnedAuthID(req) == "" {
 			decision, loan = s.cardCyclePickLocked(decision, available, inputs, cost, policy, now)
 		}
-		fiveCost := cost
+		// Near the floor, outstanding work must reserve the guard quantile.
+		// Use the selected credential's headroom; a low sibling must not tax
+		// healthy accounts or change fair-share work units.
+		m := decision.Metrics
+		admissionCost := cost
+		if (m.W > 0 && 100*m.WEffective <= s.cfg.LowQuotaPercent*m.W) ||
+			(adqFiveHourSafety(policy) > 0 && m.H > 0 && 100*m.HEffective <= s.cfg.LowQuotaPercent*m.H) {
+			admissionCost = max(cost, s.predictCostLocked(req, true))
+		}
+		fiveCost := admissionCost
 		if decision.Metrics.WeeklyOnly {
 			fiveCost = 0
 		}
 		reservation, ok := s.adqReservations.TryReserve(adqReservationRequest{
 			AuthID: decision.AuthID, SessionKey: session, Model: req.Model,
-			FiveHour: fiveCost, Weekly: cost, TTL: policy.ReservationTimeout,
+			FiveHour: fiveCost, Weekly: admissionCost, TTL: policy.ReservationTimeout,
 		}, now)
 		if ok {
 			loan.commit(cost)

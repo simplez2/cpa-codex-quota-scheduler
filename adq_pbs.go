@@ -257,11 +257,11 @@ func adqWeeklySafety(p adqPolicy) float64 {
 		// scope explicit: legacy safety is weekly-only.
 		margin = p.QuotaSafetyMargin
 	}
-	return clampADQ(margin, 0, .5)
+	return clampADQ(margin, 0, 1)
 }
 
 func adqFiveHourSafety(p adqPolicy) float64 {
-	return clampADQ(p.FiveHourSafetyMargin, 0, .5)
+	return clampADQ(p.FiveHourSafetyMargin, 0, 1)
 }
 
 // adqHardEffectiveQuota is the actual admission gate. It accounts for work

@@ -632,6 +632,11 @@ func (s *schedulerRuntimeState) observeUsage(record pluginapi.UsageRecord) {
 		return
 	}
 	previous := old
+	patches = orderedQuotaHeaders(old, patches, record.RequestedAt, now, s.cfg)
+	if len(patches) == 0 {
+		s.mu.Unlock()
+		return
+	}
 	merged, changed, quotaSignal := mergeQuotaWindows(old.Windows, patches, now)
 	if !changed && !quotaSignal {
 		s.mu.Unlock()
@@ -835,7 +840,7 @@ func codexOnlySchedulerRequest(req pluginapi.SchedulerPickRequest) bool {
 
 func (s *schedulerRuntimeState) schedulerPickUncapped(req pluginapi.SchedulerPickRequest) (pluginapi.SchedulerPickResponse, error) {
 	if schedulerRequestGenerationDisabled(req) {
-		return pluginapi.SchedulerPickResponse{Handled: false}, nil
+		return s.nativeReserveAlternative(req, time.Now()), nil
 	}
 	if len(req.Candidates) == 0 || !codexOnlySchedulerRequest(req) {
 		// Codex-only isolation is a hard boundary. Mixed and third-party routes
@@ -890,8 +895,8 @@ func (s *schedulerRuntimeState) schedulerPickUncapped(req pluginapi.SchedulerPic
 			return returned, nil
 		}
 		if !returned.Handled {
-			if s.allCandidatesWeeklyHandoffBlocked(attempt, now) {
-				returned = pluginapi.SchedulerPickResponse{Handled: true, Reject: true, RejectCode: "weekly_quota_reserved", RejectReason: "Available Codex credentials reached the configured weekly handoff; reserved weekly quota is protected"}
+			if class := s.allCandidatesReserveBlocked(attempt, now); class != "" {
+				returned = pluginapi.SchedulerPickResponse{Handled: true, Reject: true, RejectCode: class + "_quota_reserved", RejectReason: "Available Codex credentials reached a configured quota reserve"}
 			} else if s.allContinuityCandidatesBlocked(attempt, now) {
 				returned = pluginapi.SchedulerPickResponse{Handled: true, Reject: true, RejectCode: "quota_recovery_wait", RejectReason: "All selected Codex credentials are waiting for quota recovery"}
 			}
@@ -943,23 +948,25 @@ func (s *schedulerRuntimeState) schedulerPickUncapped(req pluginapi.SchedulerPic
 
 // Unknown quota retains native fallback. A fully observed pool with a configured
 // weekly handoff must not delegate selection back to an unaware native scheduler.
-func (s *schedulerRuntimeState) allCandidatesWeeklyHandoffBlocked(req pluginapi.SchedulerPickRequest, now time.Time) bool {
+func (s *schedulerRuntimeState) allCandidatesReserveBlocked(req pluginapi.SchedulerPickRequest, now time.Time) string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if !s.cfg.Enabled || s.detached || len(req.Candidates) == 0 {
-		return false
+		return ""
 	}
-	weeklyBlocked := false
+	class := ""
 	for _, candidate := range req.Candidates {
 		q, found := s.lookupQuotaLocked(candidate.ID, candidateAuthIndex(candidate))
 		q = s.serialConservativeQuotaLocked(q, now)
 		choice := inspectSerialCandidate(candidate, q, found, s.cfg, now)
 		if choice.Eligible || !choice.QuotaKnown {
-			return false
+			return ""
 		}
-		weeklyBlocked = weeklyBlocked || weeklyHandoffBlocked(choice, s.cfg, now)
+		if c := reservedHandoffClass(choice, s.cfg, now); c != "" && (class == "" || c == "weekly") {
+			class = c
+		}
 	}
-	return weeklyBlocked
+	return class
 }
 
 func (s *schedulerRuntimeState) allContinuityCandidatesBlocked(req pluginapi.SchedulerPickRequest, now time.Time) bool {
@@ -2171,8 +2178,8 @@ func runtimeADQAccountFor(snapshot quotaSnapshot, cfg pluginConfig, policy adqPo
 	}
 	status.adqAccountMetrics = adqAssessAccount(input, policy, now)
 	choice := inspectSerialCandidate(pluginapi.SchedulerAuthCandidate{ID: id}, snapshot, true, cfg, now)
-	if weeklyHandoffBlocked(choice, cfg, now) && !cfg.SerialSoftContinuation {
-		status.Eligible, status.Reason = false, "weekly_quota_reserved"
+	if class := reservedHandoffClass(choice, cfg, now); class != "" && !cfg.SerialSoftContinuation {
+		status.Eligible, status.Reason = false, class+"_quota_reserved"
 	}
 	return status
 }

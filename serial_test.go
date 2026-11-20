@@ -476,7 +476,7 @@ func TestSerialSchedulerKeepsUnknownQuotaOnOneDeterministicAuth(t *testing.T) {
 	}
 }
 
-func TestSerialSchedulerKeepsCurrentWhenEveryBackupReachedSoftThreshold(t *testing.T) {
+func TestSerialSchedulerRejectsWhenCurrentAndEveryBackupReachedWeeklyReserve(t *testing.T) {
 	resetBanStoreForTest()
 	now := time.Now()
 	state := newSerialTestState(now)
@@ -495,8 +495,8 @@ func TestSerialSchedulerKeepsCurrentWhenEveryBackupReachedSoftThreshold(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !got.Handled || got.AuthID != "primary" {
-		t.Fatalf("soft-threshold pool escaped the current auth: %#v", got)
+	if !got.Handled || !got.Reject || got.AuthID != "" || got.RejectCode != "weekly_quota_reserved" {
+		t.Fatalf("all-reserved serial pool did not fail closed: %#v", got)
 	}
 }
 

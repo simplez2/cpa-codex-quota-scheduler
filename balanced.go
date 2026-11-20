@@ -199,7 +199,7 @@ func (s *schedulerRuntimeState) balancedPick(req pluginapi.SchedulerPickRequest,
 		if !choice.Eligible && choice.Reason != "serial_threshold" {
 			continue
 		}
-		if weeklyHandoffBlocked(choice, s.cfg, now) && !(s.cfg.SerialSoftContinuation && bound &&
+		if reservedHandoffClass(choice, s.cfg, now) != "" && !(s.cfg.SerialSoftContinuation && bound &&
 			candidate.ID == binding.AuthID && (binding.AuthIndex == "" || binding.AuthIndex == snapshot.AuthIndex)) {
 			continue
 		}
