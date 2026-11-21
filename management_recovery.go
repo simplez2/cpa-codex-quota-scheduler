@@ -34,8 +34,52 @@ type managementRecoveryAccount struct {
 }
 
 type managementRecoveryWindow struct {
-	Class   string `json:"class"`
-	ResetAt string `json:"reset_at,omitempty"`
+	Class      string `json:"class,omitempty"`
+	State      string `json:"state"`
+	ResetAt    string `json:"reset_at,omitempty"`
+	ObservedAt string `json:"observed_at"`
+	Cached     bool   `json:"cached,omitempty"`
+}
+
+func managementRecoveryWindows(q quotaSnapshot, now time.Time, staleAfter time.Duration) []managementRecoveryWindow {
+	var exhausted []managementRecoveryWindow
+	var restrictionAt time.Time
+	for _, w := range q.Windows {
+		if !quotaWindowHardRestriction(w) {
+			continue
+		}
+		observedAt := w.ObservedAt
+		if observedAt.IsZero() {
+			observedAt = q.RefreshedAt
+		}
+		if observedAt.IsZero() || observedAt.After(now) {
+			continue
+		}
+		elapsed := !w.ResetAt.IsZero() && !w.ResetAt.After(now)
+		class := normalizeWindowClass(w.Class)
+		if class == "" || w.UsedPercent < usedPercentThreshold {
+			// Native allowed/limit_reached can apply to the whole account.
+			// Do not attribute the restriction to a window with headroom.
+			if !elapsed && observedAt.After(restrictionAt) {
+				restrictionAt = observedAt
+			}
+			continue
+		}
+		item := managementRecoveryWindow{Class: class, State: "exhausted",
+			ObservedAt: observedAt.Format(time.RFC3339), Cached: now.Sub(observedAt) > staleAfter}
+		if !w.ResetAt.IsZero() {
+			item.ResetAt = w.ResetAt.Format(time.RFC3339)
+		}
+		if elapsed {
+			item.State = "awaiting_quota"
+		}
+		exhausted = append(exhausted, item)
+	}
+	if len(exhausted) == 0 && !restrictionAt.IsZero() {
+		return []managementRecoveryWindow{{State: "restricted",
+			ObservedAt: restrictionAt.Format(time.RFC3339), Cached: now.Sub(restrictionAt) > staleAfter}}
+	}
+	return exhausted
 }
 
 func (s *schedulerRuntimeState) managementRecovery(bans []managementBanInfo, now time.Time) managementRecovery {
@@ -93,47 +137,37 @@ func buildManagementRecovery(bans []managementBanInfo, guards map[string]recover
 	}
 	if fresh {
 		result.NativeStatus = "current"
-		for id, auth := range inventory {
-			q := quotas[id]
-			if q.AuthIndex == auth.AuthIndex && quotaSnapshotFresh(q, now, cfg.StaleAfter) {
-				for _, w := range q.Windows {
-					// Count observed exhaustion; the configured switch threshold
-					// and a failed quota request don't establish a recovery wait.
-					class := normalizeWindowClass(w.Class)
-					if class == "" || w.UsedPercent < usedPercentThreshold || (!w.ResetAt.IsZero() && !w.ResetAt.After(now)) {
-						continue
-					}
-					if class == "5h" && byID[id] != nil && byID[id].Guard == "awaiting_quota" {
-						continue // Already shown as a recovery wait for this window.
-					}
-					item := managementRecoveryWindow{Class: class}
-					if !w.ResetAt.IsZero() {
-						item.ResetAt = w.ResetAt.Format(time.RFC3339)
-					}
-					account := row(id)
-					account.Quota = append(account.Quota, item)
+	}
+	for id, auth := range inventory {
+		// Idle credentials use cached quota until a new observation. Neither
+		// cache age nor the reset timer is evidence that the account recovered.
+		if q, found := quotas[id]; found && q.AuthID == id && q.AuthIndex == auth.AuthIndex {
+			if windows := managementRecoveryWindows(q, now, cfg.StaleAfter); len(windows) > 0 {
+				row(id).Quota = windows
+			}
+		}
+		if !fresh {
+			continue
+		}
+		var cooldowns []cpaCooldown
+		if json.Unmarshal(auth.Cooldowns, &cooldowns) != nil || cooldowns == nil {
+			result.NativeStatus = "partial"
+			// The older field can be a model aggregate. Display it with
+			// unknown scope and without an action that clears all models.
+			retryAt := parseQuotaTime(auth.NextRetryAfter)
+			if auth.Unavailable || retryAt.After(now) {
+				account := row(id)
+				account.CPAUnknown = true
+				if retryAt.After(now) {
+					account.CPA = append(account.CPA, cpaCooldown{Scope: "unknown", RetryAt: retryAt})
 				}
 			}
-			var cooldowns []cpaCooldown
-			if json.Unmarshal(auth.Cooldowns, &cooldowns) != nil || cooldowns == nil {
-				result.NativeStatus = "partial"
-				// The older field can be a model aggregate. Display it with
-				// unknown scope and without an action that clears all models.
-				retryAt := parseQuotaTime(auth.NextRetryAfter)
-				if auth.Unavailable || retryAt.After(now) {
-					account := row(id)
-					account.CPAUnknown = true
-					if retryAt.After(now) {
-						account.CPA = append(account.CPA, cpaCooldown{Scope: "unknown", RetryAt: retryAt})
-					}
-				}
-				continue
-			}
-			for _, cooldown := range cooldowns {
-				if cooldown.RetryAt.After(now) {
-					account := row(id)
-					account.CPA = append(account.CPA, cooldown)
-				}
+			continue
+		}
+		for _, cooldown := range cooldowns {
+			if cooldown.RetryAt.After(now) {
+				account := row(id)
+				account.CPA = append(account.CPA, cooldown)
 			}
 		}
 	}
@@ -152,7 +186,7 @@ func buildManagementRecovery(bans []managementBanInfo, guards map[string]recover
 			account.CanClear = !probing && onlyQuota && auth.AuthIndex != "" && auth.AuthIndex == q.AuthIndex &&
 				quotaSnapshotFresh(q, now, cfg.StaleAfter) && eval.Known && eval.Eligible
 		}
-		if account.CPAUnknown {
+		if account.CPAUnknown || len(account.Quota) > 0 {
 			account.CanClear = false
 		}
 		result.Accounts = append(result.Accounts, *account)

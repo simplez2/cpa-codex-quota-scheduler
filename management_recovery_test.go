@@ -89,3 +89,69 @@ func TestManagementRecoveryDistinguishesUnknownHostFromEmptyAndShowsQuotaWait(t 
 		t.Fatalf("expected distinct empty and stale results: %+v versus %+v", current, stale)
 	}
 }
+
+func TestManagementRecoveryKeepsCachedExhaustionThroughResetUntilReobserved(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	cfg := defaultPluginConfig()
+	observed := now.Add(-cfg.StaleAfter - time.Minute)
+	reset := now.Add(time.Hour)
+	inventory := quotaInventory([]cpaAuthFileEntry{
+		{ID: "idle", AuthIndex: "idx-idle", Provider: "codex", Cooldowns: json.RawMessage(`[]`)},
+	})
+	q := quotaSnapshot{AuthID: "idle", AuthIndex: "idx-idle", RefreshedAt: observed,
+		Windows: []quotaWindow{
+			// The usage endpoint can repeat the same account-wide restriction
+			// flags for both windows even when only the weekly one is full.
+			{Class: "5h", Allowed: false, LimitReached: true, UsedPercent: 0, ObservedAt: observed, ResetAt: now.Add(4 * time.Hour)},
+			{Class: "weekly", Allowed: false, LimitReached: true, UsedPercent: 100, ObservedAt: observed, ResetAt: reset},
+		},
+	}
+	quotas := map[string]quotaSnapshot{"idle": q}
+	assertWeekly := func(at, inventoryAt time.Time, state, nativeStatus string) {
+		t.Helper()
+		got := buildManagementRecovery(nil, nil, inventory, quotas, inventoryAt, cfg, at)
+		if got.NativeStatus != nativeStatus || len(got.Accounts) != 1 || got.CanClearAll || got.Accounts[0].CanClear {
+			t.Fatalf("expected one read-only recovery account: %+v", got)
+		}
+		windows := got.Accounts[0].Quota
+		if len(windows) != 1 || windows[0].Class != "weekly" || windows[0].State != state || !windows[0].Cached ||
+			windows[0].ObservedAt != observed.Format(time.RFC3339) || windows[0].ResetAt != reset.Format(time.RFC3339) {
+			t.Fatalf("expected cached weekly exhaustion without a false 5h attribution: %+v", windows)
+		}
+	}
+	assertWeekly(now, now, "exhausted", "current")
+	assertWeekly(now, now.Add(-3*time.Minute), "exhausted", "stale")
+	afterReset := reset.Add(time.Second)
+	assertWeekly(afterReset, afterReset, "awaiting_quota", "current")
+
+	// Confirm an upstream refill. A separate soft handoff threshold is not a
+	// recovery wait, even if that threshold still excludes another account.
+	q.RefreshedAt = afterReset
+	q.Windows = []quotaWindow{{Class: "weekly", UsedPercent: 98, Allowed: true, ObservedAt: afterReset, ResetAt: reset.Add(7 * 24 * time.Hour)}}
+	quotas["idle"] = q
+	if got := buildManagementRecovery(nil, nil, inventory, quotas, afterReset, cfg, afterReset); len(got.Accounts) != 0 {
+		t.Fatalf("confirmed active window or soft threshold left a false recovery row: %+v", got)
+	}
+
+	// Replacing a credential cannot carry forward the prior index's depletion.
+	auth := inventory["idle"]
+	auth.AuthIndex = "idx-replacement"
+	inventory["idle"] = auth
+	quotas["idle"] = quotaSnapshot{AuthID: "idle", AuthIndex: "idx-idle", RefreshedAt: observed,
+		Windows: []quotaWindow{{Class: "weekly", UsedPercent: 100, Allowed: true, ResetAt: reset}}}
+	if got := buildManagementRecovery(nil, nil, inventory, quotas, now, cfg, now); len(got.Accounts) != 0 {
+		t.Fatalf("replacement inherited a cooldown from the prior credential: %+v", got)
+	}
+}
+
+func TestManagementRecoveryShowsUnattributedRestrictionWithoutInventingWindow(t *testing.T) {
+	now := time.Now().UTC()
+	q := quotaSnapshot{RefreshedAt: now, Windows: []quotaWindow{
+		{Class: "5h", UsedPercent: 20, LimitReached: true, ResetAt: now.Add(time.Hour)},
+		{Class: "weekly", UsedPercent: 70, LimitReached: true, ResetAt: now.Add(24 * time.Hour)},
+	}}
+	got := managementRecoveryWindows(q, now, time.Minute)
+	if len(got) != 1 || got[0].State != "restricted" || got[0].Class != "" || got[0].ResetAt != "" || got[0].Cached {
+		t.Fatalf("shared restriction must not claim a specific quota window was exhausted: %+v", got)
+	}
+}

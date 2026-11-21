@@ -615,7 +615,22 @@ function renderBans() {
     const plugin=account.plugin;
     if(plugin)item.append(element('p','subtext','插件 · '+(labels[plugin.state]||'等待恢复')+(plugin.state==='cooldown'?retryAt(plugin.reset_at):'')));
     if(account.guard)item.append(element('p','subtext',(labels[account.guard]||'等待恢复')+(account.guard==='awaiting_quota'&&timestamp(account.guard_until)?' · 预计重置 '+dateText(account.guard_until):retryAt(account.guard_until))));
-    for(const window of account.quota||[])item.append(element('p','subtext',(windows[window.class]||'额度')+'已耗尽'+(timestamp(window.reset_at)?' · 预计重置 '+dateText(window.reset_at):' · 重置时间待确认')));
+    for(const window of account.quota||[]){
+      const name=windows[window.class]||'额度';
+      let detail;
+      switch(window.state){
+        case 'awaiting_quota':
+          detail=name+' · 已到重置时间，等待上游复核';
+          break;
+        case 'restricted':
+          detail='上游限制中 · 额度窗口待确认';
+          break;
+        default:
+          detail=name+'已耗尽'+(timestamp(window.reset_at)?' · 预计重置 '+dateText(window.reset_at):' · 重置时间待确认');
+      }
+      if(timestamp(window.observed_at))detail+=' · '+(window.cached?'缓存观测 ':'上次观测 ')+dateText(window.observed_at);
+      item.append(element('p','subtext',detail));
+    }
     for(const entry of account.cpa||[]){
       const scope=entry.scope==='model'&&entry.model_key?'CPA 模型 '+entry.model_key:entry.scope==='credential'?'CPA 凭证':'CPA 范围待确认';
       item.append(element('p','subtext',scope+' · '+(reasons[entry.reason]||'冷却中')+retryAt(entry.retry_at)));

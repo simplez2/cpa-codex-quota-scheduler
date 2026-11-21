@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.55 — 2026-11-21
+
+- Keep observed quota exhaustion visible in account recovery while the credential is idle, with the observation time and an explicit wait for recheck after the reset deadline. An account-wide upstream limit without an exhausted percentage does not claim a specific window. Short recovery lists keep their own height beside the allocation panel.
+
 ## 0.3.54 — 2026-11-21
 
 - Recheck the selected Codex credential's active reserve immediately before upstream dispatch. Non-generating WebSocket handshakes avoid protected credentials without recording generated usage. Late completions cannot reopen a protected balance in the same cycle or overwrite a newer anchored cycle.
